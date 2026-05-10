@@ -1,0 +1,82 @@
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.installed.cfg
+
+# ─── Virtual environments ───
+.venv/
+venv/
+env/
+ENV/
+
+# ─── IDE ───
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── Pytest ───
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# ─── Jupyter ───
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ─── ML artefakty ───
+mlruns/
+mlartifacts/
+wandb/
+optuna_studies.db
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+
+# ─── Dane (poza listingiem katalogu) ───
+data/raw/*.csv
+data/raw/*.RData
+data/raw/*.rdata
+data/processed/*.parquet
+data/processed/*.csv
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/external/.gitkeep
+
+# ─── Wyniki ───
+results/figures/*.png
+results/figures/*.pdf
+results/tables/*.csv
+!results/figures/.gitkeep
+!results/tables/.gitkeep
+!results/reports/.gitkeep
+
+# ─── Modele ───
+models/*.json
+models/*.txt
+models/*.bin
+models/*.pkl
+!models/.gitkeep
+
+# ─── OS ───
+.DS_Store
+Thumbs.db
+
+# ─── Logi ───
+*.log
+logs/
+
+# ─── ENV ───
+.env
+.env.local
