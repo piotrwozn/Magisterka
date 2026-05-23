@@ -47,6 +47,7 @@ class FeatureGroups:
     historical_labs: list[str] = field(default_factory=list)
     ed_usage: list[str] = field(default_factory=list)
     imaging_history: list[str] = field(default_factory=list)
+    engineered: list[str] = field(default_factory=list)
     other: list[str] = field(default_factory=list)
 
     @property
@@ -57,6 +58,7 @@ class FeatureGroups:
             + self.demographics
             + self.arrival
             + self.chief_complaints
+            + self.engineered
         )
 
     @property
@@ -84,6 +86,7 @@ class FeatureGroups:
             "historical_labs": len(self.historical_labs),
             "ed_usage": len(self.ed_usage),
             "imaging_history": len(self.imaging_history),
+            "engineered": len(self.engineered),
             "other": len(self.other),
             "TOTAL_TRIAGE_ONLY": len(self.triage_only),
             "TOTAL_FULL": len(self.full),
@@ -195,6 +198,17 @@ def build_feature_groups(df: pd.DataFrame) -> FeatureGroups:
             groups.demographics.append(col)
         else:
             groups.other.append(col)
+
+    # Rozpoznaj cechy z inżynierii
+    try:
+        from src.features.engineering import ENGINEERED_FEATURES
+        eng_present = [c for c in ENGINEERED_FEATURES if c in columns]
+        if eng_present:
+            groups.engineered = eng_present
+            groups.other = [c for c in groups.other if c not in eng_present]
+            groups.chief_complaints = [c for c in groups.chief_complaints if c not in eng_present]
+    except ImportError:
+        pass
 
     log.info("Zidentyfikowano grupy cech:")
     for name, n in groups.summary().items():

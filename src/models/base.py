@@ -40,21 +40,28 @@ log = get_logger(__name__)
 def compute_sample_weights(
     y: np.ndarray | pd.Series,
     strategy: str = "custom",
+    class_weights: dict[int, float] | None = None,
 ) -> np.ndarray:
     """
     Wagi sampli dla treningu.
 
-    Strategie:
-        - 'balanced'  — sklearn balanced (1/freq)
-        - 'custom'    — zdefiniowane w config.CUSTOM_CLASS_WEIGHTS
-                        (asymetryczne, faworyzujące Red/Orange)
-        - 'none'      — wszystkie 1.0
+    Parameters
+    ----------
+    y : target labels
+    strategy : str
+        'balanced' | 'custom' | 'none' (ignorowane gdy class_weights podane)
+    class_weights : dict, optional
+        Mapa {klasa: waga} z Optuny — nadpisuje strategy.
 
     Returns
     -------
     np.ndarray długości len(y).
     """
     y = np.asarray(y)
+
+    # Priorytet: class_weights > strategy
+    if class_weights is not None:
+        return np.array([class_weights.get(int(yi), 1.0) for yi in y])
 
     if strategy == "balanced":
         return compute_sample_weight("balanced", y)
@@ -108,6 +115,9 @@ class BaseTriageModel(abc.ABC):
         self.feature_names: list[str] | None = None
         self.classes_: np.ndarray | None = None
         self.is_fitted: bool = False
+
+        # Wagi klas z Optuny (nadpisują strategy w compute_sample_weights)
+        self.optuna_class_weights: dict[int, float] | None = None
 
         # Tracking — wypełniane w fit()
         self.run_id: str | None = None

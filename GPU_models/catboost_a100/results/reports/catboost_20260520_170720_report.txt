@@ -1,0 +1,120 @@
+============================================================
+SOR-AI: Raport treningu modelu
+============================================================
+
+Run ID:       20260520_170720
+Model:        catboost
+Feature set:  triage_only
+Czas treningu: 23.6 s
+Liczba cech:  336
+
+HIPERPARAMETRY:
+{
+  "loss_function": "MultiClass",
+  "eval_metric": "MultiClass",
+  "classes_count": 5,
+  "iterations": 3800,
+  "learning_rate": 0.12994140009404415,
+  "depth": 9,
+  "l2_leaf_reg": 0.12680215813384688,
+  "border_count": 168,
+  "bootstrap_type": "Bernoulli",
+  "subsample": 0.6392867682317774,
+  "grow_policy": "SymmetricTree",
+  "boosting_type": "Plain",
+  "random_seed": 42,
+  "thread_count": -1,
+  "task_type": "GPU",
+  "devices": "0",
+  "allow_writing_files": false,
+  "od_type": "Iter",
+  "od_wait": 100,
+  "verbose": 100,
+  "random_strength": 0.6044010599195688,
+  "leaf_estimation_iterations": 8,
+  "leaf_estimation_method": "Newton"
+}
+
+OPTUNA TUNING:
+  Najlepsza wartość QWK: 0.8752
+  Liczba prób: 154
+  Najlepsze parametry:
+{
+  "bootstrap_type": "MVS",
+  "grow_policy": "SymmetricTree",
+  "iterations": 3800,
+  "learning_rate": 0.12994140009404415,
+  "depth": 9,
+  "l2_leaf_reg": 0.12680215813384688,
+  "random_strength": 0.6044010599195688,
+  "border_count": 168,
+  "rsm": 0.9990935402182219,
+  "leaf_estimation_iterations": 8,
+  "leaf_estimation_method": "Newton",
+  "subsample": 0.6392867682317774,
+  "cw_red": 3.036374757519426,
+  "cw_orange": 1.1574192422259337,
+  "cw_green": 1.9919916515039087,
+  "cw_blue": 4.117141573610357
+}
+
+METRYKI (TEST SET):
+  test_quadratic_weighted_kappa : 0.8729
+  test_linear_weighted_kappa    : 0.8115
+  test_cohen_kappa              : 0.7321
+  test_accuracy                 : 0.8720
+  test_f1_macro                 : 0.6869
+  test_f1_weighted              : 0.8673
+  test_auc_macro                : 0.9711
+  test_auc_red                  : 0.9954
+  test_auc_orange               : 0.9600
+  test_auc_yellow               : 0.9498
+  test_auc_green                : 0.9624
+  test_auc_blue                 : 0.9881
+  test_log_loss                 : 0.3131
+  test_undertriage_rate         : 0.0322
+  test_overtriage_rate          : 0.1307
+  test_critical_miss_rate       : 0.0005
+  test_precision_red            : 0.9565
+  test_recall_red               : 0.9914
+  test_f1_red                   : 0.9736
+  test_support_red              : 38451
+  test_precision_orange         : 0.6951
+  test_recall_orange            : 0.6813
+  test_f1_orange                : 0.6881
+  test_support_orange           : 7285
+  test_precision_yellow         : 0.7019
+  test_recall_yellow            : 0.5337
+  test_f1_yellow                : 0.6064
+  test_support_yellow           : 6760
+  test_precision_green          : 0.5224
+  test_recall_green             : 0.5212
+  test_f1_green                 : 0.5218
+  test_support_green            : 2285
+  test_precision_blue           : 0.5599
+  test_recall_blue              : 0.7600
+  test_f1_blue                  : 0.6448
+  test_support_blue             : 1021
+  test_confusion_matrix         : [[38121, 284, 25, 12, 9], [897, 4963, 1158, 164, 103], [632, 1667, 3608, 742, 111], [185, 193, 329, 1191, 387], [21, 33, 20, 171, 776]]
+
+TOP 20 NAJWAŻNIEJSZYCH CECH:
+  age                                 9.9946
+  arrivalmode                         8.6299
+  dep_name                            8.5992
+  triage_vital_temp                   5.4725
+  arrivalhour_bin                     5.3912
+  insurance_status                    3.9720
+  maritalstatus                       3.4621
+  temp_x_rr                           3.1560
+  arrivalday                          3.0924
+  temp_x_o2                           3.0306
+  cc_suture/stapleremoval             2.4972
+  arrivalmonth                        2.4602
+  hr_x_rr                             2.4536
+  cc_count                            2.0513
+  race                                1.7696
+  cc_abdominal_group                  1.6093
+  gender                              1.5280
+  cc_cardiac_group                    1.4974
+  cc_abdominalpain                    1.0912
+  hr_x_dbp                            1.0554

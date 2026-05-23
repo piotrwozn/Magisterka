@@ -24,7 +24,7 @@ import pandas as pd
 
 from src.data.preprocessing import build_feature_groups, split_features
 from src.models import MODEL_REGISTRY, get_model
-from src.models.tuning import tune_model
+from src.models.tuning import filter_features_by_importance_1fold, tune_model
 from src.utils.config import (
     DATA_PROCESSED_DIR,
     EXPERIMENTS_DIR,
@@ -76,6 +76,8 @@ def run_training(
     use_mlflow: bool = False,
     save_model: bool = True,
     custom_params: dict | None = None,
+    resume_run_id: str | None = None,
+    do_filter: bool = True,
 ) -> dict:
     """
     Pełen pipeline treningu jednego modelu.
@@ -108,6 +110,13 @@ def run_training(
     splits = load_splits()
     df_train, df_val, df_test = splits["train"], splits["val"], splits["test"]
 
+    # 1b. Feature engineering (dodaje ~43 cechy kliniczne)
+    from src.features.engineering import engineer_features
+    df_train = engineer_features(df_train)
+    df_val = engineer_features(df_val)
+    df_test = engineer_features(df_test)
+    log.info(f"Dodano cechy inżynieryjne: {sum(1 for c in df_train.columns if c.endswith(('_flag','_score','_index','_proxy','_triad','_product','_ratio','_interaction','_instability','_deviation')))} nowych")
+
     # 2. Identyfikuj grupy cech (na pełnym DataFrame, by uniknąć missingu kolumn)
     groups = build_feature_groups(df_train)
 
@@ -116,12 +125,32 @@ def run_training(
     X_val, y_val, _ = split_features(df_val, groups, feature_set=feature_set)
     X_test, y_test, _ = split_features(df_test, groups, feature_set=feature_set)
 
-    # 4. (Opcjonalnie) Tuning
+    # 4. Opcjonalny 1-fold feature importance filter (przed tuningiem)
+    if do_filter and tune and len(feature_names) > 100:
+        log.info(f"Feature filter przed tuningiem ({len(feature_names)} cech → ?)")
+        filtered = filter_features_by_importance_1fold(
+            X_train, y_train, feature_names,
+            model_name=model_name,
+            min_importance=0.0,
+        )
+        dropped = [c for c in feature_names if c not in filtered]
+        if dropped:
+            log.info(f"Feature filter odrzucił {len(dropped)} cech")
+            X_train = X_train[filtered]
+            X_val = X_val[filtered]
+            X_test = X_test[filtered]
+            feature_names = filtered
+
+    # 5. (Opcjonalnie) Tuning
     best_params = custom_params or {}
     tuning_info = None
     if tune:
         log.info(f"Optuna tuning ({n_trials} trials)…")
-        storage_path = EXPERIMENTS_DIR / "optuna_studies.db"
+        # Per-model SQLite. /tmp/ na serwerze, /tmp/opencode/ w WSL
+        db_dir = Path("/tmp/opencode")
+        db_dir.mkdir(parents=True, exist_ok=True)
+        storage_path = db_dir / f"optuna_studies_{model_name}.db"
+        study_name = f"{model_name}_max_quality"
         tuning_info = tune_model(
             model_name=model_name,
             X_train=X_train,
@@ -131,12 +160,34 @@ def run_training(
             n_trials=n_trials,
             sample_weight_strategy=sample_weight_strategy,
             storage_path=storage_path,
+            study_name=study_name,
         )
-        best_params = tuning_info["best_params"]
+        # Rozdziel parametry modelu od wag klas
+        best_params = {
+            k: v for k, v in tuning_info["best_params"].items()
+            if not k.startswith("cw_")
+        }
+        class_weight_map = {
+            k: v for k, v in tuning_info["best_params"].items()
+            if k.startswith("cw_")
+        }
         log.info(f"Best params: {best_params}")
+        log.info(f"Optuna class weights: {class_weight_map}")
 
     # 5. Trening finalnego modelu
     model = get_model(model_name, params=best_params if best_params else None)
+
+    # Wstrzyknij wagi klas z Optuny do finalnego treningu
+    if tuning_info and class_weight_map:
+        parsed = {}
+        label_map = {"cw_red": 0, "cw_orange": 1, "cw_green": 3, "cw_blue": 4}
+        for k, v in class_weight_map.items():
+            if k in label_map:
+                parsed[label_map[k]] = v
+        parsed[2] = 1.0  # Yellow
+        model.optuna_class_weights = parsed
+        log.info(f"Używam Optuna class weights w finalnym treningu: {parsed}")
+
     model.fit(
         X_train, y_train,
         X_val=X_val, y_val=y_val,
@@ -256,6 +307,18 @@ def _parse_args() -> argparse.Namespace:
         help="Uruchom Optuna tuning przed finalnym treningiem",
     )
     parser.add_argument(
+        "--filter",
+        action="store_true",
+        default=True,
+        help="1-fold feature importance filter przed tuningiem (usuwa cechy z zerową importance)",
+    )
+    parser.add_argument(
+        "--no-filter",
+        action="store_false",
+        dest="filter",
+        help="Pomiń 1-fold feature importance filter",
+    )
+    parser.add_argument(
         "--n-trials", "-n",
         type=int,
         default=OPTUNA_N_TRIALS,
@@ -277,6 +340,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Nie zapisuj modelu na dysk",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Wznów tuning z podanego run_id (timestamp z nazwy pliku log)",
+    )
     return parser.parse_args()
 
 
@@ -290,6 +359,8 @@ def main() -> None:
         sample_weight_strategy=args.weights,
         use_mlflow=args.mlflow,
         save_model=not args.no_save,
+        resume_run_id=args.resume,
+        do_filter=args.filter,
     )
 
     log.info("╔════════════════════════════════════════════════════════════╗")

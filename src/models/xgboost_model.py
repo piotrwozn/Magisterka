@@ -76,7 +76,7 @@ class XGBoostTriageModel(BaseTriageModel):
         self.feature_names = list(X_train.columns)
 
         # 2. Wagi sampli
-        sample_weights = compute_sample_weights(y_train, strategy=sample_weight_strategy)
+        sample_weights = compute_sample_weights(y_train, strategy=sample_weight_strategy, class_weights=self.optuna_class_weights)
         self.train_logger.info(
             f"Wagi sampli: strategia='{sample_weight_strategy}', "
             f"min={sample_weights.min():.2f}, max={sample_weights.max():.2f}"

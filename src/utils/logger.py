@@ -94,15 +94,31 @@ def get_logger(
 
 def _attach_file_handler(logger: logging.Logger, log_file: Path) -> None:
     """Dodaje FileHandler do loggera (pomija jeśli już istnieje)."""
+    import os
+
     log_file = Path(log_file)
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
     abs_path = log_file.resolve()
     for h in logger.handlers:
-        if isinstance(h, logging.FileHandler) and Path(h.baseFilename).resolve() == abs_path:
-            return  # już dołączony
+        try:
+            if (
+                hasattr(h, "baseFilename")
+                and Path(h.baseFilename).resolve() == abs_path
+            ):
+                return  # już dołączony
+        except Exception:
+            pass
 
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    stream = open(log_file, "a", encoding="utf-8")
+
+    class _FlushingHandler(logging.StreamHandler):
+        def emit(self, record):
+            super().emit(record)
+            self.stream.flush()
+            os.fsync(self.stream.fileno())
+
+    file_handler = _FlushingHandler(stream)
     file_handler.setFormatter(_FILE_FORMATTER)
     logger.addHandler(file_handler)
 

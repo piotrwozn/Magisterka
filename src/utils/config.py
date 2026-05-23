@@ -144,7 +144,7 @@ XGB_DEFAULT_PARAMS: dict = {
     "reg_alpha": 0.1,
     "reg_lambda": 1.0,
     "tree_method": "hist",   # 'gpu_hist' jeśli masz GPU
-    "device": "cpu",          # 'cuda' jeśli masz GPU
+    "device": "cuda",
     "random_state": RANDOM_SEED,
     "early_stopping_rounds": 50,
     "n_jobs": -1,
@@ -184,10 +184,74 @@ EBM_DEFAULT_PARAMS: dict = {
     "random_state": RANDOM_SEED,
 }
 
+# CatBoost — multi-threaded CPU (komplementarny boosting do XGB/LGBM).
+# Uwaga: CatBoost używa innych nazw:
+#   - `random_seed`   (nie random_state)
+#   - `thread_count`  (nie n_jobs)
+#   - `iterations`    (nie n_estimators)
+#   - `depth`         (nie max_depth)
+#   - `l2_leaf_reg`   (nie reg_lambda)
+#   - `rsm`           (nie colsample_bylevel)
+CATBOOST_DEFAULT_PARAMS: dict = {
+    "loss_function": "MultiClass",
+    "eval_metric": "MultiClass",
+    "classes_count": 5,
+    "iterations": 2000,
+    "learning_rate": 0.05,
+    "depth": 8,
+    "l2_leaf_reg": 3.0,
+    "border_count": 254,             # liczba binów dla cech numerycznych (max quality)
+    "bootstrap_type": "MVS",         # nowoczesny CPU-default w CatBoost
+    "subsample": 0.8,
+    "rsm": 0.8,                       # column sampling per level
+    "grow_policy": "SymmetricTree",  # CatBoost signature — najbardziej stabilny
+    "boosting_type": "Plain",        # szybsza wersja (Ordered tylko dla <50k samples)
+    "random_seed": RANDOM_SEED,
+    "thread_count": -1,               # wszystkie rdzenie CPU
+    "task_type": "GPU",
+    "devices": "0",
+    "allow_writing_files": False,    # nie twórz folderu catboost_info/
+    "od_type": "Iter",                # early stopping mode
+    "od_wait": 100,                   # patience
+    "verbose": 100,                   # log co 100 iteracji
+}
+
+# ExtraTrees — maksymalna randomizacja (komplementarna do RF).
+# Większość parametrów jak RF, ale domyślnie bootstrap=False,
+# a criterion może być też 'friedman_mse' / 'mae' / 'poisson'.
+ET_DEFAULT_PARAMS: dict = {
+    "n_estimators": 500,
+    "max_depth": 20,
+    "min_samples_split": 10,
+    "min_samples_leaf": 5,
+    "class_weight": None,
+    "bootstrap": False,
+    "random_state": RANDOM_SEED,
+    "n_jobs": -1,
+    "verbose": 1,
+}
+
+# HistGradientBoosting — gradient boosting na histogramach (sklearn).
+# Inny inductive bias niż XGB/LGBM/CatBoost.
+HISTGBT_DEFAULT_PARAMS: dict = {
+    "learning_rate": 0.05,
+    "max_iter": 1000,
+    "max_depth": 6,
+    "max_leaf_nodes": 63,
+    "min_samples_leaf": 20,
+    "l2_regularization": 1.0,
+    "max_bins": 255,
+    "early_stopping": "auto",
+    "validation_fraction": 0.1,
+    "n_iter_no_change": 10,
+    "tol": 1e-7,
+    "random_state": RANDOM_SEED,
+}
+
 # ─────────────────────────────────────────
 # OPTUNA — TUNING
 # ─────────────────────────────────────────
-OPTUNA_N_TRIALS: int = 100
+OPTUNA_N_TRIALS: int = 300
 OPTUNA_TIMEOUT_SECONDS: int | None = None  # bez limitu czasu
 
 # ─────────────────────────────────────────

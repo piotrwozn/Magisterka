@@ -64,7 +64,7 @@ class LightGBMTriageModel(BaseTriageModel):
             sample_weights = None  # LightGBM użyje class_weight wewnętrznie
             self.train_logger.info("Wagi: class_weight='balanced' (LightGBM internal)")
         else:
-            sample_weights = compute_sample_weights(y_train, strategy=sample_weight_strategy)
+            sample_weights = compute_sample_weights(y_train, strategy=sample_weight_strategy, class_weights=self.optuna_class_weights)
             self.train_logger.info(
                 f"Wagi sampli: strategia='{sample_weight_strategy}', "
                 f"min={sample_weights.min():.2f}, max={sample_weights.max():.2f}"

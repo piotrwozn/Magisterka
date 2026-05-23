@@ -1,4 +1,4 @@
-"""Ewaluacja modeli triażowych: metryki, CV, wizualizacje."""
+"""Ewaluacja modeli triażowych: metryki, CV, wizualizacje, UQ."""
 
 from src.evaluation.cross_validation import (
     cross_validate_model,
@@ -10,6 +10,11 @@ from src.evaluation.metrics import (
     quadratic_weighted_kappa,
     undertriage_rate,
 )
+from src.evaluation.uncertainty import (
+    compute_ensemble_uq,
+    compute_model_uq,
+    ensemble_report,
+)
 from src.evaluation.visualizations import (
     plot_calibration,
     plot_confusion_matrix,
@@ -19,7 +24,10 @@ from src.evaluation.visualizations import (
 )
 
 __all__ = [
+    "compute_ensemble_uq",
+    "compute_model_uq",
     "cross_validate_model",
+    "ensemble_report",
     "full_evaluation",
     "overtriage_rate",
     "plot_calibration",

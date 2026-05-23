@@ -1,39 +1,29 @@
-"""
-Random Forest — interpretable baseline.
-
-Random Forest:
-    - Łatwy w treningu i tuningu
-    - Naturalnie odporny na overfitting
-    - Daje feature importances out-of-the-box
-    - Dobry baseline do porównań
-"""
-
 from __future__ import annotations
 
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import ExtraTreesClassifier
 
 from src.models.base import BaseTriageModel, compute_sample_weights
-from src.utils.config import RF_DEFAULT_PARAMS
+from src.utils.config import ET_DEFAULT_PARAMS
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
 
-class RandomForestTriageModel(BaseTriageModel):
-    """Random Forest dla 5-klasowej klasyfikacji triażu MTS."""
+class ExtraTreesTriageModel(BaseTriageModel):
+    """ExtraTrees dla 5-klasowej klasyfikacji triażu MTS."""
 
-    name = "random_forest"
+    name = "extra_trees"
 
     def __init__(self, params: dict[str, Any] | None = None):
-        merged = {**RF_DEFAULT_PARAMS, **(params or {})}
+        merged = {**ET_DEFAULT_PARAMS, **(params or {})}
         super().__init__(params=merged)
 
     def _build_model(self):
-        return RandomForestClassifier(**self.params)
+        return ExtraTreesClassifier(**self.params)
 
     def fit(
         self,
@@ -46,20 +36,13 @@ class RandomForestTriageModel(BaseTriageModel):
         use_mlflow: bool = False,
         feature_set: str = "triage_only",
         **kwargs,
-    ) -> "RandomForestTriageModel":
-        """
-        Trenuje Random Forest.
-
-        Uwaga: RF nie ma per-iteration metric (jak XGBoost) — zapisujemy tylko końcowe.
-        """
-        # 1. Setup trackingu
+    ) -> "ExtraTreesTriageModel":
         self._setup_tracking(run_id=run_id, use_mlflow=use_mlflow)
         self._log_data_info(X_train, y_train, X_val, y_val, feature_set=feature_set)
 
-        self.train_logger.info(f"Trenowanie Random Forest (n={len(X_train):,}, features={X_train.shape[1]})")
+        self.train_logger.info(f"Trenowanie ExtraTrees (n={len(X_train):,}, features={X_train.shape[1]})")
         self.feature_names = list(X_train.columns)
 
-        # 2. Wagi
         sample_weights = None
         if self.params.get("class_weight") not in ("balanced", "balanced_subsample"):
             sample_weights = compute_sample_weights(y_train, strategy=sample_weight_strategy, class_weights=self.optuna_class_weights)
@@ -70,7 +53,6 @@ class RandomForestTriageModel(BaseTriageModel):
         else:
             self.train_logger.info(f"Wagi: class_weight='{self.params['class_weight']}' (sklearn internal)")
 
-        # 3. Trenuj
         self.model = self._build_model()
         t0 = self._start_timer()
 
@@ -84,13 +66,11 @@ class RandomForestTriageModel(BaseTriageModel):
         self.classes_ = self.model.classes_
         self.is_fitted = True
 
-        # 4. Loguj OOB score jeśli dostępny
         oob_score = getattr(self.model, "oob_score_", None)
         if oob_score is not None:
             self.train_logger.info(f"OOB score: {oob_score:.4f}")
             self.tracker.log_metrics({"oob_score": oob_score})
 
-        # 5. Loguj train accuracy + val accuracy (jeśli mamy val)
         train_acc = self.model.score(X_train, y_train)
         self.train_logger.info(f"Train accuracy: {train_acc:.4f}")
         self.tracker.log_metrics({"train_accuracy": train_acc})
@@ -100,9 +80,8 @@ class RandomForestTriageModel(BaseTriageModel):
             self.train_logger.info(f"Val accuracy:   {val_acc:.4f}")
             self.tracker.log_metrics({"val_accuracy": val_acc})
 
-        self.train_logger.info(f"Trening Random Forest zakończony w {duration:.1f}s")
+        self.train_logger.info(f"Trening ExtraTrees zakończony w {duration:.1f}s")
 
-        # 6. Finalizuj
         self._finalize_tracking()
 
         return self
