@@ -1,0 +1,35 @@
+# Test profile — overrides for unit/integration tests
+
+server:
+  port: 0   # random port
+
+spring:
+  application:
+    name: sorai-gateway-test
+  kafka:
+    bootstrap-servers: localhost:9092
+
+ml:
+  base-url:        http://localhost:18000   # overridden by tests via @DynamicPropertySource
+  timeout-seconds: 5
+
+audit:
+  enabled: false           # test classes opt-in selectively
+  topic:   triage-predictions
+
+resilience4j:
+  retry:
+    instances:
+      mlService:
+        max-attempts: 2     # faster failure in tests
+        wait-duration: 50ms
+  circuitbreaker:
+    instances:
+      mlService:
+        sliding-window-size: 4
+        failure-rate-threshold: 60
+        wait-duration-in-open-state: 1s
+
+logging:
+  level:
+    com.sorai.gateway: DEBUG

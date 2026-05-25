@@ -1,0 +1,25 @@
+# Spring Boot Gateway — multi-stage build
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /workspace
+COPY backend/gateway/pom.xml ./pom.xml
+RUN mvn -B -e -DskipTests dependency:go-offline
+COPY backend/gateway/src ./src
+RUN mvn -B -DskipTests package
+
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /workspace/target/*.jar /app/gateway.jar
+
+ENV ML_BASE_URL=http://fastapi:8000 \
+    KAFKA_BOOTSTRAP_SERVERS=kafka:9092 \
+    SERVER_PORT=8080 \
+    AUDIT_ENABLED=true
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD curl -fsS http://localhost:8080/actuator/health || exit 1
+
+ENTRYPOINT ["java", "-jar", "/app/gateway.jar"]

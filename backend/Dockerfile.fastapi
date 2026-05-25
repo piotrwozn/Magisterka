@@ -1,0 +1,31 @@
+# FastAPI ML Service
+FROM python:3.12-slim AS base
+
+WORKDIR /app
+
+# System deps (libgomp for LightGBM, libstdc++ for CatBoost)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libstdc++6 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps
+COPY backend/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# App + project source (need src/features/engineering.py for runtime FE)
+COPY backend/app /app/app
+COPY backend/scripts /app/scripts
+COPY training/src /opt/sorai/src
+COPY backend/models /app/models
+
+ENV PYTHONPATH=/app:/opt/sorai \
+    MODELS_DIR=/app/models \
+    API_HOST=0.0.0.0 \
+    API_PORT=8000
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://localhost:8000/api/v1/health || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

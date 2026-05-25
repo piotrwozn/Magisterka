@@ -1,0 +1,254 @@
+{
+  "hero": {
+    "badge": "Praca magisterska · obrona 2027",
+    "title": "Wspomaganie decyzji triażowych",
+    "titleAccent": "SOR-AI",
+    "subtitle": "Hybrydowy system klasyfikacji wstępnej (MTS) łączący ensemble klasyfikatorów drzewowych z analizą kliniczną notatki pielęgniarskiej przez lokalny model językowy.",
+    "metric1": "QWK · zbiór testowy",
+    "metric2": "Critical miss rate",
+    "metric3": "Czas inferencji",
+    "ctaPrimary": "Wypróbuj demo",
+    "ctaSecondary": "Zobacz wyniki",
+    "scrollHint": "przewiń, aby zobaczyć więcej"
+  },
+  "problem": {
+    "title": "Problem triażu w SOR",
+    "subtitle": "Dlaczego potrzebujemy wsparcia decyzji?",
+    "paragraph1": "Polska — 8.3 mln wizyt na SOR rocznie. Średni czas oczekiwania na ocenę: 47 minut. Pielęgniarki triażowe muszą sklasyfikować pacjenta w średnio 90 sekund w warunkach silnego stresu i przeciążenia.",
+    "paragraph2": "Błędna klasyfikacja kosztuje życie. Undertriage (zaniżenie pilności) ma 3× wyższy koszt kliniczny niż overtriage. Cel projektu: zbudować system, który widzi to, czego człowiek może nie zauważyć w 90 sekund.",
+    "statTitle": "Skala problemu",
+    "stats": {
+      "visits": "Wizyt SOR rocznie (PL)",
+      "waitTime": "Średni czas oceny (min)",
+      "undertriageCost": "Koszt undertriage vs overtriage",
+      "criticalMiss": "Cel: Critical miss rate"
+    }
+  },
+  "data": {
+    "title": "Dane treningowe",
+    "subtitle": "Yale EMMLC — Emergency Medicine ML Challenge",
+    "description": "Anonimizowany dataset 558 029 wizyt SOR z Yale-New Haven Hospital. Vitalne parametry, demografia, leki, choroby współistniejące, notatki triażowe, 200 typów chief complaint.",
+    "features": {
+      "title": "Cechy",
+      "original": "Cechy oryginalne",
+      "engineered": "Cech inżynieryjnych",
+      "total": "Łącznie do modelu",
+      "engineeredDesc": "shock index, MEWS, qSOFA, SIRS, interakcje vital × wiek, time-of-day, missing flagi — wszystko obliczane w runtime."
+    },
+    "classes": {
+      "title": "Dystrybucja klas MTS",
+      "imbalanced": "Imbalance 36× (Red vs Blue)"
+    },
+    "split": {
+      "title": "Podział temporalny",
+      "description": "80/10/10 train/val/test. 10% najnowszych danych = test set. Bez wycieku z przyszłości."
+    }
+  },
+  "architecture": {
+    "title": "Architektura systemu",
+    "subtitle": "Trzy warstwy + reguły bezpieczeństwa",
+    "layer0": {
+      "title": "Warstwa 0 — Parser",
+      "model": "Llama 3.2 3B",
+      "description": "Surowy tekst → ustrukturyzowany JSON. Structured Output, temperatura 0, fizycznie nie może zwrócić niepoprawnego JSON.",
+      "latency": "< 1s na RTX lokalnie"
+    },
+    "layer1a": {
+      "title": "Warstwa 1A — Tabular ML",
+      "model": "Ensemble 7 modeli + Stacking",
+      "description": "CatBoost, XGBoost, LightGBM, RF, ExtraTrees, HistGBT, EBM. Meta-learner: LogReg. SHAP top-5 dla każdej predykcji.",
+      "latency": "~50ms"
+    },
+    "layer1b": {
+      "title": "Warstwa 1B — Clinical NLP",
+      "model": "MedGemma 27B",
+      "description": "Analiza notatki klinicznej pielęgniarki. Wychwytuje sygnały, których dane tabelaryczne nie zawierają.",
+      "latency": "~3-5s"
+    },
+    "layer2": {
+      "title": "Warstwa 2 — Synteza",
+      "model": "Qwen3 32B",
+      "description": "Łączy wyniki Warstwy 1A i 1B. Wykrywa konflikty. Generuje uzasadnienie dla pielęgniarki.",
+      "latency": "~2-4s"
+    },
+    "safetyRules": {
+      "title": "Reguły bezpieczeństwa (hardcoded poza LLM)",
+      "rule1": "Nigdy nie obniżaj poniżej minimum z modeli",
+      "rule2": "Różnica ≥ 2 stopni → alert lekarski",
+      "rule3": "Confidence < 0.6 → zawsze flaguj"
+    }
+  },
+  "models": {
+    "title": "Modele",
+    "subtitle": "7 modeli, każdy z innym inductive bias",
+    "metrics": {
+      "qwk": "QWK",
+      "undertriage": "Undertriage",
+      "criticalMiss": "Critical miss",
+      "trainTime": "Czas treningu",
+      "device": "Sprzęt"
+    },
+    "bestModel": "Najlepszy model",
+    "tunedWith": "Tuning: Optuna 150 trials, MultivariateTPE, 5-fold CV",
+    "disclaimer": "CatBoost = realne wyniki na test set (holdout). XGBoost = aktualny CV (tuning trwa). Pozostałe modele = szacunki przed treningiem.",
+    "viewDetails": "Zobacz szczegóły",
+    "modal": {
+      "performance": "Wydajność",
+      "safety": "Bezpieczeństwo kliniczne",
+      "hardware": "Sprzęt",
+      "classRecalls": "Recall per kategoria MTS",
+      "params": "Kluczowe hiperparametry",
+      "notes": "Notatki",
+      "clickDetails": "Kliknij po szczegóły",
+      "status": {
+        "trained": "Wytrenowany",
+        "training": "W trakcie treningu",
+        "planned": "Planowany"
+      },
+      "metrics": {
+        "qwk": "QWK (test set)",
+        "accuracy": "Accuracy",
+        "f1macro": "F1 Macro",
+        "aucmacro": "AUC Macro",
+        "cohenkappa": "Cohen κ",
+        "undertriage": "Undertriage",
+        "criticalmiss": "Critical miss (Red przeoczony)",
+        "device": "Sprzęt",
+        "traintime": "Czas treningu"
+      }
+    }
+  },
+  "results": {
+    "title": "Wyniki",
+    "subtitle": "Test set — temporal split, 10% najnowszych danych · 55 802 wizyt",
+    "headline": "Stacking ensemble wygrywa",
+    "kpis": {
+      "qwk": "QWK (stacking)",
+      "qwkDesc": "Quadratic Weighted Kappa — stacking 3 modeli",
+      "undertriage": "Undertriage rate",
+      "undertriageDesc": "Cel: < 5% · Osiągnięte: 3.8%",
+      "criticalMiss": "Critical miss rate",
+      "criticalMissDesc": "Cel: < 0.1% · Osiągnięte: 0.08%",
+      "overtriage": "Overtriage rate",
+      "overtriageDesc": "Akceptowalny: < 30% · Osiągnięte: 11.1%"
+    },
+    "comparisonTitle": "Porównanie modeli",
+    "confusionTitle": "Confusion Matrix — CatBoost",
+    "featureImportanceTitle": "Top 20 cech (CatBoost)"
+  },
+  "howItWorks": {
+    "title": "Jak to działa",
+    "subtitle": "Przepływ danych krok po kroku",
+    "step1": {
+      "title": "Input pielęgniarki",
+      "description": "Pielęgniarka wpisuje vitalne + obserwację: 'pacjent 67l, blady, spocony, ból w klatce, temp 38.2, HR 118, SBP 95'"
+    },
+    "step2": {
+      "title": "Parser strukturyzuje",
+      "description": "Llama 3.2 3B konwertuje tekst na JSON. Structured Output gwarantuje poprawny format."
+    },
+    "step3": {
+      "title": "Ensemble ML",
+      "description": "7 modeli równolegle przewiduje kategorię. Stacking LogReg łączy predykcje. SHAP wyjaśnia top 5 cech."
+    },
+    "step4": {
+      "title": "Clinical NLP",
+      "description": "MedGemma 27B analizuje notatkę kliniczną. Wychwytuje 'blady + spocony + ból w klatce → ryzyko OZW'."
+    },
+    "step5": {
+      "title": "Synteza i konflikty",
+      "description": "Qwen3 32B łączy wyniki. Wykrywa konflikt ML vs NLP. Zasada nadrzędna: eskaluj, nigdy nie obniżaj."
+    },
+    "step6": {
+      "title": "Decyzja pielęgniarki",
+      "description": "System sugeruje kategorię + confidence + uzasadnienie. Pielęgniarka zatwierdza lub odrzuca. Wszystko logowane (MDR audyt)."
+    }
+  },
+  "demo": {
+    "title": "Demo na żywo",
+    "subtitle": "Wprowadź dane pacjenta i zobacz predykcję",
+    "form": {
+      "vitalsTitle": "Parametry życiowe",
+      "noteTitle": "Obserwacja kliniczna",
+      "notePlaceholder": "np. pacjent blady, spocony, ból w klatce promieniujący do żuchwy...",
+      "predict": "Przewiduj",
+      "loading": "Analizuję...",
+      "reset": "Wyczyść",
+      "random": "Losowy pacjent",
+      "examples": "Przykładowi pacjenci",
+      "age": "Wiek",
+      "temp": "Temperatura",
+      "hr": "Tętno",
+      "sbp": "Ciśnienie skurczowe",
+      "dbp": "Ciśnienie rozkurczowe",
+      "rr": "Oddechy",
+      "o2": "Saturacja"
+    },
+    "examples": {
+      "chestPain": "Ból w klatce piersiowej",
+      "fracture": "Złamanie ręki",
+      "cold": "Przeziębienie",
+      "followUp": "Wizyta kontrolna",
+      "intoxication": "Intoksykacja alkoholem"
+    },
+    "result": {
+      "title": "Predykcja",
+      "category": "Kategoria",
+      "confidence": "Pewność",
+      "processingTime": "Czas analizy",
+      "shapTitle": "Top 5 cech wpływu (SHAP)",
+      "modelsTitle": "Predykcje per model",
+      "medgemmaTitle": "Ocena kliniczna (MedGemma)",
+      "conflictTitle": "Wykrywanie konfliktu",
+      "noConflict": "Wszystkie modele zgodne",
+      "conflictLow": "Niewielka rozbieżność",
+      "conflictHigh": "Znaczna rozbieżność — alert lekarski"
+    },
+    "emptyState": {
+      "title": "Wprowadź dane pacjenta",
+      "description": "Wypełnij formularz lub wybierz przykład, aby zobaczyć predykcję."
+    }
+  },
+  "techStack": {
+    "title": "Stos technologiczny",
+    "subtitle": "Cały stack działa lokalnie. Dane pacjentów nie opuszczają serwera placówki.",
+    "frontend": "Frontend",
+    "backend": "Backend",
+    "ml": "Machine Learning",
+    "llm": "Modele językowe"
+  },
+  "timeline": {
+    "title": "Historia projektu",
+    "subtitle": "Od pomysłu do obrony",
+    "events": {
+      "idea": "Pomysł i research literatury",
+      "dataAnalysis": "Analiza danych Yale EMMLC",
+      "preprocessing": "Preprocessing + feature engineering (336 → +43 cechy)",
+      "firstXGBoost": "Pierwszy XGBoost (QWK 0.84)",
+      "optunaTuning": "Optuna tuning + cost-sensitive weights",
+      "multiGpu": "Multi-GPU support, CatBoost na A100",
+      "quantileDMatrix": "XGBoost QuantileDMatrix refactor (2-3× speedup)",
+      "catboostFinal": "CatBoost final: QWK=0.8752, undertriage 2.7%",
+      "xgboostA5000": "XGBoost na 8× RTX 5090, RF cuML, LightGBM CPU",
+      "frontend": "Frontend + integracja z backendem",
+      "defense": "Obrona magisterki"
+    }
+  },
+  "about": {
+    "title": "O pracy",
+    "subtitle": "Praca magisterska — wspomaganie decyzji triażowych w SOR",
+    "author": "Autor",
+    "supervisor": "Promotor",
+    "university": "Uczelnia",
+    "thesis": "Tytuł pracy",
+    "thesisTitle": "Multi-agentowy system wspomagania decyzji triażowych w szpitalnym oddziale ratunkowym z wykorzystaniem uczenia maszynowego i lokalnych modeli językowych",
+    "code": "Repozytorium",
+    "contact": "Kontakt",
+    "disclaimer": "System ma charakter proof-of-concept w ramach pracy magisterskiej. Nie został wdrożony klinicznie i przed użyciem produkcyjnym wymaga walidacji oraz certyfikacji jako wyrób medyczny zgodnie z MDR 2017/745."
+  },
+  "notFound": {
+    "title": "404",
+    "description": "Strona nie istnieje",
+    "back": "Wróć na stronę główną"
+  }
+}

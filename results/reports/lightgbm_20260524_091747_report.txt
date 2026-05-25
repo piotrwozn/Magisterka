@@ -1,0 +1,121 @@
+============================================================
+SOR-AI: Raport treningu modelu
+============================================================
+
+Run ID:       20260524_091747
+Model:        lightgbm
+Feature set:  triage_only
+Czas treningu: 524.9 s
+Liczba cech:  336
+
+HIPERPARAMETRY:
+{
+  "objective": "multiclass",
+  "num_class": 5,
+  "n_estimators": 2100,
+  "max_depth": 12,
+  "num_leaves": 33,
+  "learning_rate": 0.05593788034661179,
+  "subsample": 0.5226086021934225,
+  "colsample_bytree": 0.5508554108068936,
+  "min_child_samples": 140,
+  "class_weight": "balanced",
+  "random_state": 42,
+  "n_jobs": -1,
+  "verbosity": -1,
+  "boosting_type": "gbdt",
+  "reg_alpha": 1.7920478130885547e-07,
+  "reg_lambda": 1.0338626789716032e-07,
+  "min_split_gain": 1.5161715941504554e-06,
+  "max_bin": 960,
+  "feature_fraction_bynode": 0.6184289210378613,
+  "extra_trees": false,
+  "path_smooth": 0.42925046891986407
+}
+
+OPTUNA TUNING:
+  Najlepsza wartość QWK: 0.8756
+  Liczba prób: 152
+  Najlepsze parametry:
+{
+  "boosting_type": "gbdt",
+  "num_leaves": 33,
+  "max_depth": 12,
+  "learning_rate": 0.05593788034661179,
+  "n_estimators": 2100,
+  "subsample": 0.5226086021934225,
+  "colsample_bytree": 0.5508554108068936,
+  "min_child_samples": 140,
+  "reg_alpha": 1.7920478130885547e-07,
+  "reg_lambda": 1.0338626789716032e-07,
+  "min_split_gain": 1.5161715941504554e-06,
+  "max_bin": 960,
+  "feature_fraction_bynode": 0.6184289210378613,
+  "extra_trees": false,
+  "path_smooth": 0.42925046891986407,
+  "cw_red": 3.689606398565269,
+  "cw_orange": 1.453307140065737,
+  "cw_green": 1.88207156118579,
+  "cw_blue": 1.8353602969191005
+}
+
+METRYKI (TEST SET):
+  test_quadratic_weighted_kappa : 0.8705
+  test_linear_weighted_kappa    : 0.8085
+  test_cohen_kappa              : 0.7280
+  test_accuracy                 : 0.8633
+  test_f1_macro                 : 0.6865
+  test_f1_weighted              : 0.8662
+  test_auc_macro                : 0.9704
+  test_auc_red                  : 0.9955
+  test_auc_orange               : 0.9594
+  test_auc_yellow               : 0.9465
+  test_auc_green                : 0.9628
+  test_auc_blue                 : 0.9878
+  test_log_loss                 : 0.3231
+  test_undertriage_rate         : 0.0480
+  test_overtriage_rate          : 0.0923
+  test_critical_miss_rate       : 0.0041
+  test_precision_red            : 0.9839
+  test_recall_red               : 0.9595
+  test_f1_red                   : 0.9715
+  test_support_red              : 38451
+  test_precision_orange         : 0.6552
+  test_recall_orange            : 0.7374
+  test_f1_orange                : 0.6939
+  test_support_orange           : 7285
+  test_precision_yellow         : 0.6566
+  test_recall_yellow            : 0.5592
+  test_f1_yellow                : 0.6040
+  test_support_yellow           : 6760
+  test_precision_green          : 0.4515
+  test_recall_green             : 0.6057
+  test_f1_green                 : 0.5174
+  test_support_green            : 2285
+  test_precision_blue           : 0.5799
+  test_recall_blue              : 0.7287
+  test_f1_blue                  : 0.6458
+  test_support_blue             : 1021
+  test_confusion_matrix         : [[36893, 1081, 320, 148, 9], [193, 5372, 1344, 292, 84], [274, 1579, 3780, 1030, 97], [122, 142, 288, 1384, 349], [16, 25, 25, 211, 744]]
+
+TOP 20 NAJWAŻNIEJSZYCH CECH:
+  age                                 33457.0000
+  arrivalmonth                        19195.0000
+  arrivalday                          16673.0000
+  arrivalhour_bin                     15720.0000
+  insurance_status                    10951.0000
+  maritalstatus                       9992.0000
+  arrivalmode                         9361.0000
+  dep_name                            8864.0000
+  race                                8596.0000
+  gender                              5799.0000
+  pulse_pressure_ratio                5389.0000
+  hr_x_dbp                            5219.0000
+  sbp_x_rr                            4787.0000
+  hr_sbp_product                      4735.0000
+  dbp_x_rr                            4579.0000
+  shock_index                         4443.0000
+  cc_count                            4228.0000
+  hr_x_rr                             4168.0000
+  sbp_dbp_ratio                       4162.0000
+  sbp_x_dbp                           4136.0000

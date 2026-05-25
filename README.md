@@ -77,25 +77,28 @@ streamlit run app/streamlit_app.py
 
 ```
 sor-ai-triage/
-├── data/                  # surowe i przetworzone dane
-│   ├── raw/               # 5v_cleandf.rdata
-│   └── processed/         # train.parquet, val.parquet, test.parquet
-├── src/
-│   ├── data/              # ładowanie, preprocessing, ESI→MTS, splity
-│   ├── models/            # XGBoost, LightGBM, RF, EBM, fusion + tuning + train pipeline
-│   ├── evaluation/        # metryki, CV, wizualizacje
-│   ├── explain/           # SHAP, LIME, DiCE, MTS rules, Ollama
-│   └── utils/             # config, logger, experiment_tracker
-├── app/                   # Streamlit demo
-├── scripts/               # CLI: 01_convert, 02_preprocess, 03_train, 04_evaluate, 05_explain, 06_cross_validate
-├── notebooks/             # EDA, training, explainability
-├── models/                # zapisane artefakty modeli (.joblib)
-├── logs/                  # logi treningu + JSON-y eksperymentów (kluczowe dla pracy magisterskiej!)
-│   ├── training/          # logi tekstowe per model+run
-│   ├── evaluation/        # logi z CV/ewaluacji
-│   └── experiments/       # JSON-y z pełnymi metadanymi (params, history, metryki)
-├── results/               # wykresy, tabele, raporty
-└── tests/                 # testy jednostkowe (66 testów)
+├── training/              # ML training — kod, dane, eksperymenty
+│   ├── src/               # modele, tuning, ewaluacja, explainability
+│   │   ├── data/          # ładowanie, preprocessing, ESI→MTS, splity
+│   │   ├── models/        # XGBoost, LightGBM, RF, EBM, fusion + tuning + train pipeline
+│   │   ├── evaluation/    # metryki, CV, wizualizacje
+│   │   ├── explain/       # SHAP, LIME, DiCE, MTS rules, Ollama
+│   │   └── utils/         # config, logger, experiment_tracker
+│   ├── scripts/           # CLI: 01_convert → 06_cross_validate
+│   ├── notebooks/         # EDA, training, explainability
+│   ├── app/               # Streamlit demo
+│   ├── tests/             # testy jednostkowe ML (66+ testów)
+│   ├── data/              # dane surowe i przetworzone
+│   └── logs/              # logi treningu + JSON-y eksperymentów
+├── backend/               # system produkcyjny (FastAPI + Spring Boot + Kafka)
+│   ├── app/               # FastAPI ML inference service
+│   ├── gateway/           # Spring Boot API gateway (Java 21)
+│   ├── tests/             # testy backendu (79 testów, 85% coverage)
+│   └── docker-compose.yml
+├── frontend/              # React 18 + TypeScript + Tailwind + three.js
+│   └── src/               # 93 pliki — journey, demo, i18n PL/EN
+├── models/                # wytrenowane .joblib (wspólne dla training/ i backend/)
+├── results/               # figury, tabele, raporty do pracy magisterskiej
 ```
 
 ## Logowanie i tracking eksperymentów

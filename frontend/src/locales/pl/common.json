@@ -1,0 +1,56 @@
+{
+  "nav": {
+    "home": "Strona główna",
+    "demo": "Demo",
+    "models": "Modele",
+    "about": "O projekcie",
+    "sections": {
+      "hero": "Start",
+      "problem": "Problem",
+      "data": "Dane",
+      "architecture": "Architektura",
+      "models": "Modele",
+      "results": "Wyniki",
+      "howItWorks": "Jak to działa",
+      "demo": "Demo",
+      "techStack": "Technologie",
+      "timeline": "Historia"
+    }
+  },
+  "common": {
+    "loading": "Ładowanie...",
+    "error": "Wystąpił błąd",
+    "retry": "Spróbuj ponownie",
+    "submit": "Wyślij",
+    "reset": "Reset",
+    "close": "Zamknij",
+    "save": "Zapisz",
+    "cancel": "Anuluj",
+    "language": "Język",
+    "theme": {
+      "light": "Jasny",
+      "dark": "Ciemny",
+      "system": "System"
+    }
+  },
+  "footer": {
+    "tagline": "System wspomagania decyzji triażowych SOR",
+    "rights": "Wszystkie prawa zastrzeżone.",
+    "thesis": "Praca magisterska",
+    "github": "GitHub",
+    "documentation": "Dokumentacja"
+  },
+  "mts": {
+    "title": "Manchester Triage System",
+    "red": "Czerwony",
+    "orange": "Pomarańczowy",
+    "yellow": "Żółty",
+    "green": "Zielony",
+    "blue": "Niebieski",
+    "redDesc": "Natychmiastowy",
+    "orangeDesc": "Bardzo pilny",
+    "yellowDesc": "Pilny",
+    "greenDesc": "Standardowy",
+    "blueDesc": "Niepilny"
+  }
+}

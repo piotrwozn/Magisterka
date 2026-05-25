@@ -1,0 +1,122 @@
+============================================================
+SOR-AI: Raport treningu modelu
+============================================================
+
+Run ID:       20260523_203330
+Model:        xgboost
+Feature set:  triage_only
+Czas treningu: 69.2 s
+Liczba cech:  336
+
+HIPERPARAMETRY:
+{
+  "objective": "multi:softprob",
+  "num_class": 5,
+  "eval_metric": [
+    "mlogloss",
+    "merror"
+  ],
+  "max_depth": 14,
+  "learning_rate": 0.011276845634859846,
+  "n_estimators": 3500,
+  "subsample": 0.4159144701972361,
+  "colsample_bytree": 0.8302094061586821,
+  "min_child_weight": 4.855197109051782,
+  "gamma": 0.00027594612357607657,
+  "reg_alpha": 0.7018145123203495,
+  "reg_lambda": 0.6203354216174954,
+  "tree_method": "hist",
+  "device": "cuda",
+  "random_state": 42,
+  "early_stopping_rounds": 50,
+  "n_jobs": -1,
+  "colsample_bylevel": 0.5688166889236826,
+  "colsample_bynode": 0.8986969653410053,
+  "max_bin": 1280,
+  "grow_policy": "lossguide"
+}
+
+OPTUNA TUNING:
+  Najlepsza wartość QWK: 0.8786
+  Liczba prób: 92
+  Najlepsze parametry:
+{
+  "n_estimators": 3500,
+  "learning_rate": 0.011276845634859846,
+  "max_depth": 14,
+  "min_child_weight": 4.855197109051782,
+  "gamma": 0.00027594612357607657,
+  "reg_alpha": 0.7018145123203495,
+  "reg_lambda": 0.6203354216174954,
+  "subsample": 0.4159144701972361,
+  "colsample_bytree": 0.8302094061586821,
+  "colsample_bylevel": 0.5688166889236826,
+  "colsample_bynode": 0.8986969653410053,
+  "max_bin": 1280,
+  "grow_policy": "lossguide",
+  "cw_red": 2.0527888618189953,
+  "cw_orange": 1.0599895611508607,
+  "cw_green": 3.3026780724926583,
+  "cw_blue": 5.132695479324713
+}
+
+METRYKI (TEST SET):
+  test_quadratic_weighted_kappa : 0.0000
+  test_linear_weighted_kappa    : 0.0000
+  test_cohen_kappa              : 0.0000
+  test_accuracy                 : 0.6891
+  test_f1_macro                 : 0.1632
+  test_f1_weighted              : 0.5622
+  test_auc_macro                : 0.9548
+  test_auc_red                  : 0.9935
+  test_auc_orange               : 0.9426
+  test_auc_yellow               : 0.9337
+  test_auc_green                : 0.9298
+  test_auc_blue                 : 0.9745
+  test_log_loss                 : 1.0299
+  test_undertriage_rate         : 0.0000
+  test_overtriage_rate          : 1.0000
+  test_critical_miss_rate       : 0.0000
+  test_precision_red            : 0.6891
+  test_recall_red               : 1.0000
+  test_f1_red                   : 0.8159
+  test_support_red              : 38451
+  test_precision_orange         : 0.0000
+  test_recall_orange            : 0.0000
+  test_f1_orange                : 0.0000
+  test_support_orange           : 7285
+  test_precision_yellow         : 0.0000
+  test_recall_yellow            : 0.0000
+  test_f1_yellow                : 0.0000
+  test_support_yellow           : 6760
+  test_precision_green          : 0.0000
+  test_recall_green             : 0.0000
+  test_f1_green                 : 0.0000
+  test_support_green            : 2285
+  test_precision_blue           : 0.0000
+  test_recall_blue              : 0.0000
+  test_f1_blue                  : 0.0000
+  test_support_blue             : 1021
+  test_confusion_matrix         : [[38451, 0, 0, 0, 0], [7285, 0, 0, 0, 0], [6760, 0, 0, 0, 0], [2285, 0, 0, 0, 0], [1021, 0, 0, 0, 0]]
+
+TOP 20 NAJWAŻNIEJSZYCH CECH:
+  temp_x_rr                           0.1676
+  temp_deviation                      0.1381
+  triage_vital_temp                   0.1249
+  temp_squared                        0.0900
+  temp_hr_interaction                 0.0389
+  temp_x_o2                           0.0334
+  arrivalmode                         0.0149
+  temp_x_hr                           0.0144
+  rr_hr_ratio                         0.0112
+  hr_rr_ratio                         0.0109
+  sbp_x_rr                            0.0096
+  dep_name                            0.0082
+  critical_cc_count                   0.0068
+  cardiac_high_risk                   0.0066
+  o2_rr_ratio                         0.0063
+  temp_hr_ratio                       0.0062
+  cc_abdominal_group                  0.0054
+  triage_vital_rr                     0.0054
+  insurance_status                    0.0054
+  cc_abdominalpain                    0.0053

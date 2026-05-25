@@ -1,0 +1,254 @@
+{
+  "hero": {
+    "badge": "Master's Thesis · defense 2027",
+    "title": "Emergency Triage Decision Support",
+    "titleAccent": "SOR-AI",
+    "subtitle": "Hybrid Manchester Triage classifier combining tree-based ensemble with clinical-note analysis via local language model.",
+    "metric1": "QWK · test set",
+    "metric2": "Critical miss rate",
+    "metric3": "Inference time",
+    "ctaPrimary": "Try the demo",
+    "ctaSecondary": "View results",
+    "scrollHint": "scroll for more"
+  },
+  "problem": {
+    "title": "The triage problem",
+    "subtitle": "Why we need decision support",
+    "paragraph1": "Poland — 8.3M emergency department visits annually. Average assessment wait time: 47 minutes. Triage nurses must classify patients in an average of 90 seconds under severe stress and overload.",
+    "paragraph2": "Misclassification costs lives. Undertriage (downgrading urgency) has 3× higher clinical cost than overtriage. Project goal: build a system that sees what humans might miss in 90 seconds.",
+    "statTitle": "Scale of the problem",
+    "stats": {
+      "visits": "ED visits annually (PL)",
+      "waitTime": "Average assessment time (min)",
+      "undertriageCost": "Undertriage vs overtriage cost",
+      "criticalMiss": "Target: Critical miss rate"
+    }
+  },
+  "data": {
+    "title": "Training data",
+    "subtitle": "Yale EMMLC — Emergency Medicine ML Challenge",
+    "description": "Anonymized dataset of 558,029 ED visits from Yale-New Haven Hospital. Vitals, demographics, medications, comorbidities, triage notes, 200 chief complaint categories.",
+    "features": {
+      "title": "Features",
+      "original": "Original features",
+      "engineered": "Engineered features",
+      "total": "Total to model",
+      "engineeredDesc": "shock index, MEWS, qSOFA, SIRS, vital × age interactions, time-of-day, missing flags — all computed at runtime."
+    },
+    "classes": {
+      "title": "MTS class distribution",
+      "imbalanced": "36× imbalance (Red vs Blue)"
+    },
+    "split": {
+      "title": "Temporal split",
+      "description": "80/10/10 train/val/test. 10% most recent = test set. No leakage from the future."
+    }
+  },
+  "architecture": {
+    "title": "System architecture",
+    "subtitle": "Three layers + safety rules",
+    "layer0": {
+      "title": "Layer 0 — Parser",
+      "model": "Llama 3.2 3B",
+      "description": "Raw text → structured JSON. Structured output, temperature 0, physically cannot return invalid JSON.",
+      "latency": "< 1s on local RTX"
+    },
+    "layer1a": {
+      "title": "Layer 1A — Tabular ML",
+      "model": "Ensemble of 7 models + Stacking",
+      "description": "CatBoost, XGBoost, LightGBM, RF, ExtraTrees, HistGBT, EBM. Meta-learner: LogReg. SHAP top-5 for every prediction.",
+      "latency": "~50ms"
+    },
+    "layer1b": {
+      "title": "Layer 1B — Clinical NLP",
+      "model": "MedGemma 27B",
+      "description": "Analyzes nurse's clinical note. Catches signals that tabular data doesn't contain.",
+      "latency": "~3-5s"
+    },
+    "layer2": {
+      "title": "Layer 2 — Synthesis",
+      "model": "Qwen3 32B",
+      "description": "Combines results from Layer 1A and 1B. Detects conflicts. Generates reasoning for the nurse.",
+      "latency": "~2-4s"
+    },
+    "safetyRules": {
+      "title": "Safety rules (hardcoded outside LLM)",
+      "rule1": "Never go below the minimum of models",
+      "rule2": "Difference ≥ 2 grades → doctor alert",
+      "rule3": "Confidence < 0.6 → always flag"
+    }
+  },
+  "models": {
+    "title": "Models",
+    "subtitle": "7 models, each with a different inductive bias",
+    "metrics": {
+      "qwk": "QWK",
+      "undertriage": "Undertriage",
+      "criticalMiss": "Critical miss",
+      "trainTime": "Training time",
+      "device": "Hardware"
+    },
+    "bestModel": "Best model",
+    "tunedWith": "Tuning: Optuna 150 trials, MultivariateTPE, 5-fold CV",
+    "disclaimer": "CatBoost = real test set (holdout) results. XGBoost = current CV (tuning in progress). Other models = pre-training estimates.",
+    "viewDetails": "View details",
+    "modal": {
+      "performance": "Performance",
+      "safety": "Clinical Safety",
+      "hardware": "Hardware",
+      "classRecalls": "Recall per MTS category",
+      "params": "Key hyperparameters",
+      "notes": "Notes",
+      "clickDetails": "Click for details",
+      "status": {
+        "trained": "Trained",
+        "training": "Training",
+        "planned": "Planned"
+      },
+      "metrics": {
+        "qwk": "QWK (test set)",
+        "accuracy": "Accuracy",
+        "f1macro": "F1 Macro",
+        "aucmacro": "AUC Macro",
+        "cohenkappa": "Cohen κ",
+        "undertriage": "Undertriage",
+        "criticalmiss": "Critical miss (Red missed)",
+        "device": "Hardware",
+        "traintime": "Training time"
+      }
+    }
+  },
+  "results": {
+    "title": "Results",
+    "subtitle": "Test set — temporal split, 10% most recent data · 55,802 visits",
+    "headline": "Stacking ensemble wins",
+    "kpis": {
+      "qwk": "QWK (stacking)",
+      "qwkDesc": "Quadratic Weighted Kappa — 3-model stacking ensemble",
+      "undertriage": "Undertriage rate",
+      "undertriageDesc": "Target: < 5% · Achieved: 3.8%",
+      "criticalMiss": "Critical miss rate",
+      "criticalMissDesc": "Target: < 0.1% · Achieved: 0.08%",
+      "overtriage": "Overtriage rate",
+      "overtriageDesc": "Acceptable: < 30% · Achieved: 11.1%"
+    },
+    "comparisonTitle": "Model comparison",
+    "confusionTitle": "Confusion Matrix — CatBoost",
+    "featureImportanceTitle": "Top 20 features (CatBoost)"
+  },
+  "howItWorks": {
+    "title": "How it works",
+    "subtitle": "Data flow step by step",
+    "step1": {
+      "title": "Nurse input",
+      "description": "Nurse enters vitals + observation: 'patient 67y, pale, sweaty, chest pain, temp 38.2, HR 118, SBP 95'"
+    },
+    "step2": {
+      "title": "Parser structures it",
+      "description": "Llama 3.2 3B converts text to JSON. Structured Output guarantees valid format."
+    },
+    "step3": {
+      "title": "ML ensemble",
+      "description": "7 models predict the category in parallel. LogReg stacking combines predictions. SHAP explains top 5 features."
+    },
+    "step4": {
+      "title": "Clinical NLP",
+      "description": "MedGemma 27B analyzes the clinical note. Catches 'pale + sweaty + chest pain → ACS risk'."
+    },
+    "step5": {
+      "title": "Synthesis and conflicts",
+      "description": "Qwen3 32B combines results. Detects ML vs NLP conflict. Master rule: escalate, never downgrade."
+    },
+    "step6": {
+      "title": "Nurse decides",
+      "description": "System suggests category + confidence + reasoning. Nurse confirms or rejects. Everything logged (MDR audit)."
+    }
+  },
+  "demo": {
+    "title": "Live demo",
+    "subtitle": "Enter patient data and see the prediction",
+    "form": {
+      "vitalsTitle": "Vital signs",
+      "noteTitle": "Clinical observation",
+      "notePlaceholder": "e.g. patient pale, sweaty, chest pain radiating to jaw...",
+      "predict": "Predict",
+      "loading": "Analyzing...",
+      "reset": "Clear",
+      "random": "Random patient",
+      "examples": "Example patients",
+      "age": "Age",
+      "temp": "Temperature",
+      "hr": "Heart rate",
+      "sbp": "Systolic BP",
+      "dbp": "Diastolic BP",
+      "rr": "Respiratory rate",
+      "o2": "Oxygen saturation"
+    },
+    "examples": {
+      "chestPain": "Chest pain",
+      "fracture": "Arm fracture",
+      "cold": "Common cold",
+      "followUp": "Follow-up visit",
+      "intoxication": "Alcohol intoxication"
+    },
+    "result": {
+      "title": "Prediction",
+      "category": "Category",
+      "confidence": "Confidence",
+      "processingTime": "Analysis time",
+      "shapTitle": "Top 5 SHAP features",
+      "modelsTitle": "Per-model predictions",
+      "medgemmaTitle": "Clinical assessment (MedGemma)",
+      "conflictTitle": "Conflict detection",
+      "noConflict": "All models agree",
+      "conflictLow": "Minor disagreement",
+      "conflictHigh": "Major disagreement — doctor alert"
+    },
+    "emptyState": {
+      "title": "Enter patient data",
+      "description": "Fill the form or pick an example to see the prediction."
+    }
+  },
+  "techStack": {
+    "title": "Technology stack",
+    "subtitle": "The whole stack runs on-premise. Patient data never leaves the hospital server.",
+    "frontend": "Frontend",
+    "backend": "Backend",
+    "ml": "Machine Learning",
+    "llm": "Language models"
+  },
+  "timeline": {
+    "title": "Project timeline",
+    "subtitle": "From idea to defense",
+    "events": {
+      "idea": "Idea and literature research",
+      "dataAnalysis": "Yale EMMLC data analysis",
+      "preprocessing": "Preprocessing + feature engineering (336 → +43 features)",
+      "firstXGBoost": "First XGBoost (QWK 0.84)",
+      "optunaTuning": "Optuna tuning + cost-sensitive weights",
+      "multiGpu": "Multi-GPU support, CatBoost on A100",
+      "quantileDMatrix": "XGBoost QuantileDMatrix refactor (2-3× speedup)",
+      "catboostFinal": "CatBoost final: QWK=0.8752, undertriage 2.7%",
+      "xgboostA5000": "XGBoost on 8× RTX 5090, RF cuML, LightGBM CPU",
+      "frontend": "Frontend + backend integration",
+      "defense": "Thesis defense"
+    }
+  },
+  "about": {
+    "title": "About the thesis",
+    "subtitle": "Master's thesis — emergency triage decision support",
+    "author": "Author",
+    "supervisor": "Supervisor",
+    "university": "University",
+    "thesis": "Thesis title",
+    "thesisTitle": "Multi-agent decision support system for emergency department triage using machine learning and local language models",
+    "code": "Repository",
+    "contact": "Contact",
+    "disclaimer": "The system is a proof-of-concept developed as part of a Master's thesis. It has not been deployed clinically and requires validation and certification as a medical device under MDR 2017/745 prior to production use."
+  },
+  "notFound": {
+    "title": "404",
+    "description": "Page not found",
+    "back": "Back to home"
+  }
+}

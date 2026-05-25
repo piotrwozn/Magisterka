@@ -1,0 +1,57 @@
+# SOR-AI Gateway configuration
+
+server:
+  port: 8080
+  compression:
+    enabled: true
+  http2:
+    enabled: true
+
+spring:
+  application:
+    name: sorai-gateway
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
+# Internal ML service (FastAPI)
+ml:
+  base-url:        ${ML_BASE_URL:http://localhost:8000}
+  timeout-seconds: 30
+
+# Audit log
+audit:
+  enabled: ${AUDIT_ENABLED:true}
+  topic:   triage-predictions
+
+# Resilience4j
+resilience4j:
+  circuitbreaker:
+    instances:
+      mlService:
+        sliding-window-size: 20
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 5
+  retry:
+    instances:
+      mlService:
+        max-attempts: 3
+        wait-duration: 250ms
+
+# Actuator endpoints (metrics, health, info)
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+  metrics:
+    tags:
+      application: sorai-gateway
+
+logging:
+  level:
+    com.sorai.gateway: INFO
+    org.springframework.web: INFO

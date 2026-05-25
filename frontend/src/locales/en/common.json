@@ -1,0 +1,56 @@
+{
+  "nav": {
+    "home": "Home",
+    "demo": "Demo",
+    "models": "Models",
+    "about": "About",
+    "sections": {
+      "hero": "Start",
+      "problem": "Problem",
+      "data": "Data",
+      "architecture": "Architecture",
+      "models": "Models",
+      "results": "Results",
+      "howItWorks": "How it works",
+      "demo": "Demo",
+      "techStack": "Tech Stack",
+      "timeline": "Timeline"
+    }
+  },
+  "common": {
+    "loading": "Loading...",
+    "error": "An error occurred",
+    "retry": "Retry",
+    "submit": "Submit",
+    "reset": "Reset",
+    "close": "Close",
+    "save": "Save",
+    "cancel": "Cancel",
+    "language": "Language",
+    "theme": {
+      "light": "Light",
+      "dark": "Dark",
+      "system": "System"
+    }
+  },
+  "footer": {
+    "tagline": "Emergency Department Triage Decision Support System",
+    "rights": "All rights reserved.",
+    "thesis": "Master's Thesis",
+    "github": "GitHub",
+    "documentation": "Documentation"
+  },
+  "mts": {
+    "title": "Manchester Triage System",
+    "red": "Red",
+    "orange": "Orange",
+    "yellow": "Yellow",
+    "green": "Green",
+    "blue": "Blue",
+    "redDesc": "Immediate",
+    "orangeDesc": "Very urgent",
+    "yellowDesc": "Urgent",
+    "greenDesc": "Standard",
+    "blueDesc": "Non-urgent"
+  }
+}

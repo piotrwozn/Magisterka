@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sor-ai-triage"
+version = "0.1.0"
+description = "SOR-AI: System Klasyfikacji Triażu MTS oparty na ML (praca magisterska)"
+authors = [
+    { name = "Piotr (Magisterka)" }
+]
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = [
+    "triage", "machine-learning", "explainable-ai",
+    "emergency-department", "mts", "esi", "xgboost", "shap"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+
+[project.urls]
+Repository = "https://github.com/anomalyco/sor-ai-triage"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+# ─────────────────────────────────────────
+# Konfiguracja narzędzi developerskich
+# ─────────────────────────────────────────
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "UP"]
+ignore = ["E501"]  # dlugość obsługuje black
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-ra --strict-markers --tb=short"
+markers = [
+    "slow: testy długo trwające",
+    "integration: testy integracyjne",
+]
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["*/tests/*", "*/__init__.py"]
