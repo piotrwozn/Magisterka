@@ -15,6 +15,8 @@ Zasady:
     - Tylko cechy z uzasadnieniem klinicznym. Przekształcenia monotoniczne
       (x², log x) i przypadkowe iloczyny nic nie wnoszą modelom drzewiastym.
     - Dorośli: Yale zawiera wyłącznie pacjentów ≥ 18 lat.
+    - Bez duplikatów: cecha identyczna z inną (np. `esi_danger_hr` ≡ `tachycardia`)
+      dzieli ważność SHAP/EBM między dwie nazwy — liczona tylko wewnętrznie.
 """
 
 from __future__ import annotations
@@ -33,9 +35,10 @@ VITALS = {
 O2_DEVICE_COL = "triage_vital_o2_device"
 
 # Grupy skarg głównych (nazwy po sanitize_name). Brakujące kolumny = 0.
+# `cc_trauma_activation` = scalone cc_fulltrauma + cc_modifiedtrauma (prepare).
 CC_CRITICAL = [
     "cc_cardiacarrest", "cc_strokealert", "cc_respiratorydistress",
-    "cc_unresponsive", "cc_fulltrauma",
+    "cc_unresponsive", "cc_trauma_activation",
 ]
 CC_GROUPS: dict[str, list[str]] = {
     "cardiac": [
@@ -55,7 +58,7 @@ CC_GROUPS: dict[str, list[str]] = {
         "cc_cough", "cc_hemoptysis",
     ],
     "trauma": [
-        "cc_fulltrauma", "cc_modifiedtrauma", "cc_trauma", "cc_motorvehiclecrash",
+        "cc_trauma_activation", "cc_trauma", "cc_motorvehiclecrash",
         "cc_motorcyclecrash", "cc_fall", "cc_fall_65", "cc_multiplefalls",
         "cc_headinjury", "cc_assaultvictim",
     ],
@@ -164,16 +167,15 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # === Temperatura (°C) ===
     c["fever"] = _flag(temp >= 38.0, temp)
     c["high_fever"] = _flag(temp >= 39.0, temp)
-    c["hypothermia"] = _flag(temp < 36.0, temp)
+    c["hypothermia"] = _flag(temp < 35.0, temp)           # hipotermia kliniczna (nie próg SIRS)
     c["temp_deviation"] = (temp - 37.0).abs()
 
     # === Strefa zagrożenia ESI (punkt decyzyjny D, dorośli) ===
-    # HR > 100, RR > 20, SpO2 < 92 → rozważ ESI 2
-    c["esi_danger_hr"] = _flag(hr > 100, hr)
-    c["esi_danger_rr"] = _flag(rr > 20, rr)
+    # HR > 100, RR > 20, SpO2 < 92 → rozważ ESI 2. Składowe HR i RR są identyczne
+    # z `tachycardia` / `tachypnea`, więc nie są osobnymi cechami.
     c["esi_danger_spo2"] = _flag(o2 < 92, o2)
     c["esi_danger_count"] = _sum_available(
-        [c["esi_danger_hr"], c["esi_danger_rr"], c["esi_danger_spo2"]]
+        [c["tachycardia"], c["tachypnea"], c["esi_danger_spo2"]]
     )
     c["esi_danger_zone"] = _flag(c["esi_danger_count"] >= 1, c["esi_danger_count"])
 
@@ -189,9 +191,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # === qSOFA (zaburzenia świadomości: proxy ze skarg głównych) ===
     ams = ((_cc(df, "cc_alteredmentalstatus") + _cc(df, "cc_confusion")
             + _cc(df, "cc_unresponsive")) > 0).astype(float)
+    # Bez RR i SBP wynik byłby samą skargą — brak pomiaru ≠ norma → NaN
     qsofa_parts = [_flag(rr >= 22, rr), _flag(sbp <= 100, sbp), ams]
-    c["qsofa_score"] = _sum_available(qsofa_parts)
-    c["qsofa_positive"] = (c["qsofa_score"] >= 2).astype(float)
+    c["qsofa_score"] = _sum_available(qsofa_parts).mask(rr.isna() & sbp.isna())
+    c["qsofa_positive"] = _flag(c["qsofa_score"] >= 2, c["qsofa_score"])
 
     # === NEWS2 (bez oceny świadomości; skala SpO2 nr 1) ===
     news_rr = _news2_points(rr, [8, 11, 20, 24], [3, 1, 0, 2, 3])
@@ -269,8 +272,8 @@ ENGINEERED_FEATURES: list[str] = [
     "tachypnea", "severe_tachypnea", "bradypnea", "hypoxia", "severe_hypoxia",
     # Temperatura
     "fever", "high_fever", "hypothermia", "temp_deviation",
-    # ESI danger zone
-    "esi_danger_hr", "esi_danger_rr", "esi_danger_spo2", "esi_danger_count", "esi_danger_zone",
+    # ESI danger zone (składowe HR/RR = tachycardia/tachypnea)
+    "esi_danger_spo2", "esi_danger_count", "esi_danger_zone",
     # Skale wczesnego ostrzegania
     "sirs_score", "sirs_positive", "qsofa_score", "qsofa_positive",
     "news2_score", "news2_high",
@@ -288,3 +291,6 @@ ENGINEERED_FEATURES: list[str] = [
     "chestpain_tachycardia", "resp_complaint_hypoxia", "trauma_shock",
     "ams_fever", "elderly_hypotension", "ambulance_danger_zone",
 ]
+
+# Usunięte duplikaty (identyczne z `tachycardia` / `tachypnea`) — do raportu z audytu
+REMOVED_DUPLICATE_FEATURES: list[str] = ["esi_danger_hr", "esi_danger_rr"]

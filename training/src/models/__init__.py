@@ -11,7 +11,14 @@ Zestaw celowo zróżnicowany — pod ręczne łączenie modeli:
 
 Usunięte: hist_gbt (powielał LightGBM), extra_trees (powielał RF),
 stacking (łączenie modeli robione ręcznie na predykcjach z runs/).
+
+Wspólny interfejs (src/models/base.py): fit_estimator() (cichy trening, tuning/CV),
+fit() (trening z trackingiem), predict_proba() → (n, 5) float64, save()/load_model().
 """
+
+from __future__ import annotations
+
+from pathlib import Path
 
 from src.models.base import BaseTriageModel, compute_sample_weights
 from src.models.catboost_model import CatBoostTriageModel
@@ -30,6 +37,9 @@ __all__ = [
     "RandomForestTriageModel",
     "XGBoostTriageModel",
     "compute_sample_weights",
+    "get_model",
+    "load_model",
+    "resolve_model_name",
 ]
 
 
@@ -63,3 +73,12 @@ def resolve_model_name(name: str) -> str:
 def get_model(name: str, **kwargs) -> BaseTriageModel:
     """Fabryka — zwraca instancję modelu po nazwie (lub aliasie)."""
     return MODEL_REGISTRY[resolve_model_name(name)](**kwargs)
+
+
+def load_model(path: Path | str) -> BaseTriageModel:
+    """
+    Ładuje zapisany model (`model.save()`), wybierając klasę po nazwie modelu w artefakcie.
+
+    Nie uruchamia wyboru urządzenia ani prób GPU — działa na maszynie bez karty.
+    """
+    return BaseTriageModel.load(path)

@@ -26,8 +26,25 @@ from src.data.dataset import (
     resolve_feature_set,
     sample_frame,
 )
-from src.data.prepare import META_COLS
+from src.data.prepare import META_COLS, VITALS_COMPLETE_COL
 from src.utils.config import DATA_VERSION, TARGET_COL
+
+
+def _set_manifest(paths, **changes) -> None:
+    manifest = json.loads(paths.DATA_MANIFEST_JSON.read_text(encoding="utf-8"))
+    manifest.update(changes)
+    paths.DATA_MANIFEST_JSON.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+@pytest.fixture
+def prepare_calls(monkeypatch) -> list[str]:
+    """Podmienia prepare_dataset (zapamiętuje strategię zamiast przygotowywać dane)."""
+    from src.data import prepare
+
+    calls: list[str] = []
+    monkeypatch.setattr(prepare, "prepare_dataset", lambda strategy="random", raw=None: calls.append(strategy))
+    monkeypatch.delenv(dataset.NO_AUTO_PREPARE_ENV, raising=False)
+    return calls
 
 
 # ─────────────────────────────────────────
@@ -51,12 +68,31 @@ class TestFeatureSets:
         assert len(feature_names("full")) > len(triage)
 
     def test_feature_names_match_json(self, prepared_paths):
-        payload = json.loads(prepared_paths.FEATURE_SETS_JSON.read_text())
+        payload = json.loads(prepared_paths.FEATURE_SETS_JSON.read_text(encoding="utf-8"))
         assert feature_names("full") == payload["feature_sets"]["full"]
 
     def test_feature_names_never_meta(self, prepared_paths):
         for fs in ("triage", "full"):
             assert not set(feature_names(fs)) & set(META_COLS)
+
+    def test_meta_columns_contract(self):
+        from src.data import VITALS_COMPLETE_COL as exported
+
+        assert exported == VITALS_COMPLETE_COL == "vitals_complete"
+        assert META_COLS == ["row_id", "site", "esi", "target", "admitted", "vitals_complete"]
+
+    def test_feature_sets_json_carries_data_version(self, prepared_paths):
+        payload = json.loads(prepared_paths.FEATURE_SETS_JSON.read_text(encoding="utf-8"))
+        assert payload["data_version"] == DATA_VERSION
+
+    def test_triage_has_no_removed_columns(self, prepared_paths):
+        triage = set(feature_names("triage"))
+        full = set(feature_names("full"))
+        assert {"arrival_ambulance", "arrival_self", "arrival_other", "cc_trauma_activation"} <= triage
+        for removed in ("arrival_unknown", "arrival_police", "esi_danger_hr", "esi_danger_rr",
+                        "cc_fulltrauma", "cc_modifiedtrauma", "vitals_complete"):
+            assert removed not in full, removed
+        assert not [c for c in full if c.startswith("meds_")]
 
     def test_feature_groups(self, prepared_paths):
         groups = feature_groups()
@@ -83,12 +119,49 @@ class TestLoadSplits:
         ensure_prepared()
         assert prepared_paths.TRAIN_PARQUET.stat().st_mtime_ns == before
 
+    def test_ensure_prepared_noop_when_ready_even_without_auto_prepare(self, prepared_paths, monkeypatch):
+        monkeypatch.setenv(dataset.NO_AUTO_PREPARE_ENV, "1")
+        ensure_prepared()
+
+    def test_no_auto_prepare_raises_when_missing(self, isolated_paths, monkeypatch, prepare_calls):
+        monkeypatch.setenv(dataset.NO_AUTO_PREPARE_ENV, "1")
+        with pytest.raises(RuntimeError, match="SOR_AI_NO_AUTO_PREPARE"):
+            ensure_prepared()
+        assert prepare_calls == []
+
+    def test_no_auto_prepare_raises_when_stale(self, prepared_paths, monkeypatch, prepare_calls):
+        _set_manifest(prepared_paths, data_version="esi-v1")
+        monkeypatch.setenv(dataset.NO_AUTO_PREPARE_ENV, "1")
+        with pytest.raises(RuntimeError, match="esi-v1"):
+            ensure_prepared()
+        assert prepare_calls == []
+
+    def test_auto_prepare_keeps_manifest_split_strategy(self, prepared_paths, prepare_calls):
+        _set_manifest(prepared_paths, data_version="esi-v1", split_strategy="site")
+        ensure_prepared()
+        assert prepare_calls == ["site"]
+
+    def test_auto_prepare_explicit_strategy_wins(self, prepared_paths, prepare_calls):
+        _set_manifest(prepared_paths, data_version="esi-v1", split_strategy="site")
+        ensure_prepared("random")
+        assert prepare_calls == ["random"]
+
+    def test_auto_prepare_defaults_to_random(self, isolated_paths, prepare_calls):
+        ensure_prepared()
+        assert prepare_calls == ["random"]
+
+    def test_corrupt_manifest_is_not_prepared(self, prepared_paths):
+        prepared_paths.DATA_MANIFEST_JSON.write_text("{nie-json", encoding="utf-8")
+        assert not is_prepared()
+
     def test_load_splits_all(self, prepared_paths):
         splits = load_splits()
         assert set(splits) == {"train", "val", "test"}
         full = feature_names("full")
         for df in splits.values():
             assert list(df.columns) == META_COLS + full
+            assert df[VITALS_COMPLETE_COL].isin([0, 1]).all()
+            assert df[VITALS_COMPLETE_COL].sum() > 0
         ids = [set(df["row_id"]) for df in splits.values()]
         assert not (ids[0] & ids[1] or ids[0] & ids[2] or ids[1] & ids[2])
 
@@ -106,10 +179,9 @@ class TestLoadSplits:
             load_split("train")
 
     def test_version_mismatch_raises(self, prepared_paths):
-        manifest = json.loads(prepared_paths.DATA_MANIFEST_JSON.read_text())
+        manifest = json.loads(prepared_paths.DATA_MANIFEST_JSON.read_text(encoding="utf-8"))
         assert manifest["data_version"] == DATA_VERSION
-        manifest["data_version"] = "stara-wersja-mts"
-        prepared_paths.DATA_MANIFEST_JSON.write_text(json.dumps(manifest))
+        _set_manifest(prepared_paths, data_version="stara-wersja-mts")
 
         assert not is_prepared()
         with pytest.raises(RuntimeError, match="stara-wersja-mts"):

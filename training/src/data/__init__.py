@@ -15,8 +15,11 @@ from src.data.load_data import (
     load_dataset,
     load_rdata,
 )
+from src.data.prepare import META_COLS, VITALS_COMPLETE_COL
 
 __all__ = [
+    "META_COLS",
+    "VITALS_COMPLETE_COL",
     "convert_rdata_to_parquet",
     "early_stopping_split",
     "ensure_prepared",

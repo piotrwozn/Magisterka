@@ -60,7 +60,7 @@ DATA_AUDIT_MD: Path = PROJECT_ROOT / "DATA_AUDIT.md"
 
 # Wersja logiki przygotowania danych. Zmień, gdy zmieniasz prepare/engineering —
 # trening odmówi użycia splitów przygotowanych starszą wersją.
-DATA_VERSION: str = "esi-v1"
+DATA_VERSION: str = "esi-v2"
 
 # Utwórz katalogi przy imporcie
 for _dir in [
@@ -86,8 +86,19 @@ RANDOM_SEED: int = 42
 # ─────────────────────────────────────────
 # SPRZĘT
 # ─────────────────────────────────────────
-# 'auto' = GPU jeśli dostępne (nvidia-smi), inaczej CPU. Nadpisz: SOR_AI_DEVICE=cpu|gpu
+# Urządzenie wybiera src.utils.hardware.device_for(biblioteka), czytając zmienne NA BIEŻĄCO:
+#   SOR_AI_DEVICE_XGBOOST / SOR_AI_DEVICE_CATBOOST  >  SOR_AI_DEVICE  >  'auto'
+# Wartości auto | cpu | gpu. 'auto' = próbny trening na GPU (porażka → CPU z ostrzeżeniem),
+# 'gpu' = wymuszenie (porażka → błąd zamiast cichego CPU). Poniższa stała tylko informacyjnie.
 DEVICE: str = os.environ.get("SOR_AI_DEVICE", "auto").lower()
+
+# Wątki CPU dla wszystkich modeli: SOR_AI_N_JOBS (> 0) albo liczba FIZYCZNYCH rdzeni
+# (i9-14900K: 24, nie 32 — wątki HT i pętle OpenMP z barierami spowalniają trening).
+# Rozwiązywane przy imporcie: proces nadrzędny (run_all, 03_train.py --n-jobs) ustawia
+# zmienną PRZED importem. Import tutaj (nie na górze pliku): hardware nie importuje config.
+from src.utils.hardware import n_jobs as _resolve_n_jobs  # noqa: E402
+
+N_JOBS: int = _resolve_n_jobs()
 
 # ─────────────────────────────────────────
 # ETYKIETA — ESI (bez mapowania)
@@ -158,21 +169,25 @@ OVERTRIAGE_COST_MULTIPLIER: float = 1.0
 # ─────────────────────────────────────────
 # Yale EMMLC nie ma roku ani identyfikatora pacjenta — podział chronologiczny
 # nie jest możliwy. Domyślnie: losowy, stratyfikowany po ESI × oddział.
-# Alternatywa: --split site (oddział C = test zewnętrzny).
+# Alternatywa: --split site (oddział B = test zewnętrzny; C ma tylko ~20 wizyt ESI 1).
 TEST_SIZE: float = 0.10            # 10% = test (ostateczna ocena)
 VAL_SIZE: float = 0.10             # 10% = walidacja (porównanie / łączenie modeli)
 EARLY_STOPPING_FRACTION: float = 0.10   # 10% TRAIN wydzielone na early stopping
-HOLDOUT_SITE: str = "C"            # oddział trzymany jako test w --split site
+HOLDOUT_SITE: str = "B"            # oddział trzymany jako test w --split site (675 × ESI 1)
 
 # ─────────────────────────────────────────
 # HIPERPARAMETRY MODELI (domyślne — sensowne bez tuningu)
 # ─────────────────────────────────────────
+# Limity iteracji boostingu są celowo wysokie: przy małym learning_rate i pełnych ~400 tys.
+# wierszy model potrzebuje tysięcy drzew, a trening i tak kończy early stopping. Gdy najlepsza
+# iteracja dojdzie do ≥ 95% limitu, wrapper modelu loguje WARNING (model niedotrenowany).
+# Wątki: N_JOBS (sekcja SPRZĘT). Testy nadpisują je na 1 (tests/conftest.py).
 XGB_DEFAULT_PARAMS: dict = {
     "objective": "multi:softprob",
     "num_class": N_CLASSES,
     "eval_metric": "mlogloss",
     "tree_method": "hist",
-    "n_estimators": 3000,
+    "n_estimators": 10_000,
     "learning_rate": 0.05,
     "max_depth": 8,
     "min_child_weight": 5,
@@ -183,14 +198,15 @@ XGB_DEFAULT_PARAMS: dict = {
     "max_bin": 256,
     "early_stopping_rounds": 100,
     "random_state": RANDOM_SEED,
-    "n_jobs": -1,
-    # "device" ustawiane w runtime (auto: cuda jeśli dostępne)
+    "n_jobs": N_JOBS,
+    # "device" ustawiane w runtime: hardware.device_for("xgboost") → "cuda" | "cpu";
+    # po treningu na GPU model przełączany na device="cpu" (predykcja na danych z RAM)
 }
 
 LGBM_DEFAULT_PARAMS: dict = {
     "objective": "multiclass",
     "num_class": N_CLASSES,
-    "n_estimators": 5000,
+    "n_estimators": 20_000,
     "learning_rate": 0.05,
     "num_leaves": 127,
     "max_depth": -1,
@@ -201,62 +217,71 @@ LGBM_DEFAULT_PARAMS: dict = {
     "reg_alpha": 0.0,
     "reg_lambda": 1.0,
     "random_state": RANDOM_SEED,
-    "n_jobs": -1,
+    "n_jobs": N_JOBS,              # fizyczne rdzenie (-1 = wszystkie wątki logiczne — wolniej)
     "verbosity": -1,
 }
 LGBM_EARLY_STOPPING_ROUNDS: int = 100
 
 # CatBoost — inne nazwy parametrów (iterations, depth, random_seed, thread_count).
+# Postęp (verbose) ustawia wrapper w czasie treningu — fit_estimator() jest cichy.
 CATBOOST_DEFAULT_PARAMS: dict = {
     "loss_function": "MultiClass",
     "eval_metric": "MultiClass",
     "classes_count": N_CLASSES,
-    "iterations": 5000,
+    "iterations": 20_000,
     "learning_rate": 0.08,
     "depth": 8,
     "l2_leaf_reg": 3.0,
     "border_count": 254,
     "grow_policy": "SymmetricTree",
     "random_seed": RANDOM_SEED,
-    "thread_count": -1,
+    "thread_count": N_JOBS,
     "allow_writing_files": False,
     "od_type": "Iter",
     "od_wait": 200,
-    "verbose": 200,
-    # "task_type" ustawiane w runtime (auto: GPU jeśli dostępne)
+    # "task_type" ustawiane w runtime: hardware.device_for("catboost") → "GPU" | "CPU"
 }
+# Na GPU CatBoost rezerwuje ułamek WOLNEJ pamięci karty na cały trening (domyślnie 0.95);
+# 0.85 zostawia zapas dla ekranu, gdy karta obsługuje też monitor.
+CATBOOST_GPU_RAM_PART: float = 0.85
 
 # Random Forest — jedyny model baggingowy (dywersyfikacja ensemble).
-# Braki obsługiwane natywnie (scikit-learn >= 1.4).
-# min_samples_leaf=20: przy ~400 tys. wierszy model ma ~300 MB zamiast kilku GB,
-# a prawdopodobieństwa są gładsze (lepiej nadają się do łączenia modeli).
+# Braki obsługiwane natywnie (scikit-learn >= 1.4). Liczby drzew się nie stroi (więcej drzew
+# nigdy nie pogarsza log loss) — 500 na finalny model. min_samples_leaf=5 jest bliżej optimum
+# niż 20, ale model jest większy: przy ~400 tys. wierszy ~1–2 GB w RAM (plik joblib kompresowany).
 RF_DEFAULT_PARAMS: dict = {
-    "n_estimators": 300,
+    "n_estimators": 500,
     "criterion": "gini",
     "max_features": "sqrt",
-    "min_samples_leaf": 20,
+    "min_samples_leaf": 5,
     "max_samples": 0.5,            # bootstrap z 50% wierszy — szybciej i mniejszy model
     "bootstrap": True,
     "class_weight": None,
     "random_state": RANDOM_SEED,
-    "n_jobs": -1,
+    "n_jobs": N_JOBS,
 }
 
 # Explainable Boosting Machine — model "glassbox" (interpretowalność, MDR).
 # interactions=0: w wersji wieloklasowej interpret nie wizualizuje interakcji par cech,
 # więc czysty GAM zachowuje pełną interpretowalność (i trenuje się szybciej).
+# outer_bags=14 (domyślne interpret) na finalny model: EBM zrównolegla się tylko po workach,
+# więc 14 worków na 24 rdzeniach kosztuje tyle czasu co 4, a krzywe są gładsze.
+# Do tuningu można podać mniej worków (parametr outer_bags).
 EBM_DEFAULT_PARAMS: dict = {
     "max_bins": 256,
     "interactions": 0,
     "learning_rate": 0.015,
-    "outer_bags": 4,
+    "outer_bags": 14,
     "max_rounds": 5000,
     "early_stopping_rounds": 100,
     "random_state": RANDOM_SEED,
-    "n_jobs": -1,
+    "n_jobs": N_JOBS,
 }
 
 # Regresja logistyczna (multinomialna) — liniowy punkt odniesienia.
+# Pipeline (logreg_model.py): SimpleImputer(median, add_indicator=True, keep_empty_features=True)
+# → StandardScaler → LogisticRegression; wskaźniki braków zachowują informację "nie zmierzono".
+# Wątki BLAS ograniczane do N_JOBS w czasie treningu.
 LOGREG_DEFAULT_PARAMS: dict = {
     "C": 1.0,
     "max_iter": 2000,

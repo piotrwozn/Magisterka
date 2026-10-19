@@ -5,9 +5,9 @@ Two-mode implementation:
   2. Deterministic keyword matcher (always available; used as fallback)
 
 Both modes emit ONLY real chief-complaint columns of the trained models
-(`cc_*`, 200 Yale/Epic complaints, names after `sanitize_name`). The keyword
+(`cc_*`, 199 Yale/Epic complaints, names after `sanitize_name`). The keyword
 matcher covers the most common PL+EN triage signals; the LLM can pick any of
-the 200 codes (Polish abbreviations, paraphrases, embedded vitals etc.).
+the 199 codes (Polish abbreviations, paraphrases, embedded vitals etc.).
 """
 from __future__ import annotations
 
@@ -23,7 +23,9 @@ log = logging.getLogger(__name__)
 # Mirrors `groups.chief_complaints` in training/data/processed/esi/feature_sets.json
 # (without the `cc_` prefix). The LLM is told to pick only from this list and
 # every code emitted by this module is guaranteed to be a model feature
-# (tests/test_layer0_parser.py checks it against feature_sets.json).
+# (tests/test_layer0_parser.py checks it against feature_sets.json and against
+# the list training's prepare builds). Yale's two-tier trauma activation
+# (fulltrauma / modifiedtrauma) is merged in training into "trauma_activation".
 KNOWN_CC_CODES: list[str] = [
     "abdominalcramping", "abdominaldistention", "abdominalpain", "abdominalpainpregnant",
     "abnormallab", "abscess", "addictionproblem", "agitation", "alcoholintoxication",
@@ -43,7 +45,7 @@ KNOWN_CC_CODES: list[str] = [
     "femaleguproblem", "fever", "fever_75yearsorolder", "fever_9weeksto74years",
     "feverimmunocompromised", "fingerinjury", "fingerpain", "fingerswelling", "flankpain",
     "follow_upcellulitis", "footinjury", "footpain", "footswelling", "foreignbodyineye",
-    "fulltrauma", "generalizedbodyaches", "gibleeding", "giproblem", "groinpain",
+    "generalizedbodyaches", "gibleeding", "giproblem", "groinpain",
     "hallucinations", "handinjury", "handpain", "headache",
     "headache_newonsetornewsymptoms", "headache_recurrentorknowndxmigraines",
     "headachere_evaluation", "headinjury", "headlaceration", "hematuria", "hemoptysis",
@@ -52,7 +54,7 @@ KNOWN_CC_CODES: list[str] = [
     "kneeinjury", "kneepain", "laceration", "leginjury", "legpain", "legswelling",
     "lethargy", "lossofconsciousness", "maleguproblem", "mass", "medicalproblem",
     "medicalscreening", "medicationproblem", "medicationrefill", "migraine",
-    "modifiedtrauma", "motorcyclecrash", "motorvehiclecrash", "multiplefalls",
+    "motorcyclecrash", "motorvehiclecrash", "multiplefalls",
     "nasalcongestion", "nausea", "nearsyncope", "neckpain", "neurologicproblem", "numbness",
     "oralswelling", "otalgia", "other", "overdose_accidental", "overdose_intentional",
     "pain", "palpitations", "panicattack", "pelvicpain", "poisoning", "post_opproblem",
@@ -63,12 +65,18 @@ KNOWN_CC_CODES: list[str] = [
     "skinproblem", "sorethroat", "stdcheck", "strokealert", "suicidal",
     "suture_stapleremoval", "swallowedforeignbody", "syncope", "tachycardia",
     "testiclepain", "thumbinjury", "tickremoval", "toeinjury", "toepain", "trauma",
-    "unresponsive", "uri", "urinaryfrequency", "urinaryretention", "urinarytractinfection",
+    "trauma_activation", "unresponsive", "uri", "urinaryfrequency", "urinaryretention", "urinarytractinfection",
     "vaginalbleeding", "vaginaldischarge", "vaginalpain", "weakness", "wheezing",
     "withdrawal_alcohol", "woundcheck", "woundinfection", "woundre_evaluation",
     "wristinjury", "wristpain",
 ]
 _KNOWN_CC_SET: frozenset[str] = frozenset(KNOWN_CC_CODES)
+
+# Codes removed from the training data → their current column (LLM / older clients)
+LEGACY_CC_CODES: dict[str, str] = {
+    "fulltrauma": "trauma_activation",
+    "modifiedtrauma": "trauma_activation",
+}
 
 
 # ── Pattern helpers ───────────────────────────────────────────────────
@@ -104,8 +112,10 @@ KEYWORD_MAP: dict[str, list[str]] = {
     # ── Critical (ESI 1 signals) ──
     r"\b(zatrzymani\w* krążenia|nzk\b|cardiac arrest|resuscytac|reanimac|rko\b|cpr\b)":
         ["cc_cardiacarrest"],
-    r"\b(politraum|polytrauma|uraz\w* wielonarządow|uraz\w* wielomiejscow|major trauma)":
-        ["cc_fulltrauma"],
+    # Trauma-team activation / pre-notification ("powiadomienie o pacjencie urazowym")
+    (r"\b(politraum|polytrauma|uraz\w* wielonarządow|uraz\w* wielomiejscow|major trauma"
+     r"|zespół urazow|zespołu urazow|centrum urazow|trauma team|trauma activation)"):
+        ["cc_trauma_activation"],
     r"\b(nieprzytomn|unresponsive|unconscious|nie reaguje)":
         ["cc_unresponsive"],
     r"\b(niewydoln\w* oddechow|respiratory distress|ciężk\w* duszno|skrajn\w* duszno)":
@@ -386,6 +396,7 @@ def normalize_cc_code(code: str) -> str | None:
     key = str(code).strip().lower().replace(" ", "")
     if key.startswith("cc_"):
         key = key[3:]
+    key = LEGACY_CC_CODES.get(key, key)
     return f"cc_{key}" if key in _KNOWN_CC_SET else None
 
 

@@ -4,7 +4,8 @@ Tracker eksperymentów — zapisuje pełne metadane treningu do JSON.
 Każdy run treningu generuje:
     logs/experiments/<model>_<run_id>.json
         ├── run_id, model_name, timestamp_start/end, duration_seconds
-        ├── git_commit, hostname, python_version
+        ├── environment: git_commit, hostname, python_version, hardware (CPU/RAM/GPU, wersje bibliotek)
+        ├── device: {requested, actual, fallback_reason} — faktyczne urządzenie treningu
         ├── data: {n_train, n_val, n_test, feature_count, class_distribution}
         ├── params (hiperparametry modelu)
         ├── training_history (per-iteration metrics: mlogloss, merror)
@@ -21,6 +22,7 @@ Użycie:
     tracker.log_iteration(iteration=100, metrics={"val_mlogloss": 0.45})
     tracker.log_metrics({"val_qwk": 0.87, "test_undertriage": 0.02})
     tracker.log_artifact("model_path", "/models/xgb.joblib")
+    tracker.log_device(requested="gpu", actual="cuda", fallback_reason=None)
     tracker.save()
 """
 
@@ -40,6 +42,7 @@ import pandas as pd
 
 from src.utils import config as _config
 from src.utils.config import MLFLOW_EXPERIMENT_NAME, MLFLOW_TRACKING_URI
+from src.utils.hardware import hardware_summary
 
 
 # ─────────────────────────────────────────
@@ -52,14 +55,25 @@ def _git_commit() -> str | None:
             ["git", "rev-parse", "--short", "HEAD"],
             capture_output=True,
             text=True,
-            timeout=2,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
             check=False,
+            cwd=_config.PROJECT_ROOT,
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.SubprocessError):
         pass
     return None
+
+
+def _safe_hardware_summary() -> dict[str, Any]:
+    """Podsumowanie sprzętu — błąd nie może przerwać treningu."""
+    try:
+        return hardware_summary()
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -121,7 +135,9 @@ class ExperimentTracker:
                 "platform": platform.platform(),
                 "python_version": sys.version.split()[0],
                 "git_commit": _git_commit(),
+                "hardware": _safe_hardware_summary(),
             },
+            "device": {},
             "params": {},
             "data": {},
             "training_history": [],
@@ -243,6 +259,25 @@ class ExperimentTracker:
             try:
                 import mlflow
                 mlflow.log_artifact(str(path))
+            except Exception:
+                pass
+
+    def log_device(
+        self,
+        requested: str | None,
+        actual: str | None,
+        fallback_reason: str | None = None,
+    ) -> None:
+        """Urządzenie treningu: żądane ('gpu'/'cpu'), faktyczne ('cuda'/'gpu'/'cpu') i powód zmiany."""
+        self.data["device"] = {
+            "requested": requested,
+            "actual": actual,
+            "fallback_reason": fallback_reason,
+        }
+        if self.use_mlflow:
+            try:
+                import mlflow
+                mlflow.log_param("device_actual", actual)
             except Exception:
                 pass
 

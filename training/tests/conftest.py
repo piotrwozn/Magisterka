@@ -49,15 +49,23 @@ MONTHS = ["January", "February", "March", "April", "May", "June", "July",
           "August", "September", "October", "November", "December"]
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 HOUR_BINS = ["23-02", "03-06", "07-10", "11-14", "15-18", "19-22"]
-PREVIOUS_DISPO = ["No previous dispo", "Discharge", "Admit", "AMA", "LWBS after Triage"]
+# Wszystkie 10 wartości z Yale (prepare scala je do 5 kategorii)
+PREVIOUS_DISPO = [
+    "No previous dispo", "Discharge", "Admit", "Observation", "Send to L&D",
+    "Transfer to Another Facility", "AMA", "Eloped", "LWBS before Triage", "LWBS after Triage",
+]
 
-# Skargi główne — część wymaga normalizacji nazwy ('>' i '/')
+# Skargi główne — część wymaga normalizacji nazwy ('>' i '/'); dwie aktywacje urazowe
+# są scalane do `cc_trauma_activation`
 CC_COLUMNS = [
     "cc_chestpain", "cc_shortnessofbreath", "cc_abdominalpain", "cc_alteredmentalstatus",
     "cc_suture/stapleremoval", "cc_fall>65", "cc_bleeding/bruising",
+    "cc_strokealert", "cc_fulltrauma", "cc_modifiedtrauma",
 ]
 # Historia chorób (AHRQ CCS) — w Yale BEZ prefiksu (także nazwa zaczynająca się od cyfry)
 PMH_COLUMNS = ["2ndarymalig", "acutemi", "asthma", "chfnonhp"]
+# PMH wykluczone: socjoekonomiczne, administracyjne kody V, małe wsparcie
+EXCLUDED_PMH_COLUMNS = ["socialadmin", "exameval", "liveborn"]
 MEDS_COLUMNS = ["meds_analgesics", "meds_anti-obesitydrugs", "meds_antibiotics"]
 IMAGING_COLUMNS = [
     "cxr_count", "echo_count", "ekg_count", "headct_count", "mri_count",
@@ -66,8 +74,20 @@ IMAGING_COLUMNS = [
 # Badania z poprzednich wizyt; eGFR liczony z rasą musi zostać wykluczony
 LAB_COLUMNS = [
     "baseexcess,venous(poc)_last", "glucose,meter_last", "troponini(poc)_max",
-    "bloodua_count", "egfr_last", "egfr(aframer)_last", "egfr(nonafricanamerican)_median",
+    "egfr_last", "egfr(aframer)_last", "egfr(nonafricanamerican)_median",
 ]
+RACE_LAB_COLUMNS = ["egfr_last", "egfr(aframer)_last", "egfr(nonafricanamerican)_median"]
+# Zepsute badania i D-dimer (mieszane jednostki) — wykluczane
+BROKEN_LAB_COLUMNS = [
+    "pocph_last", "epithelialcells_max", "phencyclidine(pcp)screen,urine,noconf._last",
+    "bloodculture,routine_last", "bloodculture,routine_npos",
+]
+UNIT_MIXED_LAB_COLUMNS = ["d-dimer_median"]
+# Badania jakościowe: _last/_npos = 0 także, gdy nie badano (_count == 0)
+CATEGORICAL_LAB_COLUMNS = ["bloodua_count", "bloodua_last", "bloodua_npos",
+                           "bloodculture,routine_count"]
+# Część wyników w komórkach/µL zamiast 10³/µL
+UNIT_LAB_COLUMNS = ["monosabs_last", "basosabs_max"]
 
 # Indeksy wierszy, które fixture gwarantuje jako "czyste" (z ESI, bez duplikatów) —
 # testy mogą je modyfikować i szukać pod tym samym row_id po przygotowaniu.
@@ -82,6 +102,9 @@ def make_raw_yale(n: int = 800, seed: int = 42, n_missing_esi: int = 7, n_duplic
     - na końcu `n_duplicates` dokładnych kopii wcześniejszych wierszy,
     - wiersze 0…19 zawsze mają ESI i nie są duplikatami,
     - temperatura (triaż i historia) w °F, część parametrów życiowych brakująca,
+    - jak w Yale: SpO2 = 100 skasowane (filtr x ≥ 100), skargi jako liczniki (0–2),
+      brak sposobu przybycia, policja, badania jakościowe z 0 zamiast „nie badano”,
+      monocyty/bazofile częściowo w komórkach/µL, kolumny wykluczane (leki, socialadmin…),
     - słaby sygnał: niższy ESI → wyższe tętno / niższa saturacja, częściej karetka.
     """
     rng = np.random.default_rng(seed)
@@ -112,7 +135,7 @@ def make_raw_yale(n: int = 800, seed: int = 42, n_missing_esi: int = 7, n_duplic
     df["arrivalhour_bin"] = rng.choice(HOUR_BINS, n)
     df["previousdispo"] = rng.choice(PREVIOUS_DISPO, n)
 
-    for col in PMH_COLUMNS:
+    for col in PMH_COLUMNS + EXCLUDED_PMH_COLUMNS:
         df[col] = rng.integers(0, 2, n).astype(float)
 
     # --- Parametry życiowe z triażu (temperatura w °F) ---
@@ -126,13 +149,16 @@ def make_raw_yale(n: int = 800, seed: int = 42, n_missing_esi: int = 7, n_duplic
         "triage_vital_temp": rng.normal(98.2, 1.0, n).round(1),
     })
     vitals = vitals.mask(rng.random(vitals.shape) < 0.15)
+    # Filtr Yale (`9_edvitalsclean.R`): SpO2 ≥ 100 → brak
+    vitals.loc[vitals["triage_vital_o2"] >= 100, "triage_vital_o2"] = np.nan
     # ESI 1: częsty brak WSZYSTKICH pomiarów (pacjent od razu na salę resuscytacyjną)
     no_vitals = (esi == 1) & (rng.random(n) < 0.5)
     vitals.loc[no_vitals, :] = np.nan
     df = pd.concat([df, vitals], axis=1)
 
+    # Skargi jak w Yale: liczniki wpisów (czasem 2), czasem brak
     for col in CC_COLUMNS:
-        df[col] = (rng.random(n) < 0.15).astype(float)
+        df[col] = (rng.random(n) < 0.15).astype(float) * rng.choice([1.0, 2.0], n, p=[0.9, 0.1])
     df.loc[rng.random(n) < 0.03, CC_COLUMNS[0]] = np.nan
 
     for col in MEDS_COLUMNS:
@@ -146,16 +172,29 @@ def make_raw_yale(n: int = 800, seed: int = 42, n_missing_esi: int = 7, n_duplic
     # --- Historia vitals (temperatura w °F) ---
     df["pulse_last"] = rng.normal(85, 15, n).round()
     df["temp_max"] = rng.normal(99.0, 1.2, n).round(1)
-    df["spo2_min"] = np.clip(rng.normal(95, 3, n), 70, 100).round()
+    df["spo2_min"] = np.clip(rng.normal(95, 3, n), 70, 99).round()
     df["sbp_median"] = rng.normal(128, 15, n).round()
     df["o2_device_last"] = (rng.random(n) < 0.08).astype(float)
     for col in ["pulse_last", "temp_max", "spo2_min", "sbp_median", "o2_device_last"]:
         df.loc[rng.random(n) < 0.3, col] = np.nan
 
-    for col in LAB_COLUMNS:
+    for col in LAB_COLUMNS + BROKEN_LAB_COLUMNS + UNIT_MIXED_LAB_COLUMNS:
         values = rng.normal(50, 20, n)
         values[rng.random(n) < 0.6] = np.nan
         df[col] = values
+
+    # Badania jakościowe: Yale wypełnia NA → 0 (także gdy badania nie wykonano)
+    count = rng.choice([0, 1, 2, 3], n, p=[0.6, 0.2, 0.1, 0.1]).astype(float)
+    tested = count > 0
+    df["bloodua_count"] = count
+    df["bloodua_last"] = np.where(tested, (rng.random(n) < 0.3).astype(float), 0.0)
+    df["bloodua_npos"] = np.where(tested, np.minimum(count, rng.integers(0, 2, n)), 0.0)
+    df["bloodculture,routine_count"] = rng.choice([0.0, 1.0], n, p=[0.9, 0.1])
+
+    # Monocyty / bazofile w 10³/µL, część w komórkach/µL (× 1000)
+    in_cells = rng.random(n) < 0.1
+    df["monosabs_last"] = np.round(rng.uniform(0.2, 1.0, n) * np.where(in_cells, 1000, 1), 3)
+    df["basosabs_max"] = np.round(rng.uniform(0.0, 0.2, n) * np.where(in_cells, 1000, 1), 3)
 
     # --- Braki ESI i duplikaty ---
     missing_idx = rng.choice(np.arange(N_CLEAN_HEAD_ROWS, n), size=n_missing_esi, replace=False)

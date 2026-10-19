@@ -20,7 +20,7 @@ from src.utils.config import (
     TRAINING_LOGS_DIR,
 )
 from src.utils.experiment_tracker import ExperimentTracker
-from src.utils.logger import get_logger, get_training_logger
+from src.utils.logger import close_training_logger, get_logger, get_training_logger
 
 __all__ = [
     "CLASS_NAMES",
@@ -41,6 +41,7 @@ __all__ = [
     "RUNS_DIR",
     "TOPSOR_COLORS",
     "TRAINING_LOGS_DIR",
+    "close_training_logger",
     "get_logger",
     "get_training_logger",
 ]

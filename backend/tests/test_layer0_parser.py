@@ -6,23 +6,34 @@ from pathlib import Path
 
 import pytest
 
+from app.pipeline import feature_engineering  # noqa: F401  (puts training/ on sys.path)
 from app.pipeline.layer0_parser import (
     KEYWORD_MAP,
     KNOWN_CC_CODES,
+    LEGACY_CC_CODES,
     normalize_cc_code,
     parse_with_keywords,
     parse_with_llm,
 )
+from src.data import yale_schema as ys  # noqa: E402
+from src.data.prepare import plan_features  # noqa: E402
+from src.utils.config import DATA_VERSION  # noqa: E402
 
 FEATURE_SETS_JSON = (
     Path(__file__).resolve().parents[2] / "training" / "data" / "processed" / "esi" / "feature_sets.json"
+)
+# Columns training's prepare always reads besides the complaints (names only — no data)
+_RAW_BASE_COLUMNS = (
+    ["esi", "dep_name", "disposition", "age", "gender", "arrivalmode", "arrivalmonth",
+     "arrivalday", "arrivalhour_bin", "previousdispo"]
+    + ys.TRIAGE_VITAL_COLS + ys.ED_USAGE_COLS + ys.IMAGING_COLS
 )
 
 # Notes exercising most of the keyword map (PL + EN)
 SAMPLE_NOTES = [
     "Pacjent blady, spocony, ból w klatce piersiowej, duszność",
     "ucisk w klatce, kołatanie serca, migotanie przedsionków, tachykardia",
-    "NZK, RKO w karetce, politrauma, pacjent nieprzytomny",
+    "NZK, RKO w karetce, politrauma, aktywacja zespołu urazowego, pacjent nieprzytomny",
     "udar mózgu, niedowład, splątany, drgawki, omdlenie, przedomdlenie",
     "ból głowy migrenowy, najgorszy ból głowy w życiu, zawroty głowy, drętwienie",
     "ból brzucha + wymioty + nudności, biegunka, zaparcie, zgaga, kolka nerkowa",
@@ -44,10 +55,24 @@ SAMPLE_NOTES = [
 
 @pytest.fixture(scope="module")
 def trained_cc_columns() -> set[str]:
-    """Chief-complaint columns of the trained models (skip if data not prepared)."""
+    """Chief-complaint columns of the trained models (skip if data missing or stale)."""
     if not FEATURE_SETS_JSON.exists():
         pytest.skip("No training/data/processed/esi/feature_sets.json — run 02_preprocess.py")
-    return set(json.loads(FEATURE_SETS_JSON.read_text())["groups"]["chief_complaints"])
+    payload = json.loads(FEATURE_SETS_JSON.read_text(encoding="utf-8"))
+    version = payload.get("data_version")
+    if version != DATA_VERSION:
+        pytest.skip(f"feature_sets.json is from data_version {version!r}, the code expects "
+                    f"{DATA_VERSION!r} — re-run training/scripts/02_preprocess.py")
+    return set(payload["groups"]["chief_complaints"])
+
+
+@pytest.fixture(scope="module")
+def prepared_cc_columns() -> set[str]:
+    """Complaint columns training's prepare builds from the raw Yale vocabulary
+    (the model vocabulary before the trauma merge) — computed from names only."""
+    raw_cc = [f"cc_{c}" for c in KNOWN_CC_CODES if c != "trauma_activation"]
+    raw_cc += list(ys.TRAUMA_ACTIVATION_SOURCES)
+    return set(plan_features(_RAW_BASE_COLUMNS + raw_cc).groups["chief_complaints"])
 
 
 class TestKeywordParser:
@@ -83,6 +108,8 @@ class TestKeywordParser:
         ("halucynacje, psychoza", ["cc_hallucinations", "cc_psychoticsymptoms"]),
         ("infekcja dróg moczowych", ["cc_urinarytractinfection"]),
         ("NZK, RKO", ["cc_cardiacarrest"]),
+        ("politrauma po wypadku", ["cc_trauma_activation", "cc_trauma"]),
+        ("powiadomienie ZRM: aktywacja zespołu urazowego", ["cc_trauma_activation"]),
     ])
     def test_keyword_matches(self, note: str, expected_cc: list[str]):
         result = parse_with_keywords(note)
@@ -145,6 +172,20 @@ class TestTrainedVocabulary:
     def test_known_codes_unique(self):
         assert len(KNOWN_CC_CODES) == len(set(KNOWN_CC_CODES))
 
+    def test_trauma_activation_replaces_yale_protocol_codes(self):
+        assert len(KNOWN_CC_CODES) == 199
+        assert "trauma_activation" in KNOWN_CC_CODES
+        assert not {"fulltrauma", "modifiedtrauma"} & set(KNOWN_CC_CODES)
+        assert set(LEGACY_CC_CODES.values()) <= set(KNOWN_CC_CODES)
+
+    def test_known_codes_match_prepare(self, prepared_cc_columns):
+        assert {f"cc_{c}" for c in KNOWN_CC_CODES} == prepared_cc_columns
+        assert "cc_trauma_activation" == ys.TRAUMA_ACTIVATION_COL
+
+    def test_keyword_map_targets_exist_in_prepare_output(self, prepared_cc_columns):
+        targets = {cc for cc_list in KEYWORD_MAP.values() for cc in cc_list}
+        assert targets - prepared_cc_columns == set()
+
     def test_known_codes_match_trained_columns(self, trained_cc_columns):
         assert {f"cc_{c}" for c in KNOWN_CC_CODES} == trained_cc_columns
 
@@ -175,6 +216,9 @@ class TestLlmParser:
         assert normalize_cc_code("Chest Pain") == "cc_chestpain"
         assert normalize_cc_code("seizure") is None          # real column: cc_seizures
         assert normalize_cc_code("pregnancy") is None
+        # Yale's trauma activation codes → merged training column
+        assert normalize_cc_code("fulltrauma") == "cc_trauma_activation"
+        assert normalize_cc_code("cc_modifiedtrauma") == "cc_trauma_activation"
 
     async def test_llm_output_filtered_to_trained_codes(self):
         client = _FakeOllama({

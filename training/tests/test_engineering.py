@@ -11,7 +11,14 @@ import pandas as pd
 import pytest
 
 from src.data import yale_schema as ys
-from src.features.engineering import ENGINEERED_FEATURES, VITALS, engineer_features
+from src.features.engineering import (
+    CC_CRITICAL,
+    CC_GROUPS,
+    ENGINEERED_FEATURES,
+    REMOVED_DUPLICATE_FEATURES,
+    VITALS,
+    engineer_features,
+)
 
 NORMAL = {
     "triage_vital_hr": 80.0,
@@ -59,6 +66,26 @@ class TestFeatureList:
         for removed in ["temp_mts_bin", "mts_vitals_score", "ambulance_flag", "dbp_risk"]:
             assert removed not in ENGINEERED_FEATURES
         assert not [f for f in ENGINEERED_FEATURES if "pediatric" in f or "mts" in f]
+
+    def test_count(self):
+        assert len(ENGINEERED_FEATURES) == 57
+
+    def test_duplicates_not_output(self):
+        """esi_danger_hr ≡ tachycardia, esi_danger_rr ≡ tachypnea — tylko wewnętrznie."""
+        assert REMOVED_DUPLICATE_FEATURES == ["esi_danger_hr", "esi_danger_rr"]
+        out = engineer_features(_row(triage_vital_hr=120.0, triage_vital_rr=25.0))
+        for name in REMOVED_DUPLICATE_FEATURES:
+            assert name not in ENGINEERED_FEATURES
+            assert name not in out.columns
+
+    def test_trauma_activation_replaces_yale_protocol_codes(self):
+        names = set(CC_CRITICAL) | {c for cols in CC_GROUPS.values() for c in cols}
+        assert "cc_trauma_activation" in CC_CRITICAL
+        assert "cc_trauma_activation" in CC_GROUPS["trauma"]
+        assert not names & {"cc_fulltrauma", "cc_modifiedtrauma"}
+        out = engineer_features(_row(cc_trauma_activation=1.0))
+        assert out["cc_critical"].iloc[0] == 1.0
+        assert out["cc_group_trauma"].iloc[0] == 1.0
 
     def test_returns_copy(self):
         df = _row()
@@ -111,7 +138,9 @@ class TestRobustness:
 class TestTemperatureCelsius:
     @pytest.mark.parametrize("temp, fever, high_fever, hypothermia", [
         (36.0, 0.0, 0.0, 0.0),
-        (35.9, 0.0, 0.0, 1.0),
+        (35.9, 0.0, 0.0, 0.0),         # < 36 to tylko kryterium SIRS, nie hipotermia
+        (35.0, 0.0, 0.0, 0.0),
+        (34.9, 0.0, 0.0, 1.0),         # hipotermia kliniczna < 35,0 °C
         (37.9, 0.0, 0.0, 0.0),
         (38.0, 1.0, 0.0, 0.0),
         (39.0, 1.0, 1.0, 0.0),
@@ -131,9 +160,9 @@ class TestTemperatureCelsius:
 class TestMissingPropagation:
     @pytest.mark.parametrize("vital, flags", [
         ("triage_vital_temp", ["fever", "high_fever", "hypothermia", "temp_deviation"]),
-        ("triage_vital_hr", ["tachycardia", "bradycardia", "esi_danger_hr", "shock_index"]),
+        ("triage_vital_hr", ["tachycardia", "bradycardia", "shock_index"]),
         ("triage_vital_sbp", ["hypotension", "severe_hypotension", "shock_index", "map"]),
-        ("triage_vital_rr", ["tachypnea", "bradypnea", "esi_danger_rr"]),
+        ("triage_vital_rr", ["tachypnea", "bradypnea"]),
         ("triage_vital_o2", ["hypoxia", "severe_hypoxia", "esi_danger_spo2"]),
     ])
     def test_flag_nan_when_vital_missing(self, vital, flags):
@@ -185,9 +214,14 @@ class TestEsiDangerZone:
 
     def test_partial_missing_uses_available(self):
         out = engineer_features(_row(triage_vital_hr=np.nan))
-        assert np.isnan(out["esi_danger_hr"].iloc[0])
+        assert np.isnan(out["tachycardia"].iloc[0])
         assert out["esi_danger_count"].iloc[0] == 0.0
         assert out["esi_danger_zone"].iloc[0] == 0.0
+
+    def test_count_uses_tachycardia_and_tachypnea(self):
+        out = engineer_features(_row(triage_vital_hr=101.0, triage_vital_rr=21.0))
+        assert out["tachycardia"].iloc[0] == out["tachypnea"].iloc[0] == 1.0
+        assert out["esi_danger_count"].iloc[0] == 2.0
 
     def test_ambulance_danger_zone(self):
         out = engineer_features(_row(arrival_ambulance=1.0, triage_vital_hr=130.0))
@@ -268,6 +302,21 @@ class TestOtherFeatures:
         out = engineer_features(_row(triage_vital_rr=24.0, cc_alteredmentalstatus=1.0))
         assert out["qsofa_score"].iloc[0] == 2.0
         assert out["qsofa_positive"].iloc[0] == 1.0
+
+    def test_qsofa_nan_without_rr_and_sbp(self):
+        """Brak pomiaru ≠ norma: bez RR i SBP qSOFA nie jest liczone (nawet ze skargą)."""
+        out = engineer_features(_row(triage_vital_rr=np.nan, triage_vital_sbp=np.nan,
+                                     cc_alteredmentalstatus=1.0))
+        assert np.isnan(out["qsofa_score"].iloc[0])
+        assert np.isnan(out["qsofa_positive"].iloc[0])
+        assert np.isnan(_feat(_only(), "qsofa_score"))
+
+    def test_qsofa_partial_vitals_uses_available(self):
+        out = engineer_features(_row(triage_vital_rr=np.nan, triage_vital_sbp=95.0,
+                                     cc_alteredmentalstatus=1.0))
+        assert out["qsofa_score"].iloc[0] == 2.0
+        assert out["qsofa_positive"].iloc[0] == 1.0
+        assert _feat(_row(triage_vital_rr=np.nan), "qsofa_positive") == 0.0
 
     def test_age_flags(self):
         out = engineer_features(_row(age=82.0))

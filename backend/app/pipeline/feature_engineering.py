@@ -5,11 +5,13 @@ Builds one row in the CANONICAL triage schema used in training
 clinical features with `src.features.engineering.engineer_features()`:
 
     age (years), is_male (0/1, NaN when unknown),
-    arrival_ambulance / _self / _police / _other / _unknown (one-hot;
-        missing mode → DEFAULT_ARRIVAL_MODE, never _unknown),
+    arrival_ambulance / _self / _other (one-hot; missing mode → "self" and
+        police → "other", exactly as in training — yale_schema.ARRIVAL_*),
     arrival_month (1–12), arrival_weekday (1–7, Mon=1), arrival_hour_bin (0–5),
-    triage_vital_hr / _sbp / _dbp / _rr / _o2 / _o2_device / _temp (°C!),
-    cc_* chief-complaint flags (200 Yale/Epic complaints, sanitized names).
+    triage_vital_hr / _sbp / _dbp / _rr / _o2 / _o2_device / _temp (°C!;
+        SpO2 = 100 passes through — training restores Yale's deleted 100% readings),
+    cc_* chief-complaint flags (199 Yale/Epic complaints, sanitized names;
+        Yale's full/modified trauma activation merged into cc_trauma_activation).
 
 Missing values stay NaN — exactly as in training (no global imputation):
 tree models / EBM handle NaN natively, logreg imputes inside its own Pipeline.
@@ -40,7 +42,10 @@ if _training_root not in sys.path:
 
 from src.data.yale_schema import (  # noqa: E402
     ARRIVAL_CATEGORIES,
+    ARRIVAL_MISSING_AS,
     ARRIVAL_MODE_MAP,
+    TRAUMA_ACTIVATION_COL,
+    TRAUMA_ACTIVATION_SOURCES,
     VITAL_BOUNDS,
     hour_to_bin,
 )
@@ -53,32 +58,33 @@ _NAN = float("nan")
 # never be pre-populated as complaint flags (cc_count counts every cc_* column).
 _ENGINEERED_SET = frozenset(ENGINEERED_FEATURES)
 
-# Full chief-complaint vocabulary of the trained models (200 cc_* columns)
+# Full chief-complaint vocabulary of the trained models (199 cc_* columns)
 CHIEF_COMPLAINT_COLUMNS: tuple[str, ...] = tuple(f"cc_{c}" for c in KNOWN_CC_CODES)
+
+# Legacy complaint names (Yale's two-tier trauma activation) → merged training column
+LEGACY_CC_COLUMNS: dict[str, str] = {src: TRAUMA_ACTIVATION_COL for src in TRAUMA_ACTIVATION_SOURCES}
 
 # ── Request value → canonical encoding ───────────────────────────────
 
-# Arrival mode used when the request does not provide one.
-# NOT "unknown": in Yale, arrival_unknown=1 marks a distinct (fast-track-like)
-# population — 90% ESI 4–5 vs 27% overall — so forcing it on every request
-# shifts predictions ~1 ESI level toward low acuity (val, true mode masked:
-# undertriage 17% → 56%). "self" is the training majority (61%) and the least
-# distorting default (+3 pp undertriage). Collect the real mode (ZRM vs own
-# transport) in the form whenever possible — it is a strong feature.
-DEFAULT_ARRIVAL_MODE = "self"
+# Arrival mode used when the request does not provide one — the same category
+# training assigns to Yale's missing mode (ARRIVAL_MISSING_AS = "self"; in Yale a
+# missing mode marks a site-A fast-track pathway, not a clinical category, so it
+# is no longer a separate feature). Collect the real mode (ZRM vs own transport)
+# in the form whenever possible — it is a strong feature.
+DEFAULT_ARRIVAL_MODE = ARRIVAL_MISSING_AS
 _MISSING_ARRIVAL = frozenset({"", "?", "unknown", "nieznany", "brak", "brak danych"})
 
 # Arrival mode (free text from the form / HIS) → Yale arrival category.
-# Yale training values + Polish SOR equivalents (ZRM = ambulance).
+# Yale training values + Polish SOR equivalents (ZRM = ambulance; police → other).
 ARRIVAL_MODE_ALIASES: dict[str, str] = {
     **{k.lower(): v for k, v in ARRIVAL_MODE_MAP.items()},
-    **{cat: cat for cat in ARRIVAL_CATEGORIES if cat != "unknown"},
+    **{cat: cat for cat in ARRIVAL_CATEGORIES},
     "zrm": "ambulance", "karetka": "ambulance", "pogotowie": "ambulance",
     "lpr": "ambulance", "śmigłowiec": "ambulance", "smiglowiec": "ambulance",
     "własny": "self", "wlasny": "self", "transport własny": "self",
     "transport wlasny": "self", "samodzielnie": "self", "pieszo": "self",
     "samochód": "self", "samochod": "self",
-    "policja": "police",
+    "policja": "other", "radiowóz": "other", "radiowoz": "other",
     "inny": "other", "inne": "other", "wózek": "other", "wozek": "other",
 }
 
@@ -91,9 +97,9 @@ _SEX_MAP: dict[str, float] = {
 def normalize_arrival_mode(mode: Any) -> str:
     """Free-text arrival mode → one of ARRIVAL_CATEGORIES.
 
-    Missing / unknown → DEFAULT_ARRIVAL_MODE (see the comment above — never
-    'unknown'). Otherwise mirrors training: a known value is mapped, any other
-    non-empty value → 'other'.
+    Missing / unknown → DEFAULT_ARRIVAL_MODE ("self", as in training).
+    Otherwise mirrors training: a known value is mapped, any other non-empty
+    value → 'other'.
     """
     text = "" if mode is None else str(mode).strip().lower()
     if text in _MISSING_ARRIVAL:
@@ -174,15 +180,15 @@ def build_feature_row(
     """Build a single-row DataFrame in the canonical triage schema + engineered features.
 
     vitals          : data from the frontend form (temperature in °C — no conversion)
-    cc_features     : {"cc_chestpain": 1, ...} from the Layer 0 parser; names that are
-                      not chief-complaint columns of the models are dropped
+    cc_features     : {"cc_chestpain": 1, ...} from the Layer 0 parser; legacy names
+                      (cc_fulltrauma / cc_modifiedtrauma) → cc_trauma_activation; names
+                      that are not chief-complaint columns of the models are dropped
     extra           : optional overrides (cc_* flags or canonical columns)
     all_cc_columns  : chief-complaint columns of the trained models (pre-populated
-                      with 0); defaults to the full 200-column vocabulary
+                      with 0); defaults to the full 199-column vocabulary
     is_male / arrival_mode / o2_device : optional request data; when not given they
                       are read from `vitals` if such fields exist, otherwise
-                      is_male=NaN, arrival = DEFAULT_ARRIVAL_MODE ("self" — NOT
-                      arrival_unknown, see above), o2_device=NaN
+                      is_male=NaN, arrival = DEFAULT_ARRIVAL_MODE ("self"), o2_device=NaN
     now             : arrival time (defaults to the system clock)
     """
     now = now or datetime.now()
@@ -220,15 +226,20 @@ def build_feature_row(
     vocabulary = _cc_vocabulary(all_cc_columns)
     allowed = set(vocabulary)
     row.update(dict.fromkeys(vocabulary, 0.0))
-    flags = dict(cc_features)
+    flags: dict[str, float] = {}
+    complaints = list(cc_features.items()) + [
+        (k, v) for k, v in (extra or {}).items() if k.startswith("cc_")
+    ]
     for key, value in (extra or {}).items():
-        if key.startswith("cc_"):
-            flags[key] = value
-        elif key not in _ENGINEERED_SET:
+        if not key.startswith("cc_") and key not in _ENGINEERED_SET:
             row[key] = value
+    for name, value in complaints:
+        name = LEGACY_CC_COLUMNS.get(name, name)
+        # Flags as in training: 0/1 (several legacy names may map to one column → max)
+        flags[name] = max(flags.get(name, 0.0), min(float(value), 1.0))
     for name, value in flags.items():
         if name in allowed:
-            row[name] = float(value)
+            row[name] = value
         else:
             log.debug("Skipping %s — not a chief-complaint column of the models", name)
 

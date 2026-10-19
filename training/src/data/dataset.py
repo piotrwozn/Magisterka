@@ -10,6 +10,7 @@ Użycie:
 from __future__ import annotations
 
 import json
+import os
 from functools import lru_cache
 
 import numpy as np
@@ -36,6 +37,11 @@ SPLIT_PATHS = {"train": TRAIN_PARQUET, "val": VAL_PARQUET, "test": TEST_PARQUET}
 # Stare nazwy z poprzedniej wersji pipeline'u
 FEATURE_SET_ALIASES = {"triage_only": "triage", "top": "triage"}
 
+# =1 → brak/nieaktualne splity to błąd zamiast automatycznego przygotowania
+# (ustawiane przez orkiestrator: podprocesy treningu nie mogą równolegle przygotowywać danych)
+NO_AUTO_PREPARE_ENV = "SOR_AI_NO_AUTO_PREPARE"
+SPLIT_STRATEGIES = ("random", "site")
+
 
 def resolve_feature_set(name: str) -> str:
     name = FEATURE_SET_ALIASES.get(name, name)
@@ -44,21 +50,58 @@ def resolve_feature_set(name: str) -> str:
     return name
 
 
+def _read_manifest() -> dict | None:
+    """Manifest splitów albo None (brak / uszkodzony plik)."""
+    try:
+        return json.loads(DATA_MANIFEST_JSON.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _not_prepared_reason() -> str | None:
+    """Dlaczego splity nie nadają się do użycia (None = są aktualne)."""
+    missing = [p.name for p in (*SPLIT_PATHS.values(), FEATURE_SETS_JSON) if not p.exists()]
+    if missing:
+        return f"brak plików: {', '.join(missing)}"
+    meta = _read_manifest()
+    if meta is None:
+        return f"brak lub uszkodzony {DATA_MANIFEST_JSON.name}"
+    version = meta.get("data_version")
+    if version != DATA_VERSION:
+        return f"wersja danych '{version}', kod oczekuje '{DATA_VERSION}'"
+    return None
+
+
 def is_prepared() -> bool:
     """Czy splity istnieją i zostały przygotowane bieżącą wersją logiki."""
-    if not all(p.exists() for p in SPLIT_PATHS.values()):
-        return False
-    if not (DATA_MANIFEST_JSON.exists() and FEATURE_SETS_JSON.exists()):
-        return False
-    manifest = json.loads(DATA_MANIFEST_JSON.read_text())
-    return manifest.get("data_version") == DATA_VERSION
+    return _not_prepared_reason() is None
 
 
-def ensure_prepared(strategy: str = "random") -> None:
-    """Uruchamia przygotowanie danych, jeśli splitów brak lub są nieaktualne."""
-    if is_prepared():
+def auto_prepare_disabled() -> bool:
+    return os.environ.get(NO_AUTO_PREPARE_ENV, "").strip().lower() in ("1", "true", "yes", "tak")
+
+
+def ensure_prepared(strategy: str | None = None) -> None:
+    """
+    Uruchamia przygotowanie danych, jeśli splitów brak lub są nieaktualne.
+
+    strategy=None → strategia podziału z istniejącego manifestu (np. 'site'),
+    a bez manifestu 'random'. Przy `SOR_AI_NO_AUTO_PREPARE=1` zamiast przygotowania
+    (≈ 11 GB RAM) zgłasza RuntimeError.
+    """
+    reason = _not_prepared_reason()
+    if reason is None:
         return
-    log.warning("Brak aktualnych splitów ESI — uruchamiam przygotowanie danych (scripts/02_preprocess.py)…")
+    if auto_prepare_disabled():
+        raise RuntimeError(
+            f"Splity ESI nie są gotowe ({reason}), a {NO_AUTO_PREPARE_ENV}=1 wyłącza "
+            f"automatyczne przygotowanie. Uruchom: python scripts/02_preprocess.py"
+        )
+    if strategy is None:
+        previous = (_read_manifest() or {}).get("split_strategy")
+        strategy = previous if previous in SPLIT_STRATEGIES else "random"
+    log.warning(f"Splity ESI nie są gotowe ({reason}) — uruchamiam przygotowanie danych "
+                f"(podział '{strategy}', scripts/02_preprocess.py)…")
     from src.data.prepare import prepare_dataset
 
     prepare_dataset(strategy=strategy)
@@ -66,7 +109,7 @@ def ensure_prepared(strategy: str = "random") -> None:
 
 
 def manifest() -> dict:
-    return json.loads(DATA_MANIFEST_JSON.read_text())
+    return json.loads(DATA_MANIFEST_JSON.read_text(encoding="utf-8"))
 
 
 @lru_cache(maxsize=1)
@@ -75,7 +118,7 @@ def _feature_sets_payload() -> dict:
         raise FileNotFoundError(
             f"Brak {FEATURE_SETS_JSON}. Uruchom: python scripts/02_preprocess.py"
         )
-    return json.loads(FEATURE_SETS_JSON.read_text())
+    return json.loads(FEATURE_SETS_JSON.read_text(encoding="utf-8"))
 
 
 def feature_names(feature_set: str = "triage") -> list[str]:
