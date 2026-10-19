@@ -373,22 +373,16 @@ def load_models(model_paths: list[Path]) -> dict[str, Any]:
     """
     Ładuje modele z plików model.joblib (artefakty BaseTriageModel.save).
 
-    Klucz = nazwa modelu; przy duplikatach — nazwa katalogu runa (albo pliku).
-    Nazwa modelu z run_info.json runa, a poza runs/ — z samego artefaktu.
+    Klucz = nazwa modelu (z artefaktu); przy duplikatach — nazwa katalogu runa (albo pliku).
+    Klasa modelu wybierana przez `src.models.load_model` (bez prób GPU).
     """
-    import joblib
-
-    from src.models import MODEL_REGISTRY
+    from src.models import load_model
 
     loaded: list[tuple[str, Path, Any]] = []
     for path in model_paths:
         path = Path(path)
-        info_path = path.parent / "run_info.json"
-        if info_path.exists():
-            name = json.loads(info_path.read_text())["model"]
-        else:
-            name = joblib.load(path)["name"]
-        model = MODEL_REGISTRY[name].load(path)
+        model = load_model(path)
+        name = model.name
         loaded.append((name, path, model))
         log.info(f"Załadowano '{name}' ({model.feature_set}): {path}")
 

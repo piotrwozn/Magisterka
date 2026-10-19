@@ -4,10 +4,10 @@ import { useTranslation } from "react-i18next";
 
 import { CountUp } from "@/components/animations/CountUp";
 import { FadeInOnScroll } from "@/components/animations/FadeInOnScroll";
-import { MTSCategoryBadge } from "@/components/shared/MTSCategoryBadge";
+import { ESILevelBadge } from "@/components/shared/ESILevelBadge";
 import { SectionHeader } from "@/components/shared/SectionHeader";
 import { Card } from "@/components/ui/card";
-import { MTS_CATEGORIES } from "@/lib/constants";
+import { ESI_LEVELS } from "@/lib/constants";
 
 export function ProblemStatement() {
   const { t, i18n } = useTranslation("sections");
@@ -64,9 +64,9 @@ export function ProblemStatement() {
 
         <FadeInOnScroll delay={0.2}>
           <Card className="overflow-hidden border-border/60 p-8 md:p-10">
-            <h3 className="mb-6 text-xl font-bold">Manchester Triage System</h3>
+            <h3 className="mb-6 text-xl font-bold">{t("esi.title", { ns: "common" })}</h3>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-              {MTS_CATEGORIES.map((cat, i) => (
+              {ESI_LEVELS.map((cat, i) => (
                 <motion.div
                   key={cat.id}
                   initial={{ opacity: 0, y: 20 }}
@@ -80,14 +80,12 @@ export function ProblemStatement() {
                     className="absolute inset-0 -z-10 opacity-0 transition-opacity group-hover:opacity-10"
                     style={{ background: `radial-gradient(circle at top right, ${cat.color}, transparent 70%)` }}
                   />
-                  <MTSCategoryBadge category={cat.id} lang={lang} size="sm" />
+                  <ESILevelBadge category={cat.id} lang={lang} size="sm" />
                   <p className="mt-3 text-3xl font-bold tabular-nums text-foreground">
                     {cat.maxWait}
                   </p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    {lang === "pl"
-                      ? t(`mts.${cat.code}Desc`, { ns: "common" })
-                      : t(`mts.${cat.code}Desc`, { ns: "common" })}
+                    {t(`esi.level${cat.level}Desc`, { ns: "common" })}
                   </p>
                 </motion.div>
               ))}

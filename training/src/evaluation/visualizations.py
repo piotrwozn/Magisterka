@@ -33,7 +33,7 @@ import seaborn as sns  # noqa: E402
 from sklearn.calibration import calibration_curve  # noqa: E402
 from sklearn.metrics import auc, confusion_matrix, roc_curve  # noqa: E402
 
-from src.utils.config import CLASS_NAMES, TOPSOR_COLORS  # noqa: E402
+from src.utils.config import CLASS_NAMES, TOPSOR_HEX  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 
 log = get_logger(__name__)
@@ -42,17 +42,8 @@ log = get_logger(__name__)
 # ─────────────────────────────────────────
 # Kolory poziomów ESI (TOPSOR)
 # ─────────────────────────────────────────
-# Odcienie (hex) dla nazw kolorów TOPSOR z config.TOPSOR_COLORS
-TOPSOR_HEX: dict[str, str] = {
-    "Red": "#D32F2F",
-    "Orange": "#F57C00",
-    "Yellow": "#FBC02D",
-    "Green": "#388E3C",
-    "Blue": "#1976D2",
-}
-
-# Kolor klasy o indeksie i (0 = ESI 1, …, 4 = ESI 5)
-ESI_COLORS: list[str] = [TOPSOR_HEX[name] for name in TOPSOR_COLORS]
+# Kolor klasy o indeksie i (0 = ESI 1, …, 4 = ESI 5) — odcienie z config.TOPSOR_HEX
+ESI_COLORS: list[str] = [TOPSOR_HEX[name] for name in CLASS_NAMES]
 
 
 def _class_color(index: int) -> str | None:

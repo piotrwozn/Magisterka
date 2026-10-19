@@ -249,16 +249,17 @@ class BaseTriageModel(abc.ABC):
         sw = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float64).ravel()
 
         X_es_use, y_es_use = None, None
-        if self.supports_early_stopping and X_es is not None and y_es is not None and len(X_es) > 0:
-            y_es_arr = np.asarray(y_es).astype(int).ravel()
-            keep = np.isin(y_es_arr, np.unique(y_arr))
-            if keep.all():
-                X_es_use, y_es_use = X_es[list(X.columns)], y_es_arr
-            elif keep.any():
-                X_es_use, y_es_use = X_es[list(X.columns)].loc[keep], y_es_arr[keep]
-        elif self.supports_early_stopping:
-            log.warning(f"{self.name}: brak zbioru early stopping — trening pełnego limitu iteracji "
-                        f"({self.iteration_param}={self.params.get(self.iteration_param)})")
+        if self.supports_early_stopping:
+            if X_es is not None and y_es is not None and len(X_es) > 0:
+                y_es_arr = np.asarray(y_es).astype(int).ravel()
+                keep = np.isin(y_es_arr, np.unique(y_arr))
+                if keep.all():
+                    X_es_use, y_es_use = X_es[list(X.columns)], y_es_arr
+                elif keep.any():
+                    X_es_use, y_es_use = X_es[list(X.columns)].loc[keep], y_es_arr[keep]
+            if X_es_use is None:
+                log.warning(f"{self.name}: brak zbioru early stopping — trening pełnego limitu iteracji "
+                            f"({self.iteration_param}={self.params.get(self.iteration_param)})")
 
         missing = sorted(set(range(N_CLASSES)) - set(np.unique(y_arr).tolist()))
         if missing:
@@ -367,6 +368,12 @@ class BaseTriageModel(abc.ABC):
                                   f"z limitu {self.iteration_cap}")
             self.tracker.log_metrics({"best_iteration": self.best_iteration,
                                       "iteration_cap": self.iteration_cap})
+            if self.iteration_cap and self.best_iteration >= ITERATION_CAP_WARN_FRACTION * self.iteration_cap:
+                self.train_logger.warning(
+                    f"Najlepsza iteracja ≥ {ITERATION_CAP_WARN_FRACTION:.0%} limitu — model może być "
+                    f"niedotrenowany (zwiększ {self.iteration_param})"
+                )
+                self.tracker.add_note("UWAGA: najlepsza iteracja przy limicie iteracji")
 
         if not self.supports_early_stopping and X_es is not None and y_es is not None and len(X_es):
             es_acc = float(np.mean(self.predict(X_es) == np.asarray(y_es).astype(int)))

@@ -1,10 +1,8 @@
 """
 Regułowa weryfikacja parametrów życiowych zgodna z ESI (sanity check dla modelu).
 
-Nazwa modułu jest historyczna (wcześniejsza wersja projektu sprawdzała reguły
-Manchester Triage System) — zachowana dla kompatybilności importów. Obecnie
-moduł NIE wykonuje żadnego mapowania ESI ↔ MTS: wynik to poziom ESI 1–5
-(indeks klasy 0–4), a kolor TOPSOR służy wyłącznie do wyświetlania.
+Wynik to poziom ESI 1–5 (indeks klasy 0–4); kolor TOPSOR służy wyłącznie do
+wyświetlania.
 
 Co sprawdzamy (algorytm ESI v4, tylko elementy możliwe do oceny z danych triażu):
     Punkt A — natychmiastowe zagrożenie życia → ESI 1
@@ -13,9 +11,11 @@ Co sprawdzamy (algorytm ESI v4, tylko elementy możliwe do oceny z danych triaż
         (zatrzymanie krążenia, brak reakcji, niewydolność oddechowa …).
     Punkt B — sytuacja wysokiego ryzyka → ESI 2
         hipotensja (SBP < 90), silny ból (≥ 7/10, jeśli podany), skargi
-        wysokiego ryzyka (alert udarowy, pełny alert urazowy, myśli samobójcze …).
+        wysokiego ryzyka (alert udarowy, aktywacja zespołu urazowego,
+        myśli samobójcze …).
     Punkt D — strefa zagrożenia parametrów (dorośli) → rozważ ESI 2
-        HR > 100, RR > 20, SpO2 < 92%.
+        HR > 100, RR > 20, SpO2 < 92% — liczone wprost z parametrów życiowych
+        (nie z cech pochodnych modelu).
     Punkt C (ESI 3 / 4 / 5) zależy od przewidywanej liczby zasobów — z samych
     parametrów życiowych NIE da się go ustalić, więc reguły nie wskazują wtedy
     konkretnego poziomu (wynik `suggested_class_idx = None`).
@@ -31,8 +31,10 @@ decyzja o ESI 1 wymaga oceny potrzeby natychmiastowej interwencji, więc
 rozbieżność "reguły ESI 1 vs model ESI 2" to sygnał do weryfikacji, nie błąd.
 
 Wejście: słownik / wiersz w schemacie kanonicznym (triage_vital_hr, _sbp, _dbp,
-_rr, _o2, _temp w °C, cc_*), akceptowane są też stare nazwy (triage_pulse,
-triage_o2sat, …). Temperatura > 50 traktowana jest jako °F i przeliczana.
+_rr, _o2, _temp w °C, cc_*), akceptowane są też stare nazwy parametrów
+(triage_pulse, triage_o2sat, …) i źródłowe flagi aktywacji urazowej Yale
+(cc_fulltrauma, cc_modifiedtrauma). Temperatura > 50 traktowana jest jako °F
+i przeliczana.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from src.data.yale_schema import TRAUMA_ACTIVATION_COL, TRAUMA_ACTIVATION_SOURCES
 from src.utils.config import (
     CLASS_NAMES,
     CLASS_NAMES_PL,
@@ -68,6 +71,7 @@ class VitalRule:
     advisory: bool = False              # True = "rozważ" (strefa zagrożenia), nie twardy próg
 
 
+# Strefa zagrożenia ESI (punkt D) dla dorosłych — progi ostre (> / <)
 ESI_DANGER_ZONE_ADULT: dict[str, float] = {
     "hr_above": 100.0,
     "rr_above": 20.0,
@@ -122,10 +126,14 @@ COMPLAINT_DISCRIMINATORS: dict[str, tuple[int, str]] = {
     "cc_unresponsive": (1, "skarga: brak reakcji"),
     "cc_respiratorydistress": (2, "skarga: niewydolność oddechowa (rozważ ESI 1)"),
     "cc_strokealert": (2, "skarga: alert udarowy"),
-    "cc_fulltrauma": (2, "skarga: pełny alert urazowy (rozważ ESI 1)"),
+    TRAUMA_ACTIVATION_COL: (2, "skarga: aktywacja zespołu urazowego (rozważ ESI 1)"),
     "cc_suicidal": (2, "skarga: myśli samobójcze"),
     "cc_homicidal": (2, "skarga: zagrożenie dla innych"),
     "cc_overdose_intentional": (2, "skarga: celowe przedawkowanie"),
+}
+# Kolumny źródłowe skarg (np. surowe flagi Yale scalane w prepare)
+COMPLAINT_ALIASES: dict[str, list[str]] = {
+    TRAUMA_ACTIVATION_COL: [TRAUMA_ACTIVATION_COL, *TRAUMA_ACTIVATION_SOURCES],
 }
 
 
@@ -142,9 +150,9 @@ def _level_info(class_idx: int) -> dict[str, Any]:
     }
 
 
-# Opis poziomów ESI z regułami (nazwa zachowana dla kompatybilności).
-# Klucze = config.CLASS_NAMES ("ESI1" … "ESI5"); kolor TOPSOR tylko do wyświetlania.
-MTS_VITAL_THRESHOLDS: dict[str, dict[str, Any]] = {
+# Poziomy ESI z regułami progowymi. Klucze = config.CLASS_NAMES ("ESI1" … "ESI5");
+# kolor TOPSOR tylko do wyświetlania.
+ESI_VITAL_RULES: dict[str, dict[str, Any]] = {
     CLASS_NAMES[0]: {
         **_level_info(0),
         "decision_point": "A",
@@ -176,7 +184,6 @@ MTS_VITAL_THRESHOLDS: dict[str, dict[str, Any]] = {
         "vital_rules": [],
     },
 }
-ESI_VITAL_RULES = MTS_VITAL_THRESHOLDS
 
 
 # ─────────────────────────────────────────
@@ -209,7 +216,7 @@ def _as_float(value: Any) -> float | None:
     return None if f != f else f   # NaN → None
 
 
-def _resolve_vital(patient_data: Mapping, canonical: str) -> float | None:
+def resolve_vital(patient_data: Mapping, canonical: str) -> float | None:
     """Wartość parametru (pierwszy niepusty alias); temperatura zawsze w °C."""
     for alias in VITAL_COL_ALIASES.get(canonical, [canonical]):
         if alias in patient_data:
@@ -222,8 +229,13 @@ def _resolve_vital(patient_data: Mapping, canonical: str) -> float | None:
     return None
 
 
-# Publiczny alias (używany np. przy budowie promptu LLM)
-resolve_vital = _resolve_vital
+def _complaint_present(patient_data: Mapping, col: str) -> bool:
+    """Czy skarga (lub któraś z jej kolumn źródłowych) jest zaznaczona (> 0)."""
+    for alias in COMPLAINT_ALIASES.get(col, [col]):
+        value = _as_float(patient_data.get(alias))
+        if value is not None and value > 0:
+            return True
+    return False
 
 
 def _to_mapping(patient: Any) -> Mapping:
@@ -289,18 +301,17 @@ def rule_based_triage(
             "decision_point": "A" if level == 1 else "B", "advisory": False, "description": desc,
         })
     for col, (level, desc) in COMPLAINT_DISCRIMINATORS.items():
-        value = _as_float(patient.get(col))
-        if value is not None and value > 0:
+        if _complaint_present(patient, col):
             violations.append({
                 "type": "complaint", "name": col, "esi": level, "class_idx": level - 1,
                 "decision_point": "A" if level == 1 else "B", "advisory": False, "description": desc,
             })
 
-    # 2. Reguły progowe na parametrach życiowych
+    # 2. Reguły progowe na parametrach życiowych (także strefa zagrożenia — z surowych wartości)
     for class_name in CLASS_NAMES:
-        level_cfg = MTS_VITAL_THRESHOLDS[class_name]
+        level_cfg = ESI_VITAL_RULES[class_name]
         for rule in level_cfg["vital_rules"]:
-            value = _resolve_vital(patient, rule.vital)
+            value = resolve_vital(patient, rule.vital)
             if value is None:
                 continue
             if rule.test(value):
@@ -312,7 +323,7 @@ def rule_based_triage(
                 })
 
     # 3. Braki pomiarów i uwagi
-    missing = [v for v in CORE_VITALS if _resolve_vital(patient, v) is None]
+    missing = [v for v in CORE_VITALS if resolve_vital(patient, v) is None]
     notes: list[str] = []
     if len(missing) == len(CORE_VITALS):
         notes.append(
@@ -365,7 +376,7 @@ def rule_based_triage(
         "notes": notes,
         "description": (
             "Strefa zagrożenia parametrów — rozważ ESI 2" if advisory
-            else MTS_VITAL_THRESHOLDS[CLASS_NAMES[best_idx]]["description"]
+            else ESI_VITAL_RULES[CLASS_NAMES[best_idx]]["description"]
         ),
     }
 

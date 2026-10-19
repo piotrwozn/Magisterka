@@ -181,10 +181,10 @@ class TestLoadSplits:
     def test_version_mismatch_raises(self, prepared_paths):
         manifest = json.loads(prepared_paths.DATA_MANIFEST_JSON.read_text(encoding="utf-8"))
         assert manifest["data_version"] == DATA_VERSION
-        _set_manifest(prepared_paths, data_version="stara-wersja-mts")
+        _set_manifest(prepared_paths, data_version="stara-wersja")
 
         assert not is_prepared()
-        with pytest.raises(RuntimeError, match="stara-wersja-mts"):
+        with pytest.raises(RuntimeError, match="stara-wersja"):
             load_split("train")
         with pytest.raises(RuntimeError):
             load_splits(feature_set="triage")

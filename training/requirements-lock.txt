@@ -1,0 +1,65 @@
+# ============================================================
+# SOR-AI — PRZETESTOWANY zestaw wersji (pip freeze z venv testowego, Python 3.13 x64)
+# Rdzeń (requirements.txt) + pytest + wszystkie zależności przechodnie.
+#
+#   pip install -r requirements-lock.txt
+#
+# Te same wersje mają koła dla Windows x64 i Linux x64 (Python 3.12 i 3.13).
+# Zależności tylko-Windows (colorama; tzdata dla pandas) — colorama przypięta niżej, tzdata dociągnie pip.
+# nvidia-nccl-cu13 — tylko Linux (komunikacja GPU w xgboost); na Windows niepotrzebna.
+# Aktualizacja: zmień wersje, przejdź testy (python -m pytest tests -q) i smoke
+# (python scripts/run_all.py --profile smoke), dopiero wtedy zatwierdź ten plik.
+# ============================================================
+alembic==1.20.0
+catboost==1.2.10
+certifi==2026.10.18
+charset-normalizer==3.5.2
+cloudpickle==3.1.2
+colorlog==6.12.0
+contourpy==1.4.0
+cycler==0.12.1
+fonttools==4.67.0
+graphviz==0.21
+idna==3.20
+iniconfig==2.3.1
+interpret-core==0.7.8
+joblib==1.6.0
+kiwisolver==1.5.1
+lightgbm==4.7.0
+Mako==1.4.3
+markdown-it-py==4.2.0
+MarkupSafe==3.0.4
+matplotlib==3.11.2
+mdurl==0.1.2
+narwhals==2.27.1
+numpy==2.5.4
+nvidia-nccl-cu13==2.32.3; platform_system == "Linux"
+optuna==5.0.0
+packaging==26.3
+pandas==3.0.6
+pillow==13.0.0
+plotly==7.1.0
+pluggy==1.7.0
+psutil==7.2.2
+pyarrow==26.0.0
+Pygments==2.21.0
+pyparsing==3.3.3
+pyreadr==0.5.7
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+requests==2.34.2
+rich==15.0.0
+scikit-learn==1.9.1
+scipy==1.18.1
+seaborn==0.13.2
+shap==0.54.1
+six==1.17.0
+slicer==0.0.8
+SQLAlchemy==2.1.5
+threadpoolctl==3.7.0
+tqdm==4.70.1
+typing_extensions==4.16.0
+urllib3==2.8.0
+xgboost==3.4.1
+colorama==0.4.6; sys_platform == "win32"

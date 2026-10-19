@@ -1,63 +1,91 @@
-# SOR-AI: trening modeli klasyfikacji ESI
+# SOR-AI: trening modeli klasyfikacji ESI — skróty dla Linuksa/macOS (make + bash).
+# Na Windows uruchamiaj skrypty wprost: python scripts/run_all.py … (training/README.md).
 #
 # Najczęściej:
-#   make install      — zależności
-#   make prepare      — przygotowanie danych Yale → splity ESI + DATA_AUDIT.md
-#   make train-all    — wszystkie modele, zestaw 'triage' (bez tuningu)
-#   make tune-all     — tuning Optuną + trening wszystkich modeli (długo: ok. 1 noc)
-#   make compare      — porównanie modeli + materiał do ręcznego łączenia
+#   make install      — przetestowane wersje zależności (requirements-lock.txt)
+#   make check-env    — kontrola środowiska (GPU, RAM, dysk, wersje, dane)
+#   make smoke        — 5–10 min: cały pipeline na próbce (test instalacji)
+#   make all          — nocny przebieg: tuning + trening 6 modeli, ewaluacja, porównanie (wznawialny)
+#   make status       — stan przebiegu z plików-znaczników
 #   make test         — testy
 #
-# Pojedynczy model: make train MODEL=xgboost   (FEATURES=full, ARGS="--weights balanced")
+# Zmienne: PROFILE=standard|thorough|quick|smoke  FEATURES=triage|full|triage,full  MODELS=all|lista
+#          RUN_ARGS="--lanes 1 --fail-fast"  (dodatkowe opcje run_all.py)
+# Pojedynczy model ręcznie: make train MODEL=xgboost ARGS="--tune --profile quick"
 
 PYTHON ?= python
-MODEL ?= xgboost
+PROFILE ?= standard
 FEATURES ?= triage
+MODELS ?= all
+MODEL ?= xgboost
 ARGS ?=
+RUN_ARGS ?=
 
-.PHONY: install convert prepare prepare-site train train-all train-full tune tune-all \
-        smoke compare eval explain cv demo mlflow test test-fast lint format clean clean-all
+RUN_ALL = $(PYTHON) scripts/run_all.py --feature-set $(FEATURES) --models $(MODELS) $(RUN_ARGS)
 
+.PHONY: install install-app install-dev check-env all smoke quick thorough status dry-run \
+        convert prepare prepare-site train train-all tune compare eval explain cv demo mlflow \
+        test test-fast lint format clean clean-all
+
+# --- Instalacja ---
 install:
-	$(PYTHON) -m pip install -r requirements.txt
+	$(PYTHON) -m pip install -r requirements-lock.txt
 
-# --- Dane ---
+install-app: install
+	$(PYTHON) -m pip install -r requirements-app.txt
+
+install-dev: install
+	$(PYTHON) -m pip install -r requirements-dev.txt
+
+# --- Jedno polecenie (scripts/run_all.py) ---
+check-env:
+	$(PYTHON) scripts/00_check_env.py
+
+all:
+	$(RUN_ALL) --profile $(PROFILE)
+
+smoke:
+	$(RUN_ALL) --profile smoke
+
+quick:
+	$(RUN_ALL) --profile quick
+
+thorough:
+	$(RUN_ALL) --profile thorough
+
+status:
+	$(RUN_ALL) --profile $(PROFILE) --status
+
+dry-run:
+	$(RUN_ALL) --profile $(PROFILE) --dry-run
+
+# --- Kroki pojedynczo ---
 convert:
 	$(PYTHON) scripts/01_convert_rdata.py
 
 prepare:
 	$(PYTHON) scripts/02_preprocess.py --split random
 
-# Walidacja zewnętrzna: oddział C w całości jako test
+# Walidacja zewnętrzna: oddział B w całości jako test
 prepare-site:
 	$(PYTHON) scripts/02_preprocess.py --split site
 
-# --- Trening ---
 train:
 	$(PYTHON) scripts/03_train.py --model $(MODEL) --feature-set $(FEATURES) $(ARGS)
 
+# Wszystkie modele w jednym procesie, parametry domyślne (bez tuningu) — szybki punkt odniesienia
 train-all:
 	$(PYTHON) scripts/03_train.py --model all --feature-set $(FEATURES) $(ARGS)
 
-train-full:
-	$(PYTHON) scripts/03_train.py --model all --feature-set full $(ARGS)
-
 tune:
-	$(PYTHON) scripts/03_train.py --model $(MODEL) --feature-set $(FEATURES) --tune $(ARGS)
+	$(PYTHON) scripts/03_train.py --model $(MODEL) --feature-set $(FEATURES) --tune --profile $(PROFILE) $(ARGS)
 
-tune-all:
-	$(PYTHON) scripts/03_train.py --model all --feature-set $(FEATURES) --tune $(ARGS)
-
-# Szybki test całego pipeline'u na próbce (kilka minut) — nie do raportowania
-smoke:
-	$(PYTHON) scripts/03_train.py --model all --sample 20000 --eval-sample 10000 --tag smoke
-
-# --- Wyniki ---
+# --- Wyniki (tylko VAL; test — raz, na końcu) ---
 compare:
 	$(PYTHON) scripts/07_compare_runs.py --feature-set $(FEATURES)
 
 eval:
-	$(PYTHON) scripts/04_evaluate.py --model-name $(MODEL)
+	$(PYTHON) scripts/04_evaluate.py --model-name $(MODEL) --feature-set $(FEATURES)
 
 explain:
 	$(PYTHON) scripts/05_explain.py --model-name $(MODEL) --n-patients 5
@@ -69,25 +97,25 @@ demo:
 	streamlit run app/streamlit_app.py
 
 mlflow:
-	mlflow ui --backend-store-uri file://$(PWD)/mlruns --port 5000
+	mlflow ui --backend-store-uri "$$($(PYTHON) -c 'import pathlib; print(pathlib.Path("mlruns").resolve().as_uri())')" --port 5000
 
 # --- Jakość ---
 test:
-	$(PYTHON) -m pytest tests/ -v
+	$(PYTHON) -m pytest tests/ -q
 
 test-fast:
 	$(PYTHON) -m pytest tests/ -q -m "not slow"
 
 lint:
-	@which ruff > /dev/null && ruff check src/ tests/ scripts/ app/ || echo "Zainstaluj ruff: pip install ruff"
+	@command -v ruff > /dev/null && ruff check src/ tests/ scripts/ app/ || echo "Zainstaluj: pip install -r requirements-dev.txt"
 
 format:
-	@which black > /dev/null && black src/ tests/ scripts/ app/ || echo "Zainstaluj black: pip install black"
+	@command -v black > /dev/null && black src/ tests/ scripts/ app/ || echo "Zainstaluj: pip install -r requirements-dev.txt"
 
 # --- Sprzątanie ---
 clean:
-	@echo "Usuwam logi, wyniki i przygotowane splity (runy w runs/ zostają)…"
-	rm -rf logs/training/* logs/experiments/* logs/evaluation/*
+	@echo "Usuwam logi, wyniki i przygotowane splity (runy w runs/ i badania Optuny zostają)…"
+	rm -rf logs/training/* logs/experiments/* logs/evaluation/* logs/run_all/*
 	rm -rf results/figures/* results/tables/*
 	rm -rf data/processed/esi
 	rm -rf mlruns/ .pytest_cache/
@@ -95,4 +123,4 @@ clean:
 
 clean-all: clean
 	rm -rf runs/ logs/
-	@echo "Usunięto także wszystkie runy (modele, predykcje, leaderboard)."
+	@echo "Usunięto także wszystkie runy (modele, predykcje, leaderboard) i badania Optuny."

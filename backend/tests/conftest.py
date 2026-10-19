@@ -74,7 +74,7 @@ def mock_registry() -> ModelRegistry:
     medians_path = backend_root / "models" / "imputation_medians.json"
 
     if medians_path.exists():
-        payload = json.loads(medians_path.read_text())
+        payload = json.loads(medians_path.read_text(encoding="utf-8"))
         medians = payload["medians"]
     else:
         # Minimal fallback (no real medians on disk) — temperature in °C

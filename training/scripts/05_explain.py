@@ -31,7 +31,6 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-import joblib  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
@@ -40,10 +39,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import load_split  # noqa: E402
-from src.data.prepare import META_COLS  # noqa: E402
+from src.data.prepare import META_COLS, VITALS_COMPLETE_COL  # noqa: E402
 from src.ensemble import list_runs, load_run  # noqa: E402
 from src.evaluation.metrics import decide  # noqa: E402
-from src.explain.mts_rules import check_consistency, rule_based_triage  # noqa: E402
+from src.explain.esi_rules import check_consistency, rule_based_triage  # noqa: E402
 from src.explain.ollama_medical import OllamaMedicalExplainer  # noqa: E402
 from src.explain.shap_explainer import (  # noqa: E402
     ExplainerUnavailable,
@@ -52,8 +51,7 @@ from src.explain.shap_explainer import (  # noqa: E402
     shap_summary_plot,
     shap_waterfall_plot,
 )
-from src.models import MODEL_REGISTRY, resolve_model_name  # noqa: E402
-from src.models.base import BaseTriageModel  # noqa: E402
+from src.models import MODEL_REGISTRY, load_model, resolve_model_name  # noqa: E402
 from src.utils.config import (  # noqa: E402
     CLASS_NAMES,
     CLASS_NAMES_PL,
@@ -76,13 +74,6 @@ PERMUTATION_SUMMARY_LIMIT = 50   # metoda permutacyjna jest wolna — mniejsza p
 # ─────────────────────────────────────────
 # Model / run
 # ─────────────────────────────────────────
-def load_model(path: Path, model_name: str | None = None) -> BaseTriageModel:
-    """model.joblib → instancja właściwej klasy modelu (z MODEL_REGISTRY)."""
-    if model_name is None:
-        model_name = joblib.load(path)["name"]
-    return MODEL_REGISTRY[resolve_model_name(model_name)].load(path)
-
-
 def latest_run_with_model(
     feature_set: str = "triage",
     model_name: str | None = None,
@@ -104,11 +95,11 @@ def latest_run_with_model(
     return None
 
 
-def resolve_run(args: argparse.Namespace) -> tuple[str, Path, str | None]:
-    """Zwraca (nazwa, ścieżka model.joblib, nazwa modelu) wg --model / --run / najnowszego runa."""
+def resolve_run(args: argparse.Namespace) -> tuple[str, Path]:
+    """Zwraca (nazwa, ścieżka model.joblib) wg --model / --run / najnowszego runa."""
     if args.model:
         path = Path(args.model)
-        return path.stem, path, None
+        return path.stem, path
     if args.run:
         run = load_run(args.run)
     else:
@@ -123,7 +114,7 @@ def resolve_run(args: argparse.Namespace) -> tuple[str, Path, str | None]:
     path = run.path / "model.joblib"
     if not path.exists():
         raise SystemExit(f"Run {run.name} nie ma zapisanego modelu ({path})")
-    return run.name, path, run.model
+    return run.name, path
 
 
 def level_info(class_idx: int) -> dict:
@@ -179,7 +170,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    run_name, model_path, model_name = resolve_run(args)
+    run_name, model_path = resolve_run(args)
 
     log.info("=" * 60)
     log.info(f"GENEROWANIE WYJAŚNIEŃ: {run_name}")
@@ -187,7 +178,7 @@ def main() -> None:
 
     # 1. Model
     log.info(f"[1/5] Ładowanie modelu: {model_path}")
-    model = load_model(model_path, model_name)
+    model = load_model(model_path)          # klasa wg nazwy modelu w artefakcie
     if not model.feature_names:
         raise SystemExit("Model nie ma zapisanych nazw cech (feature_names) — wytrenuj go ponownie.")
     features = list(model.feature_names)
@@ -311,6 +302,9 @@ def main() -> None:
             "row_id": int(row["row_id"]),
             "site": row.get("site"),
             "admitted": None if pd.isna(row.get("admitted")) else int(row["admitted"]),
+            VITALS_COMPLETE_COL: (
+                None if pd.isna(row.get(VITALS_COMPLETE_COL)) else int(row[VITALS_COMPLETE_COL])
+            ),
             "true": level_info(true_idx),
             "prediction": {rule: level_info(pred) for rule, pred in preds.items()},
             "explained_rule": args.rule,

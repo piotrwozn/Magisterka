@@ -1,17 +1,28 @@
 /**
  * Global constants for SOR-AI frontend.
- * Synced with backend types.
+ * Synced with backend types (backend/app/models/schemas.py).
+ *
+ * Label: Emergency Severity Index (ESI 1–5). The API returns class indexes
+ * 0–4 = ESI 1–5; TOPSOR colours (red … blue) and max. waits are display only.
  */
 
-export const MTS_CATEGORIES = [
-  { id: 0, code: "red", labelPl: "Czerwony", labelEn: "Red", maxWait: "0 min", color: "#DC2626" },
-  { id: 1, code: "orange", labelPl: "Pomarańczowy", labelEn: "Orange", maxWait: "10 min", color: "#EA580C" },
-  { id: 2, code: "yellow", labelPl: "Żółty", labelEn: "Yellow", maxWait: "60 min", color: "#EAB308" },
-  { id: 3, code: "green", labelPl: "Zielony", labelEn: "Green", maxWait: "120 min", color: "#16A34A" },
-  { id: 4, code: "blue", labelPl: "Niebieski", labelEn: "Blue", maxWait: "240 min", color: "#2563EB" },
+export const ESI_LEVELS = [
+  { id: 0, level: 1, code: "red",    colorPl: "Czerwony",     colorEn: "Red",    maxWait: "0 min",   maxWaitMin: 0,   color: "#DC2626" },
+  { id: 1, level: 2, code: "orange", colorPl: "Pomarańczowy", colorEn: "Orange", maxWait: "10 min",  maxWaitMin: 10,  color: "#EA580C" },
+  { id: 2, level: 3, code: "yellow", colorPl: "Żółty",        colorEn: "Yellow", maxWait: "60 min",  maxWaitMin: 60,  color: "#EAB308" },
+  { id: 3, level: 4, code: "green",  colorPl: "Zielony",      colorEn: "Green",  maxWait: "120 min", maxWaitMin: 120, color: "#16A34A" },
+  { id: 4, level: 5, code: "blue",   colorPl: "Niebieski",    colorEn: "Blue",   maxWait: "240 min", maxWaitMin: 240, color: "#2563EB" },
 ] as const;
 
-export type MTSCategoryId = (typeof MTS_CATEGORIES)[number]["id"];
+/** Class index returned by the API (0–4 = ESI 1–5). */
+export type EsiLevelId = (typeof ESI_LEVELS)[number]["id"];
+
+/** "ESI 2 · Pomarańczowy" */
+export function esiLabel(id: number, lang: "pl" | "en" = "pl"): string {
+  const lvl = ESI_LEVELS[id];
+  if (!lvl) return "—";
+  return `ESI ${lvl.level} · ${lang === "pl" ? lvl.colorPl : lvl.colorEn}`;
+}
 
 export type ModelStatus = "trained" | "training" | "planned";
 
@@ -21,18 +32,23 @@ export interface ModelClassRecall {
   color: string;
 }
 
+/**
+ * Model card. Metrics are TEST-split values in % (undertriage, criticalMiss, accuracy)
+ * or 0–1 (qwk, f1Macro, aucMacro, cohenKappa); undefined = not trained yet.
+ * Fill them from training/runs/<run>/metrics.json after the final training.
+ */
 export interface Model {
   id: string;
   name: string;
   type: string;
-  qwk: number;
+  qwk?: number;
   accuracy?: number;
   f1Macro?: number;
   aucMacro?: number;
   cohenKappa?: number;
-  undertriage: number;
-  criticalMiss: number;
-  trainTimeMin: number;
+  undertriage?: number;
+  criticalMiss?: number;
+  trainTimeMin?: number;
   device: string;
   color: string;
   status: ModelStatus;
@@ -42,190 +58,94 @@ export interface Model {
   notes?: string;
 }
 
+/** The 6 models served by the backend ensemble (backend/app/models/ensemble.py). */
 export const MODELS: Model[] = [
-  {
-    id: "catboost",
-    name: "CatBoost",
-    type: "Gradient Boosting",
-    qwk: 0.8729,
-    accuracy: 87.20,
-    f1Macro: 0.6869,
-    aucMacro: 0.9711,
-    cohenKappa: 0.7321,
-    undertriage: 3.22,
-    criticalMiss: 0.055,
-    trainTimeMin: 240,
-    device: "GPU (CUDA)",
-    color: "#FFCC00",
-    status: "trained",
-    description: "Oblivious symmetric trees z natywnym CUDA. Wytrenowany na 8× RTX 5090, 3800 iteracji, Optuna 154 triiali.",
-    classRecalls: [
-      { label: "Red",    value: 99.1, color: "#DC2626" },
-      { label: "Orange", value: 68.1, color: "#EA580C" },
-      { label: "Yellow", value: 53.4, color: "#EAB308" },
-      { label: "Green",  value: 52.1, color: "#16A34A" },
-      { label: "Blue",   value: 76.0, color: "#2563EB" },
-    ],
-    params: {
-      "iterations": 3800,
-      "depth": 9,
-      "learning_rate": 0.130,
-      "l2_leaf_reg": 0.127,
-      "subsample": 0.639,
-      "grow_policy": "SymmetricTree",
-      "bootstrap_type": "Bernoulli",
-    },
-    notes: "Najniższy critical miss (0.055%). Red recall 99.1% — minimalne przeoczenie stanów krytycznych. Optuna 154 triiale, MultivariateTPE, 5-fold CV.",
-  },
   {
     id: "xgboost",
     name: "XGBoost",
     type: "Gradient Boosting",
-    qwk: 0.8691,
-    accuracy: 86.74,
-    f1Macro: 0.6799,
-    aucMacro: 0.9706,
-    cohenKappa: 0.7236,
-    undertriage: 3.83,
-    criticalMiss: 0.07,
-    trainTimeMin: 180,
-    device: "GPU (CUDA)",
+    device: "GPU (CUDA) / CPU",
     color: "#00BFFF",
-    status: "trained",
-    description: "QuantileDMatrix + tree_method=hist, 5 foldów równolegle na osobnych RTX 5090. Optuna 150 triali, lossguide grow policy.",
-    classRecalls: [
-      { label: "Red",    value: 99.1, color: "#DC2626" },
-      { label: "Orange", value: 64.7, color: "#EA580C" },
-      { label: "Yellow", value: 50.8, color: "#EAB308" },
-      { label: "Green",  value: 60.8, color: "#16A34A" },
-      { label: "Blue",   value: 76.0, color: "#2563EB" },
-    ],
-    params: {
-      "n_estimators": 3500,
-      "max_depth": 14,
-      "learning_rate": 0.0113,
-      "subsample": 0.416,
-      "colsample_bytree": 0.830,
-      "colsample_bylevel": 0.569,
-      "colsample_bynode": 0.899,
-      "min_child_weight": 4.86,
-      "reg_alpha": 0.702,
-      "reg_lambda": 0.620,
-      "max_bin": 1280,
-      "grow_policy": "lossguide",
-      "tree_method": "hist",
-    },
-    notes: "Best trial: #83 z 150 (QWK CV=0.8786). Lossguide grow policy + 8× RTX 5090 multi-GPU. Critical miss 0.07% — drugi najlepszy po CatBoost.",
+    status: "planned",
+    description: "Histogram GBDT, early stopping na fragmencie zbioru treningowego. Tuning Optuna (TPE, wznawialny). GPU, gdy działa — inaczej CPU z ostrzeżeniem.",
+    notes: "Wyniki ESI pojawią się po treningu końcowym (runs/leaderboard.csv).",
   },
-{
+  {
     id: "lightgbm",
     name: "LightGBM",
     type: "Gradient Boosting",
-    qwk: 0.8719,
-    accuracy: 87.25,
-    f1Macro: 0.6899,
-    aucMacro: 0.9724,
-    cohenKappa: 0.7328,
-    undertriage: 2.38,
-    criticalMiss: 0.04,
-    trainTimeMin: 25,
-    device: "CPU (Lokalnie)",
+    device: "CPU",
     color: "#7CFC00",
-    status: "trained",
-    description: "Leaf-wise splitting GBDT z custom class weights (Optuna, retrained 2026-05-24). 2100 drzew, najniższy critical miss i undertriage ze wszystkich modeli.",
-    classRecalls: [
-      { label: "Red",    value: 99.2, color: "#DC2626" },
-      { label: "Orange", value: 72.9, color: "#EA580C" },
-      { label: "Yellow", value: 48.5, color: "#EAB308" },
-      { label: "Green",  value: 56.5, color: "#16A34A" },
-      { label: "Blue",   value: 65.8, color: "#2563EB" },
-    ],
-    params: {
-      "n_estimators": 2100,
-      "max_depth": 12,
-      "num_leaves": 33,
-      "learning_rate": 0.0559,
-      "subsample": 0.523,
-      "colsample_bytree": 0.551,
-      "max_bin": 960,
-    },
-    notes: "Retrenowany z custom weights — critical miss spadł z 0.41% do 0.04% (10×). Najniższy undertriage 2.38%. Red recall 99.2%.",
+    status: "planned",
+    description: "Leaf-wise GBDT, natywna obsługa braków danych. Tuning Optuna z early stoppingiem.",
+    notes: "Wyniki ESI pojawią się po treningu końcowym (runs/leaderboard.csv).",
   },
-    notes: "Najlepszy recall Orange (73.7%) i Green (60.6%) spośród wytrenowanych modeli. Optuna 152 triiale, MultivariateTPE, 5-fold CV.",
+  {
+    id: "catboost",
+    name: "CatBoost",
+    type: "Gradient Boosting",
+    device: "GPU (CUDA) / CPU",
+    color: "#FFCC00",
+    status: "planned",
+    description: "Oblivious (symmetric) trees, natywne CUDA. Tuning Optuna z early stoppingiem.",
+    notes: "Wyniki ESI pojawią się po treningu końcowym (runs/leaderboard.csv).",
   },
   {
     id: "random_forest",
     name: "Random Forest",
     type: "Bagging",
-    qwk: 0.8400,
-    accuracy: 84.73,
-    f1Macro: 0.6084,
-    aucMacro: 0.97,
-    cohenKappa: 0.6783,
-    undertriage: 4.98,
-    criticalMiss: 0.04,
-    trainTimeMin: 75,
-    device: "GPU (cuML)",
+    device: "CPU",
     color: "#FF69B4",
-    status: "trained",
-    description: "cuML RandomForest, 900 drzew, 150 triali Optuny z custom class weights. 5 foldów równolegle na RTX 5090.",
-    classRecalls: [
-      { label: "Red",    value: 99.3, color: "#DC2626" },
-      { label: "Orange", value: 54.7, color: "#EA580C" },
-      { label: "Yellow", value: 54.3, color: "#EAB308" },
-      { label: "Green",  value: 32.1, color: "#16A34A" },
-      { label: "Blue",   value: 68.2, color: "#2563EB" },
-    ],
-    params: {
-      "n_estimators": 900,
-      "max_depth": 27,
-      "min_samples_split": 39,
-      "max_features": "0.4",
-      "bootstrap": "True",
-      "max_leaf_nodes": 5000,
-    },
-    notes: "Custom class weights (Optuna). QWK 0.84 — drugi najgorszy ale kluczowy diversity booster do stackingu. Red recall 99.3% — drugi najlepszy po CatBoost.",
-  },
-  {
-    id: "extra_trees",
-    name: "ExtraTrees",
-    type: "Bagging",
-    qwk: 0.83,
-    undertriage: 5.1,
-    criticalMiss: 0.18,
-    trainTimeMin: 90,
-    device: "CPU",
-    color: "#DA70D6",
-    status: "training",
-    description: "Maksymalna randomizacja splits, komplementarny do RF w ensemblu. Tuning w toku.",
-  },
-  {
-    id: "hist_gbt",
-    name: "HistGBT",
-    type: "Gradient Boosting",
-    qwk: 0.84,
-    undertriage: 4.1,
-    criticalMiss: 0.14,
-    trainTimeMin: 150,
-    device: "CPU",
-    color: "#FF7F50",
     status: "planned",
-    description: "sklearn HistGradientBoosting, inny inductive bias. Wartości szacowane.",
+    description: "scikit-learn RandomForest (natywne NaN). Inny inductive bias niż boosting — różnorodność ensembla.",
+    notes: "Wyniki ESI pojawią się po treningu końcowym (runs/leaderboard.csv).",
   },
   {
     id: "ebm",
     name: "EBM",
     type: "Glassbox",
-    qwk: 0.81,
-    undertriage: 5.8,
-    criticalMiss: 0.21,
-    trainTimeMin: 480,
     device: "CPU",
     color: "#9370DB",
     status: "planned",
-    description: "Explainable Boosting Machine (InterpretML). Pełna interpretowalność wymagana przez MDR. Wartości szacowane.",
+    description: "Explainable Boosting Machine (InterpretML) — w pełni interpretowalny model addytywny.",
+    notes: "Wyniki ESI pojawią się po treningu końcowym (runs/leaderboard.csv).",
+  },
+  {
+    id: "logreg",
+    name: "LogReg",
+    type: "Linear baseline",
+    device: "CPU",
+    color: "#94A3B8",
+    status: "planned",
+    description: "Regresja logistyczna (imputacja medianą + standaryzacja) — liniowy punkt odniesienia.",
+    notes: "Wyniki ESI pojawią się po treningu końcowym (runs/leaderboard.csv).",
   },
 ];
+
+/** Model with the highest test QWK; null while no model has results. */
+export function bestModel(models: Model[] = MODELS): Model | null {
+  const scored = models.filter((m) => m.qwk !== undefined);
+  if (scored.length === 0) return null;
+  return scored.reduce((a, b) => ((a.qwk ?? 0) >= (b.qwk ?? 0) ? a : b));
+}
+
+/**
+ * Final ensemble results on the TEST split (ESI 1–5). null = not trained yet —
+ * the UI shows "—". Fill from training/runs (weights chosen on val, reported on test).
+ * Rates in %, recallPerLevel in % for ESI 1..5, confusionMatrix rows = true ESI 1..5.
+ */
+export interface EnsembleResults {
+  qwk: number;
+  undertriage: number;
+  criticalMiss: number;
+  overtriage: number;
+  recallPerLevel?: [number, number, number, number, number];
+  confusionMatrix?: number[][];
+  featureImportance?: { feature: string; value: number }[];
+  source: string;
+}
+
+export const RESULTS: EnsembleResults | null = null;
 
 export const VITALS_RANGES = {
   age: { min: 0, max: 120, default: 45, unit: "lat" },
@@ -324,7 +244,7 @@ export const TECH_STACK: Record<string, TechItem[]> = {
       name: "FastAPI (Python)", color: "#009688", version: "0.115",
       role: "ML inference microservice",
       why: "Python-native dla joblib modeli. Async endpoints, automatyczna dokumentacja OpenAPI. Pydantic walidacja danych wejściowych.",
-      how: "Ładuje modele przy starcie: CatBoost, XGBoost, LightGBM z /models/*.joblib. /predict endpoint: feature engineering → ensemble → SHAP → response.",
+      how: "Ładuje przy starcie 6 modeli (*.joblib) i opcjonalne wagi ensemble_weights.json. /predict: feature engineering → ensemble ESI 1–5 → reguły bezpieczeństwa ESI → SHAP → response.",
       where: "Serwis ML — odizolowany od głównego backendu, komunikacja przez HTTP.",
     },
     {
@@ -346,44 +266,44 @@ export const TECH_STACK: Record<string, TechItem[]> = {
     {
       name: "XGBoost", color: "#1F77B4", version: "2.1",
       role: "Model gradientowy #1",
-      why: "QuantileDMatrix 2–3× szybszy niż DMatrix na GPU. tree_method=hist + device=cuda. Najlepszy QWK w dotychczasowych testach.",
-      how: "5-fold CV równolegle na 5 GPU. 3500 estimatorów, max_depth=14. Optuna 150 triali (w toku). Wagi klas cost-sensitive.",
-      where: "Warstwa 1A ensembla. Wejście do meta-learnera stacking LogReg.",
+      why: "tree_method=hist + device=cuda — szybki trening na GPU, automatyczny powrót na CPU.",
+      how: "Early stopping na fragmencie zbioru treningowego, tuning Optuna (k-fold CV).",
+      where: "Warstwa 1A ensembla (wagi dobierane na zbiorze walidacyjnym).",
     },
     {
       name: "CatBoost", color: "#FFCC00", version: "1.2",
       role: "Model gradientowy #2",
-      why: "Natywna obsługa CUDA. Oblivious symmetric trees — szybszy inference. Najniższy critical miss (0.055%).",
-      how: "GPU: 8× RTX 5090. 3800 iteracji, depth=9. Optuna 154 triiale, MultivariateTPE. Bernoulli bootstrap.",
-      where: "Warstwa 1A ensembla. QWK 0.8729 na test set.",
+      why: "Natywna obsługa CUDA. Oblivious symmetric trees — szybki inference.",
+      how: "Trening na GPU (RTX 4080 Super) z early stoppingiem; tuning Optuna.",
+      where: "Warstwa 1A ensembla.",
     },
     {
       name: "LightGBM", color: "#7CB342", version: "4.5",
       role: "Model gradientowy #3",
-      why: "Leaf-wise splitting zamiast level-wise — głębsze drzewa dla 336 features. Najlepszy recall Orange/Green.",
-      how: "CPU, 2100 drzew, num_leaves=33, max_depth=12. Optuna 152 triiale. 5-fold CV z OMP parallelism per fold.",
-      where: "Warstwa 1A ensembla. QWK 0.8705 na test set.",
+      why: "Leaf-wise splitting zamiast level-wise — szybki i dokładny na danych tabelarycznych.",
+      how: "CPU (wszystkie rdzenie fizyczne), early stopping, tuning Optuna.",
+      where: "Warstwa 1A ensembla.",
     },
     {
       name: "scikit-learn", color: "#F7931E", version: "1.5",
-      role: "Preprocessing i stacking",
-      why: "StandardScaler, StratifiedKFold, LogisticRegression meta-learner. Spójne API z resztą ML pipeline.",
-      how: "StratifiedKFold(5) dla CV. LogisticRegression jako meta-learner stacking (wejście: predykcje 7 modeli). cohen_kappa_score jako główna metryka.",
-      where: "Preprocessing pipeline i warstwa meta-learnera stacking.",
+      role: "Random Forest, LogReg, walidacja",
+      why: "RandomForest z natywną obsługą NaN, pipeline LogReg (imputacja + skalowanie), StratifiedKFold. Spójne API.",
+      how: "StratifiedKFold dla CV w tuningu. cohen_kappa_score (QWK) jako główna metryka ordinalna.",
+      where: "Modele random_forest i logreg oraz metryki ewaluacji.",
     },
     {
-      name: "cuML · RAPIDS", color: "#76B900", version: "24.10",
-      role: "GPU Random Forest",
-      why: "cuML RF 10–50× szybszy niż sklearn na GPU dla dużych danych. Ta sama API co sklearn.",
-      how: "from cuml.ensemble import RandomForestClassifier. Auto-detect GPU przy starcie tuningu. Fallback do sklearn CPU jeśli brak GPU.",
-      where: "Model random_forest w ensemblu. 5-fold równolegle na 5 GPU.",
+      name: "InterpretML · EBM", color: "#76B900", version: "0.7",
+      role: "Model glassbox",
+      why: "Explainable Boosting Machine — dokładność bliska boostingowi przy pełnej interpretowalności (wymóg MDR).",
+      how: "ExplainableBoostingClassifier (interpret-core), wiele rdzeni CPU, tuning Optuna na próbce.",
+      where: "Model ebm w ensemblu.",
     },
     {
       name: "Optuna", color: "#1F4E79", version: "4.1",
       role: "Hyperparameter tuning",
-      why: "MultivariateTPE modeluje korelacje między hiperparametrami. SQLite storage — wznowienie po crashu/wyłączeniu serwera.",
-      how: "NopPruner (żaden trial nie ubijany). n_startup_trials=50 przed TPE. Storage: /tmp/opencode/optuna_studies_{model}.db. 5-fold QWK jako objective.",
-      where: "Tuning każdego z 7 modeli. ~150 triali per model.",
+      why: "MultivariateTPE modeluje korelacje między hiperparametrami. SQLite storage — wznowienie po awarii lub restarcie.",
+      how: "Budżety prób i czasu wg profilu (smoke / quick / standard / thorough), QWK z k-fold CV jako objective.",
+      where: "Tuning każdego z 6 modeli.",
     },
   ],
   llm: [
@@ -404,8 +324,8 @@ export const TECH_STACK: Record<string, TechItem[]> = {
     {
       name: "MedGemma 27B · NLP", color: "#4285F4", version: "27B",
       role: "Kliniczne uzasadnienie",
-      why: "Google MedGemma trenowany na danych medycznych. Rozumie terminologię kliniczną, ICD-10, protokoły MTS.",
-      how: "Wejście: predykcja ML + parametry życiowe + notatka. Wyjście: reasoning, risk_flags, key_findings. Inference ~3–5s na RTX 5090.",
+      why: "Google MedGemma trenowany na danych medycznych. Rozumie terminologię kliniczną, ICD-10 i skalę ESI.",
+      how: "Wejście: predykcja ML + parametry życiowe + notatka. Wyjście: poziom ESI 1–5, reasoning, risk_flags, key_findings.",
       where: "Warstwa 1B — generuje słowne uzasadnienie pokazywane w demo.",
     },
     {
@@ -429,13 +349,15 @@ export const TIMELINE_EVENTS = [
   { date: "2026-05", titleKey: "timeline.events.catboostFinal" },
   { date: "2026-05", titleKey: "timeline.events.xgboostA5000" },
   { date: "2026-06", titleKey: "timeline.events.frontend" },
+  { date: "2026-10", titleKey: "timeline.events.esiNative" },
   { date: "2027-07", titleKey: "timeline.events.defense" },
 ] as const;
 
+/** ESI distribution in Yale EMMLC (558 027 visits; training/DATA_AUDIT.md). */
 export const CLASS_DISTRIBUTION = [
-  { name: "Red", value: 68.6, color: "#DC2626" },
-  { name: "Orange", value: 13.2, color: "#EA580C" },
-  { name: "Yellow", value: 12.2, color: "#EAB308" },
-  { name: "Green", value: 4.1, color: "#16A34A" },
-  { name: "Blue", value: 1.9, color: "#2563EB" },
+  { name: "ESI 1", value: 0.9, color: "#DC2626" },
+  { name: "ESI 2", value: 29.3, color: "#EA580C" },
+  { name: "ESI 3", value: 42.3, color: "#EAB308" },
+  { name: "ESI 4", value: 22.4, color: "#16A34A" },
+  { name: "ESI 5", value: 5.0, color: "#2563EB" },
 ] as const;

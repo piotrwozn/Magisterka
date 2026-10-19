@@ -49,13 +49,22 @@ FAST_PARAMS: dict[str, dict] = {
 
 EXPECTED_MODELS = ["logreg", "lightgbm", "xgboost", "catboost", "random_forest", "ebm"]
 EARLY_STOPPING_MODELS = {"lightgbm", "xgboost", "catboost"}
-DEVICE_VARS = ("SOR_AI_DEVICE", "SOR_AI_DEVICE_XGBOOST", "SOR_AI_DEVICE_CATBOOST")
 
 ARTIFACT_KEYS = [
     "name", "run_id", "params", "model", "feature_names", "feature_set", "classes_", "class_names",
     "label", "data_version", "training_duration_s", "requested_device", "actual_device",
     "device_fallback", "best_iteration", "iteration_cap", "hardware", "saved_at",
 ]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _cpu_only():
+    """Testy zawsze na CPU, także gdy powłoka eksportuje SOR_AI_DEVICE_* (np. z run_all)."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("SOR_AI_DEVICE", "cpu")
+        for var in ("SOR_AI_DEVICE_XGBOOST", "SOR_AI_DEVICE_CATBOOST"):
+            mp.delenv(var, raising=False)
+        yield
 
 
 @pytest.fixture(scope="module")
@@ -146,10 +155,7 @@ class TestRegistry:
         assert get_model("catboost").params["thread_count"] == 1
 
     def test_device_cpu_in_tests(self):
-        if os.environ.get("SOR_AI_DEVICE") != "cpu" or any(
-            os.environ.get(v) for v in DEVICE_VARS[1:]
-        ):
-            pytest.skip("Urządzenie nadpisane przez użytkownika")
+        assert os.environ.get("SOR_AI_DEVICE") == "cpu"
         assert get_model("xgboost").params["device"] == "cpu"
         assert get_model("catboost").params["task_type"] == "CPU"
         assert get_model("xgboost").requested_device == "cpu"
@@ -397,6 +403,10 @@ def test_iteration_cap_warning(data):
         model.fit_estimator(X, y, X_es, y_es)
     assert model.best_iteration == 5 and model.iteration_cap == 5
     assert "limitu 5" in _warnings(records)
+
+    model.fit(X, y, X_val=X_es, y_val=y_es, run_id="cap_warning")
+    log_text = model.train_log_path.read_text(encoding="utf-8")
+    assert "WARNING" in log_text and "niedotrenowany" in log_text
 
 
 def test_early_stopping_rounds_override(data):

@@ -26,14 +26,14 @@ export function JourneyDataPanels() {
           <h3 className="text-sm font-bold">{t("data.features.title")}</h3>
           <dl className="mt-3 space-y-2 text-sm">
             <Row label={t("data.features.original")}>
-              <CountUp to={974} duration={1.4} />
+              <CountUp to={214} duration={1.4} />
             </Row>
             <Row label={t("data.features.engineered")}>
-              +<CountUp to={116} duration={1.6} />
+              +<CountUp to={57} duration={1.6} />
             </Row>
             <div className="my-1 h-px bg-border/60" />
             <Row label={t("data.features.total")} bold>
-              <CountUp to={1090} duration={1.8} />
+              <CountUp to={271} duration={1.8} />
             </Row>
           </dl>
           <p className="mt-3 text-[10px] leading-snug text-muted-foreground">

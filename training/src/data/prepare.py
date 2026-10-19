@@ -78,7 +78,7 @@ META_COLS: list[str] = [ROW_ID_COL, SITE_COL, ESI_COL, TARGET_COL, ADMITTED_COL,
 
 FEATURE_SETS = ("triage", "full")
 
-# Grupy w kolejności kolumn ramki kanonicznej (cechy inżynieryjne dołączane na końcu)
+# Grupy w kolejności cech zestawów (ramka kanoniczna = META_COLS + zestaw 'full')
 TRIAGE_GROUPS: tuple[str, ...] = (
     "demographics", "arrival", "time", "triage_vitals", "chief_complaints", "engineered",
 )
@@ -145,7 +145,7 @@ def plan_features(columns) -> FeaturePlan:
         "history_labs": [c for c in ys.lab_cols(columns) if c not in lab_drop],
         "engineered": list(ENGINEERED_FEATURES),
     }
-    # Kolejność kolumn ramki: meta, potem grupy (bez inżynieryjnych — ich nazwy są gotowe)
+    # Mapa nazw: meta + grupy (bez inżynieryjnych — ich nazwy są gotowe)
     frame_order = META_COLS + [
         c for g in TRIAGE_GROUPS[:-1] + HISTORY_GROUPS for c in raw_groups[g]
     ]
@@ -405,16 +405,16 @@ def build_canonical_frame(raw: pd.DataFrame) -> PreparedData:
     hist = _history_vitals_block(raw, rows, rg["history_vitals"], audit)
     labs = _labs_block(raw, rows, rg["history_labs"], audit)
 
-    pieces = [meta, demo, arrival, vit, cc, pmh, ed_usage, imaging, hist, labs, engineered]
+    # Kolejność kolumn = META_COLS + zestaw 'full' → zapis splitów bez kopii do przestawienia
+    pieces = [meta, demo, arrival, vit, cc, engineered, pmh, ed_usage, imaging, hist, labs]
     del meta, demo, arrival, vit, cc, pmh, ed_usage, imaging, hist, labs, engineered
     out = pd.concat(pieces, axis=1)
     del pieces
 
     # --- Normalizacja nazw (LightGBM nie przyjmuje , : [ ] itp.) ---
-    expected_order = list(plan.rename) + list(ENGINEERED_FEATURES)
-    if list(out.columns) != expected_order:
-        raise RuntimeError("Kolejność kolumn ramki kanonicznej niezgodna z planem cech")
     out = out.rename(columns=plan.rename)
+    if list(out.columns) != META_COLS + plan.feature_sets["full"]:
+        raise RuntimeError("Kolejność kolumn ramki kanonicznej niezgodna z planem cech")
     audit["renamed_columns"] = {k: v for k, v in plan.rename.items() if k != v}
     for reason, cols in plan.excluded.items():
         audit[f"excluded_{reason}"] = cols
@@ -452,30 +452,27 @@ def make_splits(
     'site'   — oddział HOLDOUT_SITE w całości jako test (walidacja zewnętrzna),
                val losowo z pozostałych oddziałów.
     """
-    strata = df[TARGET_COL].astype(str) + "_" + df[SITE_COL].astype(str)
+    # Podział na pozycjach wierszy, a ramka kopiowana raz (pamięć: ~1 × ramka, nie ~3 ×)
+    strata = (df[TARGET_COL].astype(str) + "_" + df[SITE_COL].astype(str)).to_numpy()
+    positions = np.arange(len(df))
 
     if strategy == "random":
-        rest, test = train_test_split(df, test_size=test_size, random_state=seed, stratify=strata)
+        rest, test = train_test_split(positions, test_size=test_size, random_state=seed, stratify=strata)
         rel_val = val_size / (1.0 - test_size)
-        train, val = train_test_split(
-            rest, test_size=rel_val, random_state=seed, stratify=strata.loc[rest.index]
-        )
     elif strategy == "site":
-        test = df[df[SITE_COL] == HOLDOUT_SITE]
-        rest = df[df[SITE_COL] != HOLDOUT_SITE]
-        if test.empty:
+        held_out = df[SITE_COL].to_numpy() == HOLDOUT_SITE
+        test, rest = positions[held_out], positions[~held_out]
+        if len(test) == 0:
             raise ValueError(f"Brak wierszy z oddziału '{HOLDOUT_SITE}'")
         rel_val = val_size / (1.0 - len(test) / len(df))
-        train, val = train_test_split(
-            rest, test_size=rel_val, random_state=seed, stratify=strata.loc[rest.index]
-        )
     else:
         raise ValueError(f"Nieznana strategia podziału: '{strategy}' (random | site)")
+    train, val = train_test_split(rest, test_size=rel_val, random_state=seed, stratify=strata[rest])
 
+    # Kolejność wierszy jak w ramce (row_id rosnąco)
     splits = {
-        "train": train.sort_values(ROW_ID_COL).reset_index(drop=True),
-        "val": val.sort_values(ROW_ID_COL).reset_index(drop=True),
-        "test": test.sort_values(ROW_ID_COL).reset_index(drop=True),
+        name: df.take(np.sort(idx)).reset_index(drop=True)
+        for name, idx in (("train", train), ("val", val), ("test", test))
     }
     ids = [set(s[ROW_ID_COL]) for s in splits.values()]
     assert not (ids[0] & ids[1] or ids[0] & ids[2] or ids[1] & ids[2]), "Splity się nakładają"
@@ -509,8 +506,12 @@ def save_prepared(
     keep = META_COLS + prepared.feature_sets["full"]
     paths = {"train": TRAIN_PARQUET, "val": VAL_PARQUET, "test": TEST_PARQUET}
     for name, path in paths.items():
-        splits[name][keep].to_parquet(path, engine="pyarrow", compression="snappy", index=False)
-        log.info(f"Zapisano {name}: {path} ({len(splits[name]):,} wierszy)")
+        frame = splits[name]
+        if list(frame.columns) != keep:
+            frame = frame[keep]
+        frame.to_parquet(path, engine="pyarrow", compression="snappy", index=False)
+        log.info(f"Zapisano {name}: {path} ({len(frame):,} wierszy)")
+        del frame
 
     _write_text_atomic(FEATURE_SETS_JSON, json.dumps(
         {"data_version": DATA_VERSION, "feature_sets": prepared.feature_sets,

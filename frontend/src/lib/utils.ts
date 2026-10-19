@@ -45,3 +45,12 @@ export function sleep(ms: number): Promise<void> {
 export function lerp(start: number, end: number, t: number): number {
   return start + (end - start) * t;
 }
+
+/**
+ * Optional metric → fixed-decimals string; undefined (not trained yet) → "—".
+ */
+export function formatMetric(value: number | undefined | null, fractionDigits = 4, suffix = ""): string {
+  return value === undefined || value === null || Number.isNaN(value)
+    ? "—"
+    : `${value.toFixed(fractionDigits)}${suffix}`;
+}

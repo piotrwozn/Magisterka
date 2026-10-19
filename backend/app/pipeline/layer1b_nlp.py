@@ -1,4 +1,8 @@
-"""Layer 1B — clinical NLP via MedGemma 27B (or deterministic stub fallback)."""
+"""Layer 1B — clinical NLP via MedGemma 27B (or deterministic stub fallback).
+
+The LLM answers with an ESI level 1–5 ("esi"); internally `category` = ESI − 1
+(class index 0–4). TOPSOR colours are display only.
+"""
 from __future__ import annotations
 
 import logging
@@ -10,17 +14,29 @@ from app.models.schemas import MedGemmaAssessment, Vitals
 log = logging.getLogger(__name__)
 
 
-_MTS_LABELS_PL = ["Red (Natychmiastowy)", "Orange (Pilny)", "Yellow (Mniej pilny)",
-                  "Green (Niepilny)", "Blue (Nieostry)"]
+# ESI level (index 0–4 = ESI 1–5) + TOPSOR colour and max. wait (display only)
+ESI_LABELS_PL: list[str] = [
+    "ESI 1 · czerwony (natychmiast)",
+    "ESI 2 · pomarańczowy (do 10 min)",
+    "ESI 3 · żółty (do 60 min)",
+    "ESI 4 · zielony (do 120 min)",
+    "ESI 5 · niebieski (do 240 min)",
+]
 
 # ── Prompts / schema ──────────────────────────────────────────────────
 
 _MEDGEMMA_SYSTEM = """Jesteś asystentem klinicznym w SOR. Otrzymujesz parametry życiowe
 pacjenta + notatkę pielęgniarki oraz sugestię modelu ML. Oceniasz pilność według
-Manchester Triage System (0=Red, 1=Orange, 2=Yellow, 3=Green, 4=Blue).
+Emergency Severity Index (ESI, wersja 4):
+- ESI 1: wymaga natychmiastowej interwencji ratującej życie,
+- ESI 2: sytuacja wysokiego ryzyka, splątanie/letarg, silny ból lub parametry
+  w strefie zagrożenia (dorośli: HR > 100, RR > 20, SpO2 < 92%),
+- ESI 3 / 4 / 5: stabilny pacjent, przewidywane ≥ 2 / 1 / 0 zasobów
+  (badania laboratoryjne, obrazowe, leki dożylne, konsultacje, procedury).
+Kolory TOPSOR (czerwony, pomarańczowy, żółty, zielony, niebieski) odpowiadają ESI 1–5.
 
 Reguły:
-- "category": liczba 0-4
+- "esi": liczba całkowita 1-5 (1 = najpilniejszy)
 - "confidence": liczba 0.0-1.0
 - "reasoning": krótkie uzasadnienie po polsku (max 350 znaków)
 - "risk_flags": lista krótkich etykiet (np. "hipotensja", "tachykardia")
@@ -32,14 +48,22 @@ Zwróć WYŁĄCZNIE poprawny JSON. Bez komentarzy.
 _MEDGEMMA_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "category":     {"type": "integer", "minimum": 0, "maximum": 4},
+        "esi":          {"type": "integer", "minimum": 1, "maximum": 5},
         "confidence":   {"type": "number",  "minimum": 0, "maximum": 1},
         "reasoning":    {"type": "string"},
         "risk_flags":   {"type": "array", "items": {"type": "string"}},
         "key_findings": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["category", "confidence", "reasoning", "risk_flags", "key_findings"],
+    "required": ["esi", "confidence", "reasoning", "risk_flags", "key_findings"],
 }
+
+
+def esi_to_category(esi: Any, default: int) -> int:
+    """ESI level 1–5 from the LLM → class index 0–4 (clamped); unusable value → default."""
+    try:
+        return min(4, max(0, int(esi) - 1))
+    except (TypeError, ValueError):
+        return default
 
 
 def _build_prompt(vitals: Vitals, note: str, ml_category: int) -> str:
@@ -51,10 +75,10 @@ def _build_prompt(vitals: Vitals, note: str, ml_category: int) -> str:
 
 Notatka pielęgniarska: {note or "(brak)"}
 
-Sugestia ML: kategoria {ml_category} ({_MTS_LABELS_PL[ml_category]})
+Sugestia ML: {ESI_LABELS_PL[ml_category]}
 
 Oceń:
-1. Czy zgadzasz się z ML?
+1. Czy zgadzasz się z ML (poziom ESI 1-5)?
 2. Jakie czynniki ryzyka widzisz?
 3. Jakie kluczowe wartości to potwierdzają?
 """
@@ -91,11 +115,11 @@ def _key_findings(vitals: Vitals) -> list[str]:
 
 
 _REASONING_BY_CATEGORY = {
-    0: "Stan zagrożenia życia — wymagana natychmiastowa interwencja resuscytacyjna.",
-    1: "Bardzo wysoki priorytet. Krytyczne parametry wymagają oceny w ciągu 10 minut.",
-    2: "Stabilne parametry z odchyleniami. Wymagana ocena lekarska w ciągu 60 minut.",
-    3: "Stan nieostry, niski priorytet kliniczny. Możliwa obserwacja.",
-    4: "Stan stabilny — przypadek nieostry, tryb ambulatoryjny.",
+    0: "ESI 1 — wymagana natychmiastowa interwencja ratująca życie.",
+    1: "ESI 2 — sytuacja wysokiego ryzyka; ocena lekarska do 10 minut (TOPSOR: pomarańczowy).",
+    2: "ESI 3 — pacjent stabilny, przewidywane ≥ 2 zasoby; ocena do 60 minut.",
+    3: "ESI 4 — pacjent stabilny, przewidywany 1 zasób; niski priorytet.",
+    4: "ESI 5 — pacjent stabilny, bez przewidywanych zasobów; tryb ambulatoryjny.",
 }
 
 
@@ -139,7 +163,7 @@ async def assess_async(
                     schema=_MEDGEMMA_SCHEMA,
                 )
                 return MedGemmaAssessment(
-                    category=int(parsed.get("category", ml_category)),
+                    category=esi_to_category(parsed.get("esi"), ml_category),
                     confidence=float(parsed.get("confidence", 0.8)),
                     reasoning=str(parsed.get("reasoning", "")) or _REASONING_BY_CATEGORY.get(ml_category, ""),
                     risk_flags=list(parsed.get("risk_flags", [])) or _collect_risk_flags(vitals),

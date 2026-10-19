@@ -48,15 +48,18 @@ def _dump(path: Path, artifact: dict) -> Path:
 
 def _make_run(runs_dir: Path, run_name: str, model: str = "logreg",
               train_sample: int | None = None, feature_set: str = "triage",
-              with_info: bool = True) -> Path:
-    """training/runs/<run_name>/{model.joblib, run_info.json}."""
+              with_info: bool = True, done: bool = True) -> Path:
+    """training/runs/<run_name>/{model.joblib, run_info.json, DONE.json}."""
     run_dir = runs_dir / run_name
     _dump(run_dir / "model.joblib", _artifact(model, run_id=run_name[:15], feature_set=feature_set))
     if with_info:
         (run_dir / "run_info.json").write_text(json.dumps({
             "run_name": run_name, "model": model, "feature_set": feature_set,
             "train_sample": train_sample, "eval_sample": None,
-        }))
+        }), encoding="utf-8")
+    if done:
+        (run_dir / "DONE.json").write_text(json.dumps({"run_name": run_name, "model": model}),
+                                           encoding="utf-8")
     return run_dir
 
 
@@ -78,7 +81,7 @@ class TestEmptyRegistry:
         assert reg.loaded_ids == []
 
     def test_feature_set_alias_resolved(self):
-        assert ModelRegistry().feature_set == "triage"            # settings: "triage_only"
+        assert ModelRegistry().feature_set == "triage"            # settings default
         assert ModelRegistry(feature_set="triage_only").feature_set == "triage"
         assert ModelRegistry(feature_set="full").feature_set == "full"
 
@@ -107,7 +110,7 @@ class TestLoadFromEmptyDir:
             "n_features": 3,
             "medians": {"triage_vital_hr": 84.0, "triage_vital_temp": 36.7, "cc_chestpain": 0.0},
         }
-        (models_dir / "imputation_medians.json").write_text(json.dumps(medians_payload))
+        (models_dir / "imputation_medians.json").write_text(json.dumps(medians_payload), encoding="utf-8")
 
         reg = ModelRegistry()
         reg.load_from_dir(models_dir, runs_dir=runs_dir)
@@ -124,6 +127,7 @@ class TestLoadArtifacts:
 
         bundle = reg.models["logreg"]
         assert bundle["feature_names"] == FEATURES
+        assert bundle["classes"] == [0, 1, 2, 3, 4]
         assert bundle["class_names"] == CLASS_NAMES
         assert bundle["feature_set"] == "triage"
         X = pd.DataFrame([[50.0, 90.0, 1.0]], columns=FEATURES)
@@ -145,6 +149,24 @@ class TestLoadArtifacts:
         models_dir, runs_dir = dirs
         full = _make_run(runs_dir, "20260101_100000_logreg_triage")
         _make_run(runs_dir, "20260105_100000_logreg_triage_smoke", train_sample=12000)
+
+        reg = ModelRegistry()
+        reg.load_from_dir(models_dir, runs_dir=runs_dir)
+        assert reg.models["logreg"]["path"] == str(full / "model.joblib")
+
+    def test_finished_run_preferred_over_newer_interrupted_run(self, dirs):
+        models_dir, runs_dir = dirs
+        finished = _make_run(runs_dir, "20260101_100000_logreg_triage_standard")
+        _make_run(runs_dir, "20260102_100000_logreg_triage_standard", done=False)
+
+        reg = ModelRegistry()
+        reg.load_from_dir(models_dir, runs_dir=runs_dir)
+        assert reg.models["logreg"]["path"] == str(finished / "model.joblib")
+
+    def test_interrupted_full_run_beats_finished_sample_run(self, dirs):
+        models_dir, runs_dir = dirs
+        full = _make_run(runs_dir, "20260101_100000_logreg_triage_standard", done=False)
+        _make_run(runs_dir, "20260102_100000_logreg_triage_smoke", train_sample=6000)
 
         reg = ModelRegistry()
         reg.load_from_dir(models_dir, runs_dir=runs_dir)
@@ -207,7 +229,7 @@ class TestLoadArtifacts:
     def test_legacy_artifact_skipped(self, dirs):
         models_dir, runs_dir = dirs
         legacy = _artifact("xgboost")
-        del legacy["label"]                       # pre-ESI (MTS-mapped) artifact
+        del legacy["label"]                       # pre-ESI artifact (no native ESI label)
         _dump(models_dir / "xgboost_legacy.joblib", legacy)
         fallback = _make_run(runs_dir, "20260101_100000_xgboost_triage", model="xgboost")
 

@@ -46,12 +46,13 @@ const config: Config = {
           DEFAULT: "hsl(var(--card) / <alpha-value>)",
           foreground: "hsl(var(--card-foreground) / <alpha-value>)",
         },
-        mts: {
-          red: "#DC2626",
-          orange: "#EA580C",
-          yellow: "#EAB308",
-          green: "#16A34A",
-          blue: "#2563EB",
+        // ESI 1–5 in TOPSOR colours (display only) — same as ESI_LEVELS in src/lib/constants.ts
+        esi: {
+          1: "#DC2626",
+          2: "#EA580C",
+          3: "#EAB308",
+          4: "#16A34A",
+          5: "#2563EB",
         },
       },
       borderRadius: {

@@ -160,7 +160,7 @@ class OllamaMedicalExplainer:
         shap_explanation : dict, optional
             Z SHAPTriageExplainer.explain_patient().
         rule_check : dict, optional
-            Z mts_rules.rule_based_triage() (weryfikacja parametrów wg ESI).
+            Z esi_rules.rule_based_triage() (weryfikacja parametrów wg ESI).
 
         Returns
         -------
@@ -198,7 +198,7 @@ class OllamaMedicalExplainer:
 
         # Rule check
         if rule_check:
-            from src.explain.mts_rules import explain_rule_decision
+            from src.explain.esi_rules import explain_rule_decision
             rule_text = explain_rule_decision(rule_check)
         else:
             rule_text = "(brak weryfikacji regułowej)"
@@ -207,7 +207,7 @@ class OllamaMedicalExplainer:
         labels = dict(zip(CLASS_NAMES, CLASS_NAMES_PL))
         proba_str = ", ".join(f"{labels.get(k, k).split(' (')[0]}: {v:.1%}" for k, v in probabilities.items())
 
-        from src.explain.mts_rules import resolve_vital
+        from src.explain.esi_rules import resolve_vital
 
         def vital(name: str) -> str:
             value = resolve_vital(patient_data, name)
@@ -350,12 +350,11 @@ class OllamaMedicalExplainer:
 # ─────────────────────────────────────────
 # Helpery — opis pacjenta do promptu
 # ─────────────────────────────────────────
+# Klucze = kolumny one-hot `arrival_<kategoria>` (src.data.yale_schema.ARRIVAL_CATEGORIES)
 ARRIVAL_LABELS_PL: dict[str, str] = {
     "arrival_ambulance": "zespół ratownictwa medycznego",
     "arrival_self": "samodzielnie",
-    "arrival_police": "policja",
-    "arrival_other": "inny",
-    "arrival_unknown": "nieznany",
+    "arrival_other": "inny (np. policja, wózek)",
 }
 
 

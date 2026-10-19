@@ -1,0 +1,8 @@
+# Demo Streamlit i dodatkowe wyjaśnienia (LIME, DiCE, Ollama) — opcjonalne.
+#   pip install -r requirements-lock.txt
+#   pip install -r requirements-app.txt
+-r requirements.txt
+streamlit>=1.28
+lime>=0.2
+dice-ml>=0.11
+requests>=2.31

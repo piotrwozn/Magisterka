@@ -1,4 +1,8 @@
-"""Pydantic schemas — must match frontend/src/lib/types.ts exactly (camelCase aliases)."""
+"""Pydantic schemas — must match frontend/src/lib/types.ts exactly (camelCase aliases).
+
+Every `category` is an ESI class index: 0–4 = ESI 1–5 (TOPSOR colours red, orange,
+yellow, green, blue are display only).
+"""
 from __future__ import annotations
 
 from typing import Literal
@@ -27,6 +31,14 @@ class Vitals(BaseModel):
 class PredictRequest(CamelModel):
     vitals: Vitals
     clinical_note: str = Field("", max_length=2000)
+    # Optional patient context (features of the trained models; missing → as in
+    # app/pipeline/feature_engineering.build_feature_row: sex / O2 = NaN, arrival = "self")
+    sex: Literal["M", "F"] | None = Field(None, description="M = male, F = female")
+    arrival_mode: str | None = Field(
+        None, max_length=40,
+        description='"ambulance" | "self" | "other" (Polish aliases accepted, e.g. "ZRM", "własny")',
+    )
+    o2_device: bool | None = Field(None, description="supplemental oxygen at triage")
 
 
 # ── Response ─────────────────────────────────────────────────────────

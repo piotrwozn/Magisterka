@@ -3,7 +3,7 @@ Krok 2: przygotowanie danych Yale EMMLC do treningu modeli ESI.
 
 Wykonuje (szczegóły: src/data/prepare.py):
     1. Wczytanie surowego parquet (lub .RData, jeśli brak parquet).
-    2. Etykieta = natywne ESI 1–5 (bez mapowania na MTS).
+    2. Etykieta = natywne ESI 1–5 nadane przy triażu w Yale.
     3. Czyszczenie: °F → °C, wartości niemożliwe → NaN, duplikaty, brak ESI.
     4. Wykluczenie zmiennych specyficznych dla USA i kolumn-przecieków.
     5. Cechy kliniczne (src/features/engineering.py).
@@ -12,7 +12,7 @@ Wykonuje (szczegóły: src/data/prepare.py):
 
 Użycie:
     python scripts/02_preprocess.py                 # podział losowy (domyślny)
-    python scripts/02_preprocess.py --split site    # oddział C jako test zewnętrzny
+    python scripts/02_preprocess.py --split site    # oddział B jako test zewnętrzny
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Przygotowanie danych Yale EMMLC → ESI")
     parser.add_argument(
         "--split", choices=["random", "site"], default="random",
-        help="random = stratyfikowany losowy; site = oddział C jako test zewnętrzny",
+        help="random = stratyfikowany losowy; site = oddział HOLDOUT_SITE (B) jako test zewnętrzny",
     )
     args = parser.parse_args()
 
@@ -48,7 +48,7 @@ def main() -> None:
     for name, path in paths.items():
         log.info(f"  {name:5s}: {path}")
     log.info(f"  audyt: {DATA_AUDIT_MD}")
-    log.info("Następny krok: make train-all  (albo python scripts/03_train.py --model all)")
+    log.info("Następny krok: python scripts/run_all.py  (albo python scripts/03_train.py --model all)")
 
 
 if __name__ == "__main__":

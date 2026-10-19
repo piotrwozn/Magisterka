@@ -1,8 +1,9 @@
-# Trening modeli ESI — instrukcja
+# Trening modeli ESI — instrukcja na domowy komputer
 
-Tu trenujesz modele klasyfikujące pacjentów SOR do poziomów **ESI 1–5**, tak jak robi to polski
-system TOPSOR (rozporządzenie MZ, Dz.U. 2021 poz. 1182, § 2 pkt 9). Etykietą jest natywne ESI
-z danych Yale. Nie ma mapowania na MTS.
+Tu trenujesz modele, które przypisują pacjenta SOR do jednego z pięciu poziomów **Emergency Severity
+Index (ESI 1–5)**. To ten sam algorytm, którym segregują pacjentów polskie SOR-y w systemie TOPSOR
+(Dz.U. 2021 poz. 1182, § 2 pkt 9). Etykietą jest natywne ESI z danych Yale EMMLC. Kolory TOPSOR
+służą wyłącznie do prezentacji:
 
 | ESI | kolor TOPSOR | czas do lekarza |
 |---|---|---|
@@ -12,192 +13,385 @@ z danych Yale. Nie ma mapowania na MTS.
 | 4 | zielony | do 120 min |
 | 5 | niebieski | do 240 min |
 
-## Szybki start
+## W skrócie
 
-```bash
-cd training
-pip install -r requirements.txt
-
-python scripts/02_preprocess.py          # dane → splity ESI + DATA_AUDIT.md   (1–3 min)
-python scripts/03_train.py --model all   # 6 modeli, zestaw 'triage'          (~1–1,5 h)
-python scripts/07_compare_runs.py        # porównanie + materiał do łączenia
+```powershell
+cd C:\dev\Magisterka\training            # w aktywnym venv (instalacja: niżej)
+python scripts/00_check_env.py           # 1. kontrola środowiska: GPU, RAM, dysk, wersje, dane
+python scripts/run_all.py --profile smoke   # 2. test całego pipeline'u: 5–10 min
+python scripts/run_all.py                # 3. właściwy przebieg na noc (profil standard)
 ```
 
-Skrót z Makefile'a: `make prepare`, `make train-all`, `make compare`. Krok 2 uruchamia się też sam,
-jeśli splitów brakuje albo są nieaktualne.
+Po awarii, restarcie albo Ctrl+C uruchom **to samo polecenie** — gotowe modele zostaną pominięte,
+a przerwany tuning dokończy tylko brakujące próby. Stan w dowolnej chwili: `python scripts/run_all.py --status`.
 
-Z tuningiem Optuną (ok. jednej nocy na i9 + RTX 4080):
+---
 
-```bash
-python scripts/03_train.py --model all --tune
+## 1. Wymagania
+
+| | |
+|---|---|
+| System | Windows 11 x64 albo Linux x64 (macOS działa bez GPU) |
+| Python | **3.13 x64** (przetestowany) albo 3.12 x64. **Nie** 3.11 i starsze (brak kół xgboost 3.4, numpy 2.5, shap 0.54); 3.14 nieprzetestowany |
+| Karta | NVIDIA ze sterownikiem **≥ 580** — koło xgboost 3.4 jest zbudowane z CUDA 13. CUDA Toolkit **nie** jest potrzebny (koła mają własne biblioteki CUDA). Bez karty wszystko działa na CPU, tylko wolniej |
+| RAM | **32 GB zalecane**; minimum 16 GB (przygotowanie danych chwilowo zajmuje ~11 GB) |
+| Dysk | ≥ 20 GB wolnego (jeden pełny przebieg dokłada 1–2 GB do `runs/`) |
+| Ścieżka | repo **poza OneDrive**, bez polskich znaków, krótka — np. `C:\dev\Magisterka` |
+
+Punkt odniesienia dla czasów w tej instrukcji: i9-14900K (24 rdzenie fizyczne) + RTX 4080 Super 16 GB + 64 GB RAM.
+
+## 2. Instalacja
+
+### Windows (PowerShell)
+
+```powershell
+nvidia-smi                                   # musi pokazać "Driver Version: 580+" i "CUDA Version: 13.x"
+git clone <adres-repo> C:\dev\Magisterka     # NIE do Dokumentów/Pulpitu (OneDrive)
+
+py -3.13 -m venv C:\venvs\sorai              # Python 3.13 x64 z python.org (launcher `py`)
+C:\venvs\sorai\Scripts\Activate.ps1          # zablokowane? Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+python -m pip install -U pip
+cd C:\dev\Magisterka\training
+pip install -r requirements-lock.txt         # dokładnie przetestowane wersje
+setx PYTHONUTF8 1                            # UTF-8 w Pythonie — działa w NOWYCH oknach PowerShell
 ```
 
-## Co robi przygotowanie danych (`scripts/02_preprocess.py`)
+Za stary sterownik: zaktualizuj go (NVIDIA App / sterownik Game Ready lub Studio) i uruchom ponownie komputer.
 
-Pełny, automatycznie generowany raport: [`DATA_AUDIT.md`](DATA_AUDIT.md).
+### Linux
 
-- Etykieta = ESI 1–5 (`target` 0–4). Odrzucone wizyty bez ESI (2 457) i duplikaty.
-- Temperatura z Yale jest w °F i jest przeliczana na °C (dotyczy też temperatur z historii).
-- Wartości fizjologicznie niemożliwe są zamieniane na brak, a nie na medianę.
-- Braki zostają jako NaN. U 85% pacjentów ESI 1 brak **wszystkich** parametrów życiowych
-  (od razu na salę resuscytacyjną), więc imputacja medianą kasowałaby najsilniejszy sygnał.
-  Modele drzewiaste obsługują NaN natywnie, a regresja logistyczna imputuje wewnątrz własnego
-  pipeline'u, wyłącznie na zbiorze treningowym.
-- Wykluczone zmienne specyficzne dla USA: rasa, etniczność, wyznanie, ubezpieczenie,
-  zatrudnienie, język, stan cywilny, eGFR liczony z rasą.
-- Wykluczone przecieki: `disposition` (przyjęcie lub wypis to wynik wizyty) oraz oddział Yale.
-- Kategorie są kodowane jawnie, a nie alfabetycznie:
-  - sposób przybycia → `ambulance / self / police / other / unknown`,
-  - miesiąc 1–12,
-  - dzień tygodnia 1–7,
-  - przedział godzin 0–5.
-- Nazwy kolumn są znormalizowane, bo LightGBM nie przyjmuje przecinków ani nawiasów.
-- Cechy kliniczne: wskaźnik wstrząsowy, MAP, NEWS2, SIRS, qSOFA, strefa zagrożenia ESI
-  (HR > 100, RR > 20, SpO₂ < 92), flagi braków i grupy skarg głównych.
-  Opis: [`FEATURE_ENGINEERING.md`](FEATURE_ENGINEERING.md).
+```bash
+nvidia-smi                                   # sterownik >= 580 (koło xgboost dla Linuksa też jest CUDA 13)
+python3.13 -m venv ~/venvs/sorai && source ~/venvs/sorai/bin/activate
+python -m pip install -U pip
+cd ~/Magisterka/training
+pip install -r requirements-lock.txt
+```
+
+WSL2: domyślnie dostaje połowę RAM hosta — ustaw `memory=` w `%UserProfile%\.wslconfig` i trzymaj repo
+w systemie plików Linuksa (`~/…`), nie w `/mnt/c`.
+
+### Pliki z zależnościami
+
+| plik | zawartość |
+|---|---|
+| `requirements-lock.txt` | **przetestowany zestaw** (dokładne wersje: rdzeń + pytest + zależności przechodnie) — instaluj ten |
+| `requirements.txt` | rdzeń z zakresami wersji (gdy lock nie pasuje do platformy) |
+| `requirements-app.txt` | demo Streamlit, LIME, DiCE (`pip install -r requirements-app.txt` po locku) |
+| `requirements-dev.txt` | pytest, ruff, black; MLflow opcjonalnie (zakomentowany) |
+
+## 3. Kontrola środowiska
+
+```powershell
+python scripts/00_check_env.py
+```
+
+Sprawdza Pythona, pakiety (wersje względem `requirements-lock.txt`), RAM, wolne miejsce, rdzenie,
+kartę (`nvidia-smi`) i robi **prawdziwy próbny trening na GPU** dla xgboost i catboost. Sprawdza
+też dane Yale, ścieżkę repo (OneDrive, polskie znaki, długość) i kodowanie konsoli. Wynik
+trafia na konsolę i do `logs/run_all/<czas>/preflight.json`.
+
+- `[BŁĄD ]` — trzeba poprawić (kod wyjścia 1); `run_all.py` też się wtedy nie uruchomi.
+- `[UWAGA]` — trening ruszy. Przykład: GPU niedostępne → xgboost/catboost na CPU z mniejszym budżetem.
+- Ostatnia linia mówi, czy `run_all.py` użyje dwóch torów (GPU + CPU równolegle).
+
+## 4. Test całości: profil `smoke` (5–10 minut)
+
+```powershell
+python scripts/run_all.py --profile smoke
+```
+
+Przy pierwszym uruchomieniu najpierw przygotowuje dane (3–5 min, chwilowo ~11 GB RAM). Potem
+trenuje wszystkie 6 modeli na małej próbce (6 tys. wierszy, 2 próby Optuny), ocenia je na `val`
+i porównuje. Sprawdź podsumowanie `runs/run_all_summary__triage__smoke__<czas>.md`:
+
+- kolumna **urządzenie** dla xgboost i catboost powinna pokazywać GPU (`cuda` / `gpu`), nie `cpu`,
+- wszystkie modele mają stan `gotowy`.
+
+Wyniki smoke są oznaczone tagiem `smoke`. Nie nadają się do raportowania.
+
+## 5. Właściwy przebieg
+
+```powershell
+python scripts/run_all.py                    # = --profile standard --feature-set triage --models all
+```
+
+Kroki (każdy w **osobnym procesie**: awaria jednego modelu, błąd CUDA albo brak pamięci zabija
+tylko ten krok, a nie całą noc):
+
+1. **preflight** — jak w punkcie 3;
+2. **dane** — `02_preprocess.py`, tylko gdy splity nie są gotowe albo mają inny podział;
+3. dla każdego modelu: **tuning Optuną + trening finalny** (`03_train.py --tune --profile standard`),
+   potem **ewaluacja na `val`** z wykresami (`04_evaluate.py`);
+4. **porównanie** modeli na `val` (`07_compare_runs.py`);
+5. **podsumowanie** `runs/run_all_summary__triage__standard__<czas>.md`.
+
+**Szacowany czas** (i9-14900K + RTX 4080 Super, zestaw `triage`): **~7–8 h w dwóch torach**,
+~11–12 h sekwencyjnie. To szacunki ±50%. Każdy model ma limit czasu tuningu, więc górną granicę
+wyznacza suma limitów; `run_all.py` wypisuje ją na starcie (ETA każdego modelu).
+
+**Dwa tory** (`--lanes auto`) włączają się, gdy GPU działa, CPU ma ≥ 16 rdzeni fizycznych i jest
+≥ 32 GB RAM:
+
+- tor GPU: xgboost → catboost, 6 wątków CPU;
+- tor CPU: logreg → lightgbm → random_forest → ebm, pozostałe rdzenie fizyczne.
+
+Budżety wątków się nie nakładają (nadsubskrypcja OpenMP potrafi spowolnić trening kilkadziesiąt
+razy). Jeden tor: `--lanes 1`.
+
+### Profile
+
+| profil | do czego | dane | tuning | czas |
+|---|---|---|---|---|
+| `smoke` | test instalacji | próbka 6 tys. (val/test 4 tys.) | 2 próby, 2 foldy, ≤ 2 min/model | 5–10 min |
+| `quick` | test pipeline'u na większej próbce | próbka 60 tys. | 3 próby na 20 tys. wierszy, 2 foldy, ≤ 5 min/model | 20–30 min |
+| `standard` | **właściwy przebieg** (domyślny) | całość | tabela niżej | ~7–8 h (2 tory) |
+| `thorough` | dłuższy tuning | całość | ≈ 1,7× próby i czas `standard`; EBM na 250 tys. | ~12–14 h (2 tory) |
+
+Budżet `standard` (próby i limit czasu dotyczą całego badania Optuny, także po wznowieniach):
+
+| model | urządzenie | wiersze do tuningu | foldy | próby | limit tuningu |
+|---|---|---|---:|---:|---:|
+| `logreg` | CPU | cały zbiór dopasowania | 3 | 20 | 45 min |
+| `lightgbm` | CPU | cały | 3 | 120 | 2 h |
+| `xgboost` | GPU | cały | 3 | 100 | 3,5 h |
+| `catboost` | GPU | cały | 3 | 60 | 4 h |
+| `random_forest` | CPU | 150 tys. | 3 | 40 | 1,5 h |
+| `ebm` | CPU | 150 tys. | 3 | 25 | 4 h |
+
+Bez GPU xgboost i catboost dostają budżet zastępczy na CPU: xgboost 50 prób na 150 tys. wierszy
+w 3 h, catboost 25 prób na 100 tys. w 4 h. Pełne definicje: `TUNING_PROFILES` i
+`CPU_FALLBACK_BUDGETS` w `src/utils/config.py`.
+
+Tuning minimalizuje **log loss** w k-krotnej walidacji krzyżowej na części TRAIN. Foldy są
+stratyfikowane po ESI × oddział, a early stopping liczony jest na wycinku treningowej części foldu.
+Zbiory `val` i `test` nie biorą udziału w tuningu ani w treningu.
+
+### Opcje `run_all.py`
+
+| opcja | znaczenie |
+|---|---|
+| `--profile smoke\|quick\|standard\|thorough` | budżet (domyślnie `standard`) |
+| `--feature-set triage\|full\|triage,full` | zestaw cech (domyślnie `triage`); `full` ≈ 3–4× dłużej na próbę i ≥ 32 GB RAM — osobna noc |
+| `--models all\|lista` | np. `--models lightgbm,xgboost` (aliasy: lr, lgbm, xgb, cb, rf) |
+| `--split random\|site` | podział danych; `site` = oddział B w całości jako test (walidacja zewnętrzna) |
+| `--no-tune` | bez tuningu, parametry domyślne (tag `<profil>-notune`) |
+| `--lanes auto\|1\|2` | tory równoległe |
+| `--force` | trenuj ponownie także gotowe modele (ukończone próby Optuny i tak zostaną użyte) |
+| `--fail-fast` | pierwszy nieudany model zatrzymuje kolejne (domyślnie pozostałe trenują dalej) |
+| `--dry-run` | pokaż plan, ETA i polecenia, nic nie uruchamiaj |
+| `--status` | stan z plików-znaczników, nic nie uruchamiaj |
+| `--skip-preflight`, `--no-keep-awake` | pomiń kontrolę środowiska / blokadę uśpienia |
+
+Na Linuksie są też skróty z Makefile'a: `make check-env`, `make smoke`, `make all`, `make status`.
+
+## 6. Wznawianie, stan, przerwanie
+
+- **Wznowienie = to samo polecenie.** Model jest pominięty, gdy istnieje
+  `runs/*_<model>_<zestaw>_<profil>/DONE.json` z tą samą wersją danych (`esi-v2`) i tym samym
+  odciskiem danych (skrót `manifest.json`). Brakująca ewaluacja zostanie dorobiona.
+- **Przerwany tuning** wznawia się od miejsca przerwania. Badanie Optuny (`logs/optuna/optuna_<model>.db`)
+  liczy ukończone próby i zużyty czas. Próba przerwana awarią procesu jest oznaczana jako błąd
+  i ponawiana raz.
+- **Ctrl+C**: orkiestrator nie uruchamia już nowych kroków i czeka do 2 minut, aż bieżące się
+  zakończą (drugie Ctrl+C = natychmiast). Potem zapisuje podsumowanie i wypisuje polecenie wznowienia.
+  Kod wyjścia to 130.
+- **Restart / zanik prądu**: po prostu uruchom to samo polecenie.
+- **Co unieważnia gotowe modele**: ponowne przygotowanie danych (nowy odcisk) i zmiana podziału
+  (`--split`). Zmienia je też nowa wersja logiki danych w kodzie. Stare runy zostają w `runs/`.
+- **Stan**: `python scripts/run_all.py --status` (dla profilu innego niż standard dodaj `--profile …`).
+  Pokazuje gotowe modele z QWK na `val` oraz postęp tuningu (liczbę prób w badaniu) i przerwane runy.
+- xgboost/catboost z **błędem GPU** w logu (CUDA, brak pamięci karty) są automatycznie powtarzane
+  raz na CPU. Podsumowanie pokazuje to jako „powtórka na CPU”.
+
+Kody wyjścia `run_all.py`: 0 = wszystko gotowe, 1 = któryś krok nieudany, 2 = błąd preflight
+albo przygotowania danych, 130 = przerwano.
+
+## 7. Wyniki: gdzie są i jak je czytać
+
+**Najpierw** `runs/run_all_summary__<zestaw>__<profil>__<czas>.md`. Zawiera jeden wiersz na model:
+
+| kolumna | znaczenie |
+|---|---|
+| stan | `gotowy`, `gotowy wcześniej` (pominięty przy wznowieniu), `NIEUDANY` (sekcja „Błędy” z końcówką logu), `przerwany`, `nieuruchomiony` |
+| urządzenie | faktyczne urządzenie treningu finalnego (`cuda`/`gpu` = karta); „fallback”/„powtórka na CPU” = GPU zawiodło |
+| próby | ukończone / przycięte (pruning) / błędne próby Optuny |
+| CV | najlepszy log loss z walidacji krzyżowej na TRAIN ± odchylenie między foldami |
+| QWK argmax / koszt | Quadratic Weighted Kappa na `val` dla obu reguł decyzyjnych |
+| undertriage (koszt) | odsetek ESI 1–2 przewidzianych jako ESI 3–5 (reguła kosztowa) |
+| QWK vc | QWK w podgrupie z kompletem HR, SBP i RR przy triażu (`vitals_complete == 1`), czyli populacji jak w TOPSOR |
+
+Podsumowanie i porównanie pokazują **tylko metryki VAL**. Zbiór testowy oceniasz raz, na końcu (punkt 8).
+
+| gdzie | co |
+|---|---|
+| `runs/<czas>_<model>_<zestaw>_<profil>/` | jeden run: `report.md` (metryki, tuning, macierz pomyłek, top cechy), `metrics.json`, `predictions_val.parquet` i `predictions_test.parquet` (`row_id, site, esi, target, vitals_complete, p_esi1…p_esi5, pred_argmax, pred_cost`), `model.joblib`, `run_info.json` (parametry, urządzenie, sprzęt, tuning), `feature_importance.csv`, `DONE.json` |
+| `runs/<run>/figures/` | z ewaluacji: macierze pomyłek (także podgrupa vc), ROC, kalibracja, ważność cech, `metrics_val.json` (z metrykami per oddział) |
+| `runs/leaderboard.csv` | jeden wiersz na ukończony run, metryki VAL (+ podgrupa vc) |
+| `runs/comparison__<zestaw>__<profil>__<czas>.md` | porównanie modeli na VAL, różnorodność, średnia równowagowa |
+| `logs/run_all/<czas>/` | log każdego kroku (`<zestaw>__<model>__train.log`, `…__eval.log`), `preflight.json`, `status.json`, `run_all.log` |
+| `logs/optuna/` | badania Optuny (`optuna_<model>.db`) i wynik każdego badania (`<badanie>.best.json`) |
+| `logs/training/` | szczegółowe logi treningu i historia prób (`*_trials.csv`) |
+
+### Reguły decyzyjne i metryki
+
+- **argmax**: najbardziej prawdopodobny poziom ESI.
+- **koszt** (`cost`): poziom minimalizujący oczekiwany koszt. Niedotriażowanie kosztuje 3× więcej
+  niż przetriażowanie, a koszt rośnie z kwadratem odległości. Mocno obniża niedotriażowanie
+  ESI 1–2 kosztem większego przetriażowania i niższego QWK (QWK karze symetrycznie).
+- `quadratic_weighted_kappa` — główna metryka porządkowa;
+- `undertriage_rate` — ESI 1–2 → ESI 3–5 (bezpieczeństwo);
+- `critical_miss_rate` — ESI 1 → ESI 4–5;
+- `overtriage_rate` — ESI 4–5 → ESI 1–2;
+- `mistriage_under` / `mistriage_over` — błąd o dowolny poziom;
+- `auc_macro`, `log_loss`, `brier` — jakość prawdopodobieństw; `expected_cost` — średni koszt decyzji.
+
+Klucze w `metrics.json`: `{split}_{reguła}_{metryka}`, a dla podgrupy vc `{split}_vc_{reguła}_{metryka}`.
+
+## 8. Łączenie modeli (na VAL) i test na końcu
+
+Modele trenują się **bez wag klas**, więc ich prawdopodobieństwa są skalibrowane i nadają się do
+łączenia. Asymetrię kosztów realizuje reguła decyzyjna. Wszystko (wybór modeli, wagi,
+kalibrację, regułę) dobierasz na `val`:
+
+```python
+from src.ensemble import latest_runs, aligned_probas, blend, evaluate, optimize_weights
+from src.ensemble import fit_temperature, apply_temperature
+
+runs = latest_runs("triage", tag="standard")          # najnowszy ukończony run każdego modelu
+y_val, P_val, vc_val = aligned_probas(runs, "val", return_vc=True)
+
+weights = {"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}   # albo podpowiedź: optimize_weights(P_val, y_val)
+T = fit_temperature(P_val["random_forest"], y_val)        # kalibracja RF — też na val
+p_val = blend(P_val, weights)
+print(evaluate(y_val, p_val, rule="cost")["quadratic_weighted_kappa"])
+print(evaluate(y_val[vc_val], p_val[vc_val], rule="cost")["undertriage_rate"])   # podgrupa vc
+```
+
+`latest_runs` domyślnie pomija runy na próbkach, nieukończone, bez pliku modelu, z innej wersji
+danych i z wagami klas (wypisuje notę). `aligned_probas` sprawdza, czy runy mają te same wiersze
+i etykiety.
+
+**Test — raz, na końcu**, dla jednej, już wybranej receptury:
+
+```python
+y_test, P_test = aligned_probas(runs, "test")
+P_test["random_forest"] = apply_temperature(P_test["random_forest"], T)
+final = evaluate(y_test, blend(P_test, weights), rule="cost")
+```
+
+Pojedynczy model: `python scripts/04_evaluate.py --run <run> --split test`. Nie wracaj potem do
+strojenia — liczby z testu idą tylko do pracy.
+
+## 9. Rozwiązywanie problemów
+
+| objaw | co zrobić |
+|---|---|
+| komputer usnął w nocy | `run_all.py` blokuje uśpienie (Windows: `SetThreadExecutionState`; sprawdzisz w `powercfg /requests`, że `python.exe` jest pod SYSTEM). Nie chroni przed zamknięciem pokrywy laptopa ani ręcznym uśpieniem. Laptop: zasilacz podłączony. Wznów tym samym poleceniem |
+| restart po Windows Update | na noc: Ustawienia → Windows Update → *Wstrzymaj aktualizacje* (albo godziny aktywne). Po restarcie uruchom to samo polecenie |
+| repo w OneDrive | przenieś do `C:\dev\Magisterka`: synchronizacja blokuje pliki (SQLite „database is locked”, `PermissionError`) i wysyła gigabajty `runs/` |
+| wolne wczytywanie / zapis | Windows Defender: Zabezpieczenia Windows → Ochrona przed wirusami → Wykluczenia: dodaj folder repo i `C:\venvs\sorai` |
+| GPU nieużywane (urządzenie `cpu`) | `python scripts/00_check_env.py` pokaże powód. Najczęściej sterownik < 580: zaktualizuj i zrestartuj. Ręczne sprawdzenie: `python -c "import xgboost as x; print(x.__version__, x.build_info()['CUDA_VERSION'])"` i `python -c "from catboost.utils import get_gpu_device_count as g; print(g())"` (≥ 1). Zamknij programy zajmujące kartę (gry, inny trening) |
+| wymuszenie urządzenia | PowerShell: `$env:SOR_AI_DEVICE_XGBOOST="gpu"` (błąd zamiast cichego CPU) albo `"cpu"`; to samo `SOR_AI_DEVICE_CATBOOST`, wspólnie `SOR_AI_DEVICE` |
+| „Logging error”, krzaczki w logach | `setx PYTHONUTF8 1` i nowe okno PowerShell (`run_all.py` i tak wymusza UTF-8 w procesach treningu) |
+| brak pamięci (RAM) | zamknij inne programy, `--lanes 1`; zestaw `full` wymaga ≥ 32 GB |
+| model `NIEUDANY` | sekcja „Błędy” w podsumowaniu ma końcówkę logu; pełny log: `logs/run_all/<czas>/<zestaw>__<model>__train.log`. Po poprawce: to samo polecenie |
+| „badanie jest używane przez inny proces” | ten sam model trenuje w innym oknie. Plik blokady `logs/optuna/<badanie>.lock` po martwym procesie jest przejmowany automatycznie |
+| `Activate.ps1` zablokowany | `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
+| błędy instalacji pakietów | sprawdź `python --version` (3.12/3.13 x64), krótka ścieżka venv (`C:\venvs\sorai`); ewentualnie włącz długie ścieżki (LongPathsEnabled) |
+
+## 10. Dane: co wykluczamy i dlaczego
+
+Yale EMMLC: 560 486 wizyt z 3 oddziałów ratunkowych w USA (2014–2017), 972 zmienne, natywne
+ESI 1–5. Modele mają się uczyć **ogólnej, klinicznej** wiedzy, przenośnej na polski SOR. Dlatego
+`scripts/02_preprocess.py` usuwa wszystko, co jest specyficzne dla USA, socjoekonomiczne, zależne
+od organizacji szpitala albo przecieka z przyszłości wizyty. Pełny, automatycznie generowany raport
+z liczbami: [`DATA_AUDIT.md`](DATA_AUDIT.md).
+
+| wykluczone | dlaczego |
+|---|---|
+| ubezpieczenie (`insurance_status`) | amerykański system finansowania; w Polsce bez znaczenia klinicznego, a w danych silnie powiązane z dostępem do opieki |
+| rasa, pochodzenie etniczne, wyznanie, język, stan cywilny, zatrudnienie | cechy chronione i socjoekonomiczne, nieobecne w karcie triażu TOPSOR; model nie może segregować po nich pacjentów |
+| eGFR (wszystkie warianty) | wzór CKD-EPI 2009 używa współczynnika rasy (osobne kolumny „African American / non-AA”) |
+| oddział Yale (`dep_name` → `site`) | uczyłby się praktyk konkretnego szpitala; zostaje tylko jako metadana (stratyfikacja, metryki per oddział, `--split site`) |
+| `disposition` (przyjęcie / wypis) | to wynik wizyty — przeciek przyszłości; zostaje jako `admitted` wyłącznie do analizy trafności |
+| leki (`meds_*`, zestaw `full`) | lista leków jest dokumentowana głównie przy przyjęciu, więc przecieka bieżąca decyzja (9,1% wypisanych vs 68,7% przyjętych ma wpisane leki) |
+| `socialadmin` (historia chorób) | wskaźnik socjoekonomiczny (71% Medicaid / bez ubezpieczenia vs 35% w populacji) |
+| administracyjne kody V (badania przesiewowe, szczepienia, opieka po zabiegu) i rzadkie grupy chorób | kody rozliczeniowe, nie stan pacjenta; za mało przypadków na wiarygodny sygnał |
+| `arrival_unknown` (brak sposobu przybycia) | 99,7% braków pochodzi z oddziału A, gdzie oznaczają amerykańską ścieżkę szybkiej obsługi (64% wizyt ESI 5 tego oddziału). W TOPSOR takiej kategorii nie ma — brak kodowany jako „przyszedł sam”, policja jako „inny” |
+| zepsute badania laboratoryjne (24 kolumny: puste, stałe, śmieciowe) i D-dimer | brak informacji albo mieszane jednostki w jednej kolumnie |
+| `esi_danger_hr`, `esi_danger_rr` | dokładne duplikaty `tachycardia` / `tachypnea` |
+
+Przekształcenia: temperatura °F → °C; wartości fizjologicznie niemożliwe → brak (nie mediana);
+skargi główne jako flagi 0/1; aktywacje urazowe połączone w `cc_trauma_activation`; poprzednia
+dyspozycja zwinięta do `admitted / discharged / transferred / left_early / none`; badania
+jakościowe `_last`/`_npos` = brak, gdy badania nie wykonano; część wyników morfologii przeliczona
+z komórek/µL na 10³/µL. Braki zostają jako NaN — modele drzewiaste obsługują je natywnie,
+a regresja logistyczna imputuje medianą z flagą braku wewnątrz własnego pipeline'u (tylko na TRAIN).
+
+Zestawy cech: `triage` (domyślny, ~270 cech) zawiera to, co pielęgniarka ma w chwili triażu:
+parametry życiowe, wiek, płeć, sposób przybycia, czas przybycia, skargi główne i cechy kliniczne
+(wskaźnik wstrząsowy, NEWS2, qSOFA, strefa zagrożenia ESI, flagi braków). `full` (~900 cech) to
+`triage` + historia pacjenta: choroby przewlekłe, wcześniejsze wizyty, badania obrazowe, parametry
+i wyniki badań z **poprzednich** wizyt. Dokładne liczby są w `DATA_AUDIT.md`. Opis cech:
+[`FEATURE_ENGINEERING.md`](FEATURE_ENGINEERING.md).
 
 Podział danych:
 
 | zbiór | udział | do czego |
 |---|---|---|
-| train | 80% | trening; 10% z niego wydzielane w locie na early stopping |
-| val | 10% | porównanie modeli, ręczne łączenie, kalibracja, progi |
+| train | 80% | tuning (CV) i trening; 10% wydzielane w locie na early stopping |
+| val | 10% | porównanie modeli, łączenie, kalibracja, progi |
 | test | 10% | tylko ostateczna ocena — niczego na nim nie dostrajaj |
 
-Domyślnie podział jest losowy, ze stratyfikacją po ESI × oddział. Yale nie ma roku ani
-identyfikatora pacjenta, więc podział chronologiczny jest niemożliwy. Alternatywa:
-`--split site`, w którym oddział C w całości tworzy test (walidacja zewnętrzna).
+Domyślnie podział jest losowy, stratyfikowany po ESI × oddział. Yale nie ma roku ani
+identyfikatora pacjenta, więc podział chronologiczny jest niemożliwy. `--split site` trzyma
+oddział **B** w całości jako test (walidacja zewnętrzna). Oddział C ma tylko 19 wizyt ESI 1 —
+za mało, by go tak użyć.
 
-Zestawy cech:
-- `triage` (276): to, co pielęgniarka ma w chwili triażu. To zestaw domyślny.
-- `full` (1022): triaż oraz historia pacjenta (choroby, leki, wcześniejsze wizyty, wyniki badań).
+## 11. Zastrzeżenia do metodologii
 
-## Modele
+- **Braki parametrów życiowych odzwierciedlają organizację pracy, a nie stan pacjenta.** Yale
+  zapisuje jako „triażowe” pomiary sprzed przyjęcia na salę. 85,6% wizyt ESI 1 nie ma żadnego
+  pomiaru, bo pacjenta od razu przeniesiono na salę resuscytacyjną. W TOPSOR pomiar jest
+  obowiązkowy, więc metryki na całym `val` przeszacowują wykrywanie ESI 1. Raportuj zawsze także
+  **podgrupę vc** (`vitals_complete == 1`: zmierzone HR, SBP i RR) — kolumny `*_vc_*` w metrykach,
+  podsumowaniu, porównaniu i ewaluacji.
+- **SpO₂ = 100% przywrócone.** Filtr Yale (wartość ≥ 100 → brak) skasował każdy odczyt 100%.
+  Gdy zmierzono HR i SBP, brak SpO₂ przywracany jest jako 100%. Historia `spo2_*` pozostaje
+  ucięta na 99%.
+- Etykieta to **najnowsze ESI wizyty** (po ewentualnym ponownym triażu).
+- Brak identyfikatora pacjenta: ten sam pacjent może trafić do różnych zbiorów (lekko optymistyczne
+  wyniki dla wszystkich modeli jednakowo).
+- Dane z USA: populacja i organizacja SOR są inne niż w Polsce. Skargi główne pochodzą z listy
+  systemu Epic (po angielsku) i trzeba je odwzorować na wywiad z karty segregacji. Wyniki badań
+  są w jednostkach amerykańskich (zestaw `full` wymaga tabeli przeliczeń).
 
-| model | sprzęt | dlaczego w zestawie |
-|---|---|---|
-| `logreg` | CPU | liniowy punkt odniesienia, w pełni przejrzysty |
-| `lightgbm` | CPU | boosting, drzewa liść-po-liściu, najszybszy |
-| `xgboost` | GPU/CPU | boosting, drzewa poziomowe, TreeSHAP |
-| `catboost` | GPU/CPU | boosting, drzewa symetryczne, silna regularyzacja |
-| `random_forest` | CPU | bagging, czyli inny mechanizm niż boosting (dywersyfikacja) |
-| `ebm` | CPU | Explainable Boosting Machine: interpretowalny GAM |
+## 12. Pojedyncze skrypty
 
-Usunięte modele:
-- `hist_gbt` powielał LightGBM,
-- `extra_trees` powielał Random Forest,
-- automatyczny `stacking` zastępuje ręczne łączenie (niżej).
+`run_all.py` wywołuje je za Ciebie. Ręcznie przydają się do eksperymentów:
 
-GPU wybierane jest automatycznie; wymuszenie: `SOR_AI_DEVICE=cpu|gpu`.
-
-```bash
-python scripts/03_train.py --model xgboost                 # jeden model
-python scripts/03_train.py --model lightgbm,catboost       # kilka modeli
-python scripts/03_train.py --model all --feature-set full  # z historią pacjenta
-python scripts/03_train.py --model all --weights balanced  # wagi klas (domyślnie brak)
-python scripts/03_train.py --model all --sample 20000 --eval-sample 10000 --tag smoke  # szybki test
+```powershell
+python scripts/02_preprocess.py [--split site]                       # dane → splity + DATA_AUDIT.md
+python scripts/03_train.py --model xgboost --tune --profile quick    # jeden model (tag = profil)
+python scripts/03_train.py --model all                               # 6 modeli bez tuningu, jeden proces
+python scripts/04_evaluate.py --run <run>                            # wykresy i metryki na val
+python scripts/05_explain.py --model-name xgboost --n-patients 5     # SHAP + kontrola reguł ESI
+python scripts/06_cross_validate.py --model lightgbm                 # k-fold CV na TRAIN
+python scripts/07_compare_runs.py --tag standard                     # porównanie na val
+streamlit run app/streamlit_app.py                                   # demo (requirements-app.txt)
 ```
 
-Domyślnie modele trenują się **bez wag klas**. Dzięki temu prawdopodobieństwa są skalibrowane,
-co jest najlepsze do łączenia modeli. Asymetrię kosztów realizuje reguła decyzyjna (niżej).
+Modele: `logreg` (liniowy punkt odniesienia), `lightgbm`, `xgboost` (GPU), `catboost` (GPU),
+`random_forest` (bagging — dywersyfikacja), `ebm` (Explainable Boosting Machine, interpretowalny
+GAM bez interakcji).
 
-### Tuning
+## 13. Testy
 
-`--tune` uruchamia Optunę na zbiorze treningowym (k-fold CV); `val` i `test` pozostają nietknięte.
-
-- Domyślnie: 50 prób (EBM 15), 3 foldy, próbka 150 tys. wierszy.
-- Cel: log loss, czyli jakość prawdopodobieństw.
-- `--tune-metric qwk` optymalizuje QWK i dobiera też wagi klas.
-- `--n-trials`, `--cv-folds`, `--tune-rows 0` (cały TRAIN) zmieniają te ustawienia.
-- Historia zapisuje się w `logs/optuna/*.db`, więc przerwany tuning wznawia się od miejsca przerwania.
-
-## Wyniki: `runs/`
-
-Każdy trening zapisuje komplet w `runs/<data>_<model>_<zestaw>/`:
-
-| plik | zawartość |
-|---|---|
-| `report.md` | metryki val/test, macierz pomyłek, top cechy |
-| `metrics.json` | wszystkie metryki: `{val,test}_{argmax,cost}_<metryka>` |
-| `predictions_val.parquet`, `predictions_test.parquet` | `row_id, site, esi, target, p_esi1…p_esi5, pred_argmax, pred_cost` |
-| `model.joblib` | model z listą cech i metadanymi |
-| `feature_importance.csv`, `run_info.json` | ważność cech, parametry, rozmiary zbiorów |
-
-`runs/leaderboard.csv` ma jeden wiersz na run i służy do szybkiego porównania.
-
-### Dwie reguły decyzyjne
-
-- **argmax**: najbardziej prawdopodobny poziom ESI.
-- **cost**: poziom minimalizujący oczekiwany koszt. Niedotriażowanie kosztuje 3× więcej niż
-  przetriażowanie, a koszt rośnie z kwadratem odległości. Ta reguła mocno obniża
-  niedotriażowanie ESI 1–2 kosztem nieco większego przetriażowania i niższego QWK, bo QWK karze
-  symetrycznie.
-
-### Metryki
-
-- `quadratic_weighted_kappa` — główna metryka porządkowa.
-- `undertriage_rate` — ESI 1–2 przewidziane jako ESI 3–5. To metryka bezpieczeństwa.
-- `critical_miss_rate` — ESI 1 przewidziane jako ESI 4–5.
-- `overtriage_rate` — ESI 4–5 przewidziane jako ESI 1–2.
-- `mistriage_under` / `mistriage_over` — błąd o dowolny poziom.
-- `auc_macro`, `log_loss`, `brier` — jakość prawdopodobieństw.
-- `expected_cost` — średni koszt decyzji.
-
-## Ręczne łączenie modeli
-
-`python scripts/07_compare_runs.py` bierze najnowszy run każdego modelu i pokazuje:
-- metryki na `val`,
-- różnorodność modeli (korelacja błędów: im niższa, tym więcej daje połączenie),
-- punkt odniesienia w postaci równowagowej średniej.
-
-Raport trafia do `runs/comparison_*.md`.
-
-Własne połączenie:
-
-```python
-from src.ensemble import latest_runs, aligned_probas, blend, evaluate, optimize_weights
-from src.ensemble import fit_temperature, apply_temperature, diversity
-
-runs = latest_runs("triage")
-y_val, P_val = aligned_probas(runs, "val")
-y_test, P_test = aligned_probas(runs, "test")
-
-# 1. wybór i wagi — WYŁĄCZNIE na val
-weights = {"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}
-print(evaluate(y_val, blend(P_val, weights), rule="cost")["quadratic_weighted_kappa"])
-print(optimize_weights(P_val, y_val))           # podpowiedź (min. log loss na val)
-
-# 2. kalibracja np. Random Forest — temperatura dopasowana na val
-T = fit_temperature(P_val["random_forest"], y_val)
-P_test["random_forest"] = apply_temperature(P_test["random_forest"], T)
-
-# 3. raport — ta sama receptura na test
-final = evaluate(y_test, blend(P_test, weights), rule="cost")
+```powershell
+python -m pytest tests -q                    # wszystkie (z testem end-to-end run_all.py, ~1 min)
+python -m pytest tests -q -m "not slow"      # bez testów w procesach
 ```
 
-## Ewaluacja, wyjaśnienia, CV
-
-```bash
-python scripts/04_evaluate.py --model-name xgboost            # wykresy i metryki runa (val)
-python scripts/04_evaluate.py --model-name xgboost --split test
-python scripts/05_explain.py --model-name xgboost --n-patients 5   # SHAP + kontrola reguł
-python scripts/06_cross_validate.py --model lightgbm          # k-fold CV na TRAIN
-streamlit run app/streamlit_app.py                            # demo
-```
-
-## Testy
-
-```bash
-python -m pytest tests -q            # wszystkie
-python -m pytest tests -q -m "not slow"
-```
-
-## Ograniczenia danych (do rozdziału o metodologii)
-
-- Yale to dane z USA (3 oddziały, 2014–2017). ESI ma ten sam algorytm co w TOPSOR, ale inna
-  jest populacja i organizacja SOR.
-- Brak identyfikatora pacjenta: ten sam pacjent może trafić do train i test.
-- Wzorzec braków (np. ESI 1 bez parametrów życiowych) wynika z praktyki Yale. W TOPSOR pomiary
-  są obowiązkowe, więc przy wdrożeniu trzeba to sprawdzić na polskich danych.
-- Skargi główne to lista z systemu Epic (po angielsku). W Polsce trzeba je odwzorować na wywiad
-  z karty segregacji (warstwa NLP).
+Testy używają wyłącznie syntetycznych danych w katalogach tymczasowych; nie dotykają `data/`,
+`runs/` ani `logs/`.

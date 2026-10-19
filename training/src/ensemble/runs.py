@@ -6,17 +6,44 @@ import itertools
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize, minimize_scalar
 from sklearn.metrics import log_loss
 
+from src.data.dataset import FEATURE_SET_ALIASES
 from src.evaluation.metrics import decide, full_evaluation
-from src.utils.config import CLASS_NAMES, N_CLASSES, RUNS_DIR
+from src.utils import config
+from src.utils.config import CLASS_NAMES, N_CLASSES
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
 
 PROBA_COLS = [f"p_{name.lower()}" for name in CLASS_NAMES]
+VITALS_COMPLETE_COL = "vitals_complete"     # = src.data.prepare.VITALS_COMPLETE_COL
+DONE_JSON = "DONE.json"                     # = src.models.train.DONE_JSON (run ukończony)
 _EPS = 1e-12
+
+
+def _runs_dir(runs_dir: Path | str | None) -> Path:
+    """Katalog runów rozwiązywany przy WYWOŁANIU (config.RUNS_DIR może być nadpisany zmienną/testem)."""
+    return Path(runs_dir) if runs_dir is not None else Path(config.RUNS_DIR)
+
+
+def _read_json(path: Path) -> dict:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def resolve_feature_set(name: str) -> str:
+    """Stare nazwy zestawów cech ('triage_only', 'top') → 'triage'."""
+    return FEATURE_SET_ALIASES.get(name, name)
+
+
+def _is_weighted(weights: Any) -> bool:
+    """Run trenowany z wagami klas (prawdopodobieństwa nieskalibrowane — nie do domyślnego łączenia)."""
+    return weights not in (None, "none") and not (isinstance(weights, float) and np.isnan(weights))
 
 
 @dataclass
@@ -29,6 +56,14 @@ class Run:
     def model(self) -> str:
         return self.info["model"]
 
+    @property
+    def done(self) -> bool:
+        return (self.path / DONE_JSON).exists()
+
+    @property
+    def has_model(self) -> bool:
+        return (self.path / "model.joblib").exists()
+
     def predictions(self, split: str) -> pd.DataFrame:
         path = self.path / f"predictions_{split}.parquet"
         if not path.exists():
@@ -39,31 +74,43 @@ class Run:
 # ─────────────────────────────────────────
 # Runy
 # ─────────────────────────────────────────
-def load_run(run: str | Path, runs_dir: Path = RUNS_DIR) -> Run:
+def load_run(run: str | Path, runs_dir: Path | str | None = None) -> Run:
+    """Run po nazwie katalogu w runs/ albo po ścieżce."""
     path = Path(run)
     if not path.is_absolute() and not path.exists():
-        path = runs_dir / str(run)
+        path = _runs_dir(runs_dir) / str(run)
     info_path = path / "run_info.json"
     if not info_path.exists():
         raise FileNotFoundError(f"{path} nie jest katalogiem runa (brak run_info.json)")
-    return Run(name=path.name, path=path, info=json.loads(info_path.read_text()))
+    return Run(name=path.name, path=path, info=_read_json(info_path))
 
 
-def list_runs(runs_dir: Path = RUNS_DIR) -> pd.DataFrame:
+def list_runs(runs_dir: Path | str | None = None) -> pd.DataFrame:
     """Wszystkie runy z podstawowymi informacjami (najnowsze na końcu)."""
     rows = []
-    for info_path in sorted(Path(runs_dir).glob("*/run_info.json")):
-        info = json.loads(info_path.read_text())
+    for info_path in sorted(_runs_dir(runs_dir).glob("*/run_info.json")):
+        try:
+            info = _read_json(info_path)
+        except (OSError, ValueError) as exc:
+            log.warning(f"Pomijam uszkodzony {info_path}: {exc}")
+            continue
+        run_dir = info_path.parent
         rows.append({
-            "run": info_path.parent.name,
+            "run": run_dir.name,
             "model": info.get("model"),
-            "feature_set": info.get("feature_set"),
+            "feature_set": resolve_feature_set(str(info.get("feature_set"))),
+            "tag": info.get("tag"),
+            "profile": info.get("profile"),
             "tuned": info.get("tuned"),
-            "weights": info.get("sample_weight_strategy"),
+            "weights": info.get("weights_strategy") or info.get("sample_weight_strategy"),
+            "data_version": info.get("data_version"),
+            "data_fingerprint": info.get("data_fingerprint"),
             "n_fit": info.get("n_fit"),
             "n_val": info.get("n_val"),
             "train_sample": info.get("train_sample"),
             "eval_sample": info.get("eval_sample"),
+            "done": (run_dir / DONE_JSON).exists(),
+            "has_model": (run_dir / "model.joblib").exists(),
         })
     return pd.DataFrame(rows)
 
@@ -72,37 +119,82 @@ def latest_runs(
     feature_set: str = "triage",
     models: list[str] | None = None,
     include_samples: bool = False,
-    runs_dir: Path = RUNS_DIR,
+    runs_dir: Path | str | None = None,
+    *,
+    tag: str | None = None,
+    require_model: bool = True,
+    require_done: bool = True,
+    include_weighted: bool = False,
+    data_version: str | None = "current",
 ) -> list[Run]:
     """
-    Najnowszy run każdego modelu dla danego zestawu cech.
+    Najnowszy run każdego modelu dla zestawu cech — kandydaci do porównania i łączenia.
 
-    Runy na próbkach (--sample / --eval-sample) są pomijane, chyba że include_samples=True.
+    Domyślnie pomijane są runy:
+        - na próbkach (--sample / --eval-sample)       → include_samples=True,
+        - nieukończone (bez DONE.json)                  → require_done=False,
+        - bez pliku modelu (--no-save)                  → require_model=False,
+        - z wagami klas (nieskalibrowane prawdopodobieństwa; z notą w logu) → include_weighted=True,
+        - z innej wersji danych niż bieżąca DATA_VERSION → data_version=None (dowolna) albo nazwa.
+    tag : tylko runy z tym tagiem (np. nazwa profilu 'standard').
     """
     table = list_runs(runs_dir)
     if table.empty:
         return []
-    table = table[table["feature_set"] == feature_set]
+    table = table[table["feature_set"] == resolve_feature_set(feature_set)]
     if not include_samples:
         table = table[table["train_sample"].isna() & table["eval_sample"].isna()]
+    if require_done:
+        table = table[table["done"]]
+    if require_model:
+        table = table[table["has_model"]]
+    if tag is not None:
+        table = table[table["tag"] == tag]
+    if data_version is not None:
+        wanted = config.DATA_VERSION if data_version == "current" else data_version
+        table = table[table["data_version"] == wanted]
     if models is not None:
         table = table[table["model"].isin(models)]
+    if not include_weighted and not table.empty:
+        weighted = table[table["weights"].map(_is_weighted)]
+        if not weighted.empty:
+            log.info("Pominięto runy z wagami klas (prawdopodobieństwa nieskalibrowane — nie do domyślnego "
+                     "łączenia; include_weighted=True je uwzględni): " + ", ".join(weighted["run"]))
+            table = table[~table["run"].isin(weighted["run"])]
     latest = table.groupby("model", sort=False).tail(1)
     return [load_run(r, runs_dir) for r in latest["run"]]
 
 
-def aligned_probas(runs: list[Run], split: str = "val") -> tuple[np.ndarray, dict[str, np.ndarray]]:
+def aligned_probas(
+    runs: list[Run],
+    split: str = "val",
+    return_vc: bool = False,
+) -> tuple[np.ndarray, dict[str, np.ndarray]] | tuple[np.ndarray, dict[str, np.ndarray], np.ndarray | None]:
     """
-    Prawdopodobieństwa wszystkich runów na tym samym zbiorze wierszy.
+    Prawdopodobieństwa wszystkich runów na tym samym zbiorze wierszy (po `row_id`).
+
+    Sprawdza: ten sam zbiór wierszy, identyczną etykietę dla każdego `row_id` i tę samą wersję
+    danych we wszystkich runach (inaczej ValueError — łącz tylko runy z jednego przygotowania).
 
     Returns
     -------
     y : np.ndarray (n,) — prawdziwe klasy 0–4
     probas : dict nazwa → np.ndarray (n, 5); nazwa = model (albo nazwa runa przy duplikatach)
+    vc_mask : (tylko return_vc=True) maska `vitals_complete == 1` albo None, gdy predykcje nie
+              mają tej kolumny (stare runy)
     """
     if not runs:
         raise ValueError("Brak runów do porównania")
-    frames = {}
+    versions = {r.info.get("data_version") for r in runs if r.info.get("data_version")}
+    if len(versions) > 1:
+        raise ValueError(f"Runy z różnych wersji danych ({sorted(versions)}) — łącz tylko runy z tego samego "
+                         f"przygotowania danych")
+    fingerprints = {r.info.get("data_fingerprint") for r in runs if r.info.get("data_fingerprint")}
+    if len(fingerprints) > 1:
+        log.warning(f"Runy z różnych przygotowań danych (odciski {sorted(fingerprints)}) — sprawdzam etykiety "
+                    f"wiersz po wierszu")
+
+    frames: dict[str, pd.DataFrame] = {}
     for run in runs:
         key = run.model if sum(r.model == run.model for r in runs) == 1 else run.name
         frames[key] = run.predictions(split).set_index("row_id").sort_index()
@@ -113,10 +205,21 @@ def aligned_probas(runs: list[Run], split: str = "val") -> tuple[np.ndarray, dic
             "Runy mają różne zbiory wierszy (np. inne --eval-sample albo inny podział danych). "
             "Łącz tylko runy z tego samego przygotowania danych."
         )
-    first = next(iter(frames.values()))
+    first_key, first = next(iter(frames.items()))
     y = first["target"].to_numpy()
+    for key, df in frames.items():
+        if not np.array_equal(df["target"].to_numpy(), y):
+            raise ValueError(f"Run '{key}' ma inne etykiety niż '{first_key}' dla tych samych row_id — "
+                             f"runy pochodzą z różnych przygotowań danych")
     probas = {k: _normalize(df[PROBA_COLS].to_numpy(dtype=float)) for k, df in frames.items()}
-    return y, probas
+    if not return_vc:
+        return y, probas
+    vc_mask = None
+    if VITALS_COMPLETE_COL in first.columns:
+        values = pd.to_numeric(first[VITALS_COMPLETE_COL], errors="coerce")
+        if values.notna().any():
+            vc_mask = values.fillna(0).to_numpy() == 1
+    return y, probas, vc_mask
 
 
 def _normalize(proba: np.ndarray) -> np.ndarray:
@@ -220,7 +323,10 @@ def diversity(probas: dict[str, np.ndarray], y: np.ndarray) -> pd.DataFrame:
     disagreement  — odsetek wierszy z różną predykcją argmax
     corr_expected — korelacja oczekiwanego poziomu ESI (Σ p·k)
     corr_errors   — korelacja wskaźników błędu argmax (1 = myli się na tych samych wierszach)
+
+    Mniej niż 2 modele → pusta tabela z tymi samymi kolumnami.
     """
+    columns = ["model_a", "model_b", "disagreement", "corr_expected", "corr_errors"]
     levels = np.arange(N_CLASSES)
     preds = {k: p.argmax(axis=1) for k, p in probas.items()}
     expected = {k: p @ levels for k, p in probas.items()}
@@ -234,4 +340,4 @@ def diversity(probas: dict[str, np.ndarray], y: np.ndarray) -> pd.DataFrame:
             "corr_expected": float(np.corrcoef(expected[a], expected[b])[0, 1]),
             "corr_errors": float(np.corrcoef(errors[a], errors[b])[0, 1]),
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=columns)

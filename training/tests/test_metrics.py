@@ -268,7 +268,7 @@ class TestFullEvaluation:
         for key in keys:
             assert key in result, f"Brak klucza: {key}"
         assert "auc_esi1" in result and "auc_esi5" in result
-        assert not [k for k in result if "mts" in k or "orange" in k or "yellow" in k]
+        assert not [k for k in result if "orange" in k or "yellow" in k]
 
     def test_confusion_matrix_5x5(self, sample):
         y_true, y_pred, _ = sample

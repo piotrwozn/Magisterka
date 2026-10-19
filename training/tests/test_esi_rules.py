@@ -5,8 +5,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.explain.mts_rules import (
-    MTS_VITAL_THRESHOLDS,
+from src.explain.esi_rules import (
+    ESI_VITAL_RULES,
     check_consistency,
     explain_rule_decision,
     rule_based_triage,
@@ -117,6 +117,27 @@ class TestRuleBasedTriage:
         assert rule_based_triage(_with(cc_suicidal=1))["suggested_esi"] == 2
         assert rule_based_triage(_with(cc_cardiacarrest=0))["suggested_class_idx"] is None
 
+    def test_trauma_activation_flag(self):
+        """Scalona flaga aktywacji urazowej (cc_trauma_activation) → punkt B, ESI 2."""
+        result = rule_based_triage(_with(cc_trauma_activation=1))
+        assert result["suggested_esi"] == 2
+        assert result["decision_point"] == "B"
+        assert result["triggered_rules"][0]["name"] == "cc_trauma_activation"
+        assert rule_based_triage(_with(cc_trauma_activation=0))["suggested_class_idx"] is None
+
+    def test_trauma_activation_source_flags(self):
+        """Surowe flagi Yale (pełna / zmodyfikowana aktywacja) liczą się jak scalona flaga."""
+        for col in ("cc_fulltrauma", "cc_modifiedtrauma"):
+            result = rule_based_triage(_with(**{col: 1}))
+            assert result["suggested_esi"] == 2
+            assert result["triggered_rules"][0]["name"] == "cc_trauma_activation"
+
+    def test_danger_zone_from_raw_vitals_only(self):
+        """Strefa zagrożenia liczona z parametrów — pochodne flagi modelu są ignorowane."""
+        derived = {"tachycardia": 1, "tachypnea": 1, "esi_danger_zone": 1, "esi_danger_count": 2}
+        result = rule_based_triage(_with(**derived))
+        assert result["suggested_class_idx"] is None
+
     def test_accepts_series_and_frame(self):
         row = pd.Series(_with(triage_vital_o2=80))
         assert rule_based_triage(row)["suggested_esi"] == 1
@@ -166,26 +187,36 @@ class TestExplainRule:
         text = explain_rule_decision(rule_based_triage(_with(triage_vital_o2=80)))
         assert "ESI 1" in text
         assert "SpO2" in text
-        assert "MTS" not in text
+        assert "TOPSOR" in text
 
 
 class TestThresholdsStructure:
     def test_all_esi_levels_present(self):
-        assert list(MTS_VITAL_THRESHOLDS) == CLASS_NAMES
+        assert list(ESI_VITAL_RULES) == CLASS_NAMES
         for idx, name in enumerate(CLASS_NAMES):
-            level = MTS_VITAL_THRESHOLDS[name]
+            level = ESI_VITAL_RULES[name]
             assert level["esi"] == idx + 1
             assert level["class_idx"] == idx
             assert level["color"] == TOPSOR_COLORS[idx]
 
     def test_max_wait_increases_with_level(self):
         """Maks. czas oczekiwania TOPSOR rośnie od ESI 1 do ESI 5."""
-        waits = [MTS_VITAL_THRESHOLDS[name]["max_wait_minutes"] for name in CLASS_NAMES]
+        waits = [ESI_VITAL_RULES[name]["max_wait_minutes"] for name in CLASS_NAMES]
         assert waits == sorted(waits)
         assert waits[0] == 0
 
     def test_only_esi1_and_esi2_have_vital_rules(self):
         """ESI 3–5 zależą od zasobów — brak reguł progowych."""
         for idx, name in enumerate(CLASS_NAMES):
-            has_rules = bool(MTS_VITAL_THRESHOLDS[name]["vital_rules"])
+            has_rules = bool(ESI_VITAL_RULES[name]["vital_rules"])
             assert has_rules == (idx < 2)
+
+
+class TestModuleNames:
+    def test_package_exports_esi_names(self):
+        """Pakiet src.explain eksportuje reguły pod nazwami ESI."""
+        import src.explain as explain
+
+        assert explain.ESI_VITAL_RULES is ESI_VITAL_RULES
+        assert explain.rule_based_triage is rule_based_triage
+        assert {n for n in explain.__all__ if n.isupper()} == {"ESI_VITAL_RULES"}

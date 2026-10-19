@@ -1,0 +1,23 @@
+# Normalizacja końców linii (Git for Windows z core.autocrlf=true zmienia LF → CRLF,
+# co psuje skrypty bash i Makefile). Pliki tekstowe w repo: LF; checkout wg platformy,
+# z wyjątkiem plików, które MUSZĄ mieć LF także na Windows.
+* text=auto
+
+*.sh        text eol=lf
+Makefile    text eol=lf
+*.mk        text eol=lf
+*.ps1       text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Dane i artefakty binarne — bez konwersji i bez diffów tekstowych
+*.parquet   binary
+*.rdata     binary
+*.RData     binary
+*.joblib    binary
+*.pkl       binary
+*.db        binary
+*.png       binary
+*.jpg       binary
+*.pdf       binary
+*.xlsx      binary

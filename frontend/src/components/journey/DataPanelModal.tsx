@@ -14,52 +14,54 @@ interface DataPanelModalProps {
   onClose: () => void;
 }
 
+// Feature set "triage" (training/src/data — counts as in the current pipeline)
 const FEATURES_GROUPS = [
   {
     group: { pl: "Parametry życiowe (triażowe)", en: "Triage vitals" },
     count: 7,
-    examples: ["SBP", "DBP", "HR", "SpO₂", "Temp", "RR", "Pain score"],
+    examples: ["SBP", "DBP", "HR", "SpO₂", "Tlen (O₂)", "Temp", "RR"],
   },
   {
-    group: { pl: "Dane demograficzne", en: "Demographics" },
+    group: { pl: "Demografia i przybycie", en: "Demographics & arrival" },
     count: 8,
-    examples: ["Wiek", "Płeć", "Rasa", "Metoda przybycia", "Pora dnia", "Dzień tygodnia", "Sezon", "Rok"],
+    examples: ["Wiek", "Płeć", "ZRM / własny / inny", "Miesiąc", "Dzień tygodnia", "Pora dnia"],
   },
   {
-    group: { pl: "Chief complaints (binarnie)", en: "Chief complaints (binary)" },
-    count: 200,
-    examples: ["cc_chest_pain", "cc_dyspnea", "cc_abdominal_pain", "cc_syncope", "…"],
+    group: { pl: "Skargi główne (binarnie)", en: "Chief complaints (binary)" },
+    count: 199,
+    examples: ["cc_chestpain", "cc_shortnessofbreath", "cc_abdominalpain", "cc_syncope", "…"],
   },
   {
     group: { pl: "Cechy inżynierowane", en: "Engineered features" },
-    count: 116,
-    examples: ["Shock index (HR/SBP)", "MEWS", "qSOFA", "SIRS score", "Temp × wiek", "SBP × wiek", "Missing flags"],
+    count: 57,
+    examples: ["Shock index", "NEWS2", "qSOFA", "SIRS", "Strefa zagrożenia ESI", "Braki pomiarów"],
   },
 ];
 
-const MTS_DETAILS = [
-  { name: "Red (Natychmiastowy)", value: 68.6, color: "#DC2626", wait: "0 min", desc: "Stan zagrożenia życia. Resuscytacja lub natychmiastowa interwencja.", visits: "~307 k" },
-  { name: "Orange (Pilny)", value: 13.2, color: "#EA580C", wait: "10 min", desc: "Bardzo wysoki priorytet. Intensywny ból, krytyczne parametry.", visits: "~59 k" },
-  { name: "Yellow (Pilny)", value: 12.2, color: "#EAB308", wait: "60 min", desc: "Pilny, ale stabilny. Wymaga oceny w ciągu godziny.", visits: "~54 k" },
-  { name: "Green (Mniej pilny)", value: 4.1, color: "#16A34A", wait: "120 min", desc: "Stan nieostry. Może poczekać do 2 godzin.", visits: "~18 k" },
-  { name: "Blue (Nieostry)", value: 1.9, color: "#2563EB", wait: "240 min", desc: "Stan przewlekły lub drobna dolegliwość. Tryb ambulatoryjny.", visits: "~8.5 k" },
+// ESI distribution in Yale EMMLC (training/DATA_AUDIT.md); TOPSOR colour + max wait = display only
+const ESI_DETAILS = [
+  { name: "ESI 1 · Czerwony", value: 0.9, color: "#DC2626", wait: "0 min", desc: "Wymaga natychmiastowej interwencji ratującej życie.", visits: "5 271" },
+  { name: "ESI 2 · Pomarańczowy", value: 29.3, color: "#EA580C", wait: "10 min", desc: "Sytuacja wysokiego ryzyka, splątanie, silny ból lub parametry w strefie zagrożenia.", visits: "163 532" },
+  { name: "ESI 3 · Żółty", value: 42.3, color: "#EAB308", wait: "60 min", desc: "Stabilny, przewidywane ≥ 2 zasoby (badania, obrazowanie, leki iv.).", visits: "236 229" },
+  { name: "ESI 4 · Zielony", value: 22.4, color: "#16A34A", wait: "120 min", desc: "Stabilny, przewidywany 1 zasób.", visits: "125 003" },
+  { name: "ESI 5 · Niebieski", value: 5.0, color: "#2563EB", wait: "240 min", desc: "Stabilny, bez przewidywanych zasobów.", visits: "27 992" },
 ];
 
 const SPLIT_DETAILS = [
   {
     label: "Train", pct: 80, color: "hsl(199 89% 58%)",
-    rows: "446 480",
-    desc: { pl: "Dane do treningu modeli i tuningowy CV. Najstarsze chronologicznie.", en: "Training data for models and CV tuning. Oldest chronologically." },
+    rows: "446 421",
+    desc: { pl: "Trening i tuning (k-fold CV). Early stopping na fragmencie wydzielonym z train.", en: "Training and tuning (k-fold CV). Early stopping on a slice carved from train." },
   },
   {
     label: "Val", pct: 10, color: "hsl(280 80% 60%)",
-    rows: "55 747",
-    desc: { pl: "Walidacja w trakcie treningu (early stopping). Nie dotknięte przez tuning Optuny.", en: "Validation during training (early stopping). Not touched by Optuna tuning." },
+    rows: "55 803",
+    desc: { pl: "Porównanie modeli, wagi ensembla i reguła decyzyjna. Nie używany w tuningu.", en: "Model comparison, ensemble weights and decision rule. Not used in tuning." },
   },
   {
     label: "Test", pct: 10, color: "hsl(160 70% 50%)",
-    rows: "55 802",
-    desc: { pl: "Holdout set — 10% najnowszych wizyt. Jedyny prawdziwy test generalizacji. Użyty jednokrotnie.", en: "Holdout set — 10% most recent visits. True generalization test. Used once." },
+    rows: "55 803",
+    desc: { pl: "Holdout — wyłącznie ocena końcowa, raz, tą samą recepturą co na val.", en: "Holdout — final evaluation only, once, with the recipe fixed on val." },
   },
 ];
 
@@ -163,7 +165,7 @@ function ClassesDetail({ t, onClose }: { t: ReturnType<typeof useTranslation>["t
   return (
     <Card className="overflow-hidden border-2 border-primary/30 bg-background/95 p-6 backdrop-blur-xl">
       <div className="pointer-events-none absolute -right-16 -top-16 size-48 rounded-full bg-primary/10 blur-3xl" />
-      <ModalHeader icon={<Database className="size-5" />} title={t("data.classes.title")} subtitle="558 029 wizyt · Yale-New Haven Hospital" onClose={onClose} />
+      <ModalHeader icon={<Database className="size-5" />} title={t("data.classes.title")} subtitle="558 027 wizyt · Yale-New Haven Hospital" onClose={onClose} />
       <div className="mb-4 h-44">
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
@@ -187,7 +189,7 @@ function ClassesDetail({ t, onClose }: { t: ReturnType<typeof useTranslation>["t
         </ResponsiveContainer>
       </div>
       <div className="space-y-2">
-        {MTS_DETAILS.map((c) => (
+        {ESI_DETAILS.map((c) => (
           <Card key={c.name} className="bg-card/60 p-3" style={{ borderColor: `${c.color}30` }}>
             <div className="flex items-start justify-between gap-3">
               <div className="flex items-center gap-2">
@@ -216,7 +218,7 @@ function SplitDetail({ t, lang, onClose }: { t: ReturnType<typeof useTranslation
   return (
     <Card className="overflow-hidden border-2 border-primary/30 bg-background/95 p-6 backdrop-blur-xl">
       <div className="pointer-events-none absolute -right-16 -top-16 size-48 rounded-full bg-primary/10 blur-3xl" />
-      <ModalHeader icon={<Calendar className="size-5" />} title={t("data.split.title")} subtitle="Podział temporalny — bez wycieku z przyszłości" onClose={onClose} />
+      <ModalHeader icon={<Calendar className="size-5" />} title={t("data.split.title")} subtitle="Podział stratyfikowany po ESI (Yale nie zawiera dat wizyt)" onClose={onClose} />
       <div className="space-y-4">
         {SPLIT_DETAILS.map((s) => (
           <Card key={s.label} className="bg-card/60 p-4">

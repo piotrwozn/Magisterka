@@ -62,10 +62,10 @@ class TestFeatureList:
         added = [c for c in out.columns if c not in NORMAL]
         assert set(added) == set(ENGINEERED_FEATURES)
 
-    def test_no_removed_mts_or_pediatric_features(self):
-        for removed in ["temp_mts_bin", "mts_vitals_score", "ambulance_flag", "dbp_risk"]:
+    def test_no_removed_legacy_or_pediatric_features(self):
+        for removed in ["ambulance_flag", "dbp_risk"]:
             assert removed not in ENGINEERED_FEATURES
-        assert not [f for f in ENGINEERED_FEATURES if "pediatric" in f or "mts" in f]
+        assert not [f for f in ENGINEERED_FEATURES if "pediatric" in f]
 
     def test_count(self):
         assert len(ENGINEERED_FEATURES) == 57

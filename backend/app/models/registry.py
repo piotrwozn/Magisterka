@@ -1,15 +1,21 @@
-"""Model registry — loads ESI model artifacts (.joblib) + optional medians at startup.
+"""Model registry — loads ESI model artifacts (.joblib), optional medians and the
+ensemble configuration at startup.
 
 Search order per model (first location with a valid artifact wins):
   1. backend/models/<model>_*.joblib or <model>.joblib   (explicit deployment, newest file)
   2. <repo>/models/<model>_*.joblib or <model>.joblib
-  3. training/runs/<run>/model.joblib                     (newest complete run per model;
-     runs trained on the full train split are preferred over --sample runs)
+  3. training/runs/<run>/model.joblib                     (runs with run_info.json; runs
+     trained on the full train split (not a --sample / smoke / quick profile sample) first,
+     then finished runs (DONE.json), then the newest)
 
 Artifacts are written by `BaseTriageModel.save()` (training/src/models/base.py):
 dict with name, model (raw estimator / sklearn Pipeline), feature_names,
-feature_set, class_names (["ESI1", …, "ESI5"]), label="esi", run_id, data_version.
-Class index 0..4 = ESI 1..5. Legacy artifacts without label="esi" are skipped.
+feature_set, classes_, class_names (["ESI1", …, "ESI5"]), label="esi", run_id,
+data_version. Class index 0..4 = ESI 1..5. Legacy artifacts without label="esi"
+are skipped.
+
+Ensemble weights + decision rule: `<models_dir>/ensemble_weights.json`
+(format in app/models/ensemble.py; default = equal weights, argmax).
 """
 from __future__ import annotations
 
@@ -21,13 +27,17 @@ from typing import Any, NamedTuple
 import joblib
 
 from app.config import get_settings
+from app.models.ensemble import (
+    ENSEMBLE_MODELS,
+    ENSEMBLE_WEIGHTS_FILE,
+    EnsembleConfig,
+    load_ensemble_config,
+)
 
 log = logging.getLogger(__name__)
 
 # Models served by the backend (training/src/models MODEL_REGISTRY)
-TARGET_MODELS: tuple[str, ...] = (
-    "xgboost", "lightgbm", "catboost", "random_forest", "ebm", "logreg",
-)
+TARGET_MODELS: tuple[str, ...] = ENSEMBLE_MODELS
 N_CLASSES = 5
 
 # Old feature-set names (same aliases as src.data.dataset)
@@ -44,10 +54,12 @@ class _Candidate(NamedTuple):
     path: Path
     source: str
     train_sample: bool = False     # run trained on a --sample of the train split
+    finished: bool = True          # run wrote DONE.json (its last artifact)
 
 
 class ModelRegistry:
-    """Holds loaded ML models, their expected features, and (optional) train medians."""
+    """Holds loaded ML models, their expected features, (optional) train medians
+    and the ensemble configuration (weights + decision rule)."""
 
     def __init__(self, feature_set: str | None = None) -> None:
         self.models: dict[str, dict[str, Any]] = {}
@@ -55,6 +67,7 @@ class ModelRegistry:
         # NOT used for imputation by default — see feature_engineering.align_features.
         self.medians: dict[str, float] = {}
         self.feature_set: str = resolve_feature_set(feature_set or get_settings().feature_set)
+        self.ensemble: EnsembleConfig = EnsembleConfig()
 
     # ── Discovery ────────────────────────────────────────────────────
 
@@ -71,7 +84,7 @@ class ModelRegistry:
         return out
 
     def _run_candidates(self, runs_dir: Path) -> dict[str, list[_Candidate]]:
-        """training/runs/*/model.joblib per model — full-data runs first, newest first."""
+        """training/runs/*/model.joblib per model — full-data, then finished, then newest runs first."""
         if not runs_dir.is_dir():
             return {}
         found: dict[str, list[_Candidate]] = {}
@@ -80,7 +93,7 @@ class ModelRegistry:
             if not model_path.exists():
                 continue
             try:
-                info = json.loads(info_path.read_text())
+                info = json.loads(info_path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 log.warning("  skipping run %s — unreadable run_info.json (%s)", info_path.parent.name, exc)
                 continue
@@ -90,11 +103,14 @@ class ModelRegistry:
                 model_path,
                 f"run {info_path.parent.name}",
                 train_sample=info.get("train_sample") is not None,
+                finished=(info_path.parent / "DONE.json").exists(),
             ))
         for runs in found.values():
-            # Newest run first (directory names start with YYYYmmdd_HHMMSS), then
-            # full-data runs before --sample runs (stable sort keeps the date order).
+            # Full-data runs before sample runs; within each group finished runs
+            # (DONE.json) before interrupted ones; then newest first (directory names
+            # start with YYYYmmdd_HHMMSS). Stable sorts: the last sort is the primary key.
             runs.sort(key=lambda c: c.path.parent.name, reverse=True)
+            runs.sort(key=lambda c: not c.finished)
             runs.sort(key=lambda c: c.train_sample)
         return found
 
@@ -131,9 +147,11 @@ class ModelRegistry:
             log.warning("  %-15s ✗ %s uses feature set %r (backend serves %r) — skipping",
                         model_id, path, artifact_fs, self.feature_set)
             return None
+        classes = data.get("classes_")
         return {
             "model": data["model"],
             "feature_names": feature_names,
+            "classes": [int(c) for c in classes] if classes is not None else list(range(N_CLASSES)),
             "class_names": class_names,
             "feature_set": artifact_fs,
             "run_id": data.get("run_id"),
@@ -168,23 +186,36 @@ class ModelRegistry:
                     continue
                 bundle["train_sample"] = cand.train_sample
                 self.models[model_id] = bundle
-                log.info("  %-15s ✓ loaded (%d features) from %s [%s]",
-                         model_id, len(bundle["feature_names"]), cand.path, cand.source)
+                log.info("  %-15s ✓ loaded (%d features, data %s) from %s [%s]",
+                         model_id, len(bundle["feature_names"]), bundle["data_version"],
+                         cand.path, cand.source)
                 if cand.train_sample:
-                    log.warning("  %-15s ! trained on a --sample of the train split "
-                                "(smoke test) — not for clinical evaluation", model_id)
+                    log.warning("  %-15s ! trained on a sample of the train split "
+                                "(smoke/quick run) — not for clinical evaluation", model_id)
+                if not cand.finished:
+                    log.warning("  %-15s ! run has no DONE.json (unfinished run or older "
+                                "training version) — prefer a finished run", model_id)
                 break
             else:
                 log.warning("  %-15s — not found, skipping", model_id)
 
         self._load_medians(models_dir / "imputation_medians.json")
+        self.ensemble = load_ensemble_config(models_dir / ENSEMBLE_WEIGHTS_FILE)
+        active = self.ensemble.active(self.loaded_ids)
+        if self.models and not active:
+            log.error("No loaded model has a weight > 0 in %s — /api/v1/predict will fail",
+                      self.ensemble.source)
+        missing = [m for m, w in self.ensemble.weights.items() if w > 0 and m not in self.models]
+        if missing and not self.ensemble.is_default:
+            log.warning("Weighted models not loaded (weights renormalised over the rest): %s", missing)
+        log.info("Ensemble: %s (rule=%s)", active, self.ensemble.rule)
 
     def _load_medians(self, medians_path: Path) -> None:
         """Optional train-set medians (scripts/generate_imputation_medians.py)."""
         if not medians_path.exists():
             log.info("No imputation_medians.json — fine: missing features stay NaN")
             return
-        with medians_path.open() as f:
+        with medians_path.open(encoding="utf-8") as f:
             payload = json.load(f)
         self.medians = dict(payload.get("medians", {}))
         medians_fs = resolve_feature_set(payload.get("feature_set"))

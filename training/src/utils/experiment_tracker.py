@@ -8,7 +8,7 @@ Każdy run treningu generuje:
         ├── device: {requested, actual, fallback_reason} — faktyczne urządzenie treningu
         ├── data: {n_train, n_val, n_test, feature_count, class_distribution}
         ├── params (hiperparametry modelu)
-        ├── training_history (per-iteration metrics: mlogloss, merror)
+        ├── training_history (krzywa early stopping per iteracja: es_mlogloss, … — 10% TRAIN, nie val)
         ├── metrics: {val_*, test_*}  — pełna ewaluacja
         ├── feature_importances (top-N)
         └── artifacts: {model_path, log_path, config_path}
@@ -19,7 +19,7 @@ Użycie:
     tracker = ExperimentTracker(model_name="xgboost", run_id="...")
     tracker.log_params({"max_depth": 8, ...})
     tracker.log_data_info(X_train, y_train, X_val, y_val)
-    tracker.log_iteration(iteration=100, metrics={"val_mlogloss": 0.45})
+    tracker.log_iteration(iteration=100, metrics={"es_mlogloss": 0.45})
     tracker.log_metrics({"val_qwk": 0.87, "test_undertriage": 0.02})
     tracker.log_artifact("model_path", "/models/xgb.joblib")
     tracker.log_device(requested="gpu", actual="cuda", fallback_reason=None)

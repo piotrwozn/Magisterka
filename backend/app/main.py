@@ -42,7 +42,11 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="SOR-AI Triage API",
     version="1.0.0",
-    description="ML-powered Manchester Triage decision support",
+    description=(
+        "ML-powered triage decision support: Emergency Severity Index (ESI 1–5), "
+        "TOPSOR colours (red, orange, yellow, green, blue) for display. "
+        "Every category is a class index 0–4 = ESI 1–5."
+    ),
     lifespan=lifespan,
 )
 

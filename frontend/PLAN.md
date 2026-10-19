@@ -62,7 +62,7 @@
 
 ### Lib
 - ✅ `src/lib/utils.ts` — cn() helper, format helpers
-- ✅ `src/lib/constants.ts` — MTS categories, colors, models
+- ✅ `src/lib/constants.ts` — poziomy ESI 1–5 (kolory TOPSOR, maks. czas oczekiwania), modele, wyniki (`RESULTS`)
 - ✅ `src/lib/types.ts` — TS types z backend schema
 - ✅ `src/lib/api.ts` — axios + endpoints
 - ✅ `src/lib/i18n.ts` — react-i18next config
@@ -105,17 +105,17 @@
 - ✅ `MagneticButton`
 
 ### Shared
-- ✅ `MTSCategoryBadge` — kolorowane chipy 5 kategorii
+- ✅ `ESILevelBadge` — chip poziomu ESI w kolorze TOPSOR (+ maks. czas oczekiwania)
 - ✅ `MetricCard`
 - ✅ `SectionHeader`
 - ✅ `CodeBlock`
 
 ### Sections (one-page scroll)
 - ✅ `Hero` — three.js neural net + typewriter + CTA
-- ✅ `ProblemStatement` — MTS 5 kategorii, statystyki SOR
+- ✅ `ProblemStatement` — 5 poziomów ESI, statystyki SOR
 - ✅ `DataSection` — Yale EMMLC, 336 cech, pie chart klas
 - ✅ `ArchitectureDiagram` — animowany flow 3 warstw (SVG paths)
-- ✅ `ModelsShowcase` — 7 modeli z metrykami
+- ✅ `ModelsShowcase` — 6 modeli (metryki „—” do czasu treningu końcowego)
 - ✅ `ResultsSection` — confusion matrix, ROC, big numbers
 - ✅ `HowItWorks` — scrollytelling pipeline
 - ✅ `DemoSection` — full interaktywne demo
@@ -127,7 +127,7 @@
 - ✅ `PatientForm` — react-hook-form + zod
 - ✅ `VitalsInput` — sliders + number inputs
 - ✅ `ClinicalNoteInput` — textarea + przykłady
-- ✅ `PredictionResult` — animated final category
+- ✅ `PredictionResult` — animowany końcowy poziom ESI
 - ✅ `ModelComparison` — co każdy model powiedział
 - ✅ `ShapWaterfall` — top 5 cech, animated bars
 - ✅ `ConfidenceGauge` — radial gauge animated
@@ -136,7 +136,7 @@
 ### Pages
 - ✅ `Home` — one-page (wszystkie sekcje)
 - ✅ `Demo` — standalone demo
-- ✅ `Models` — deep dive 7 modeli
+- ✅ `Models` — deep dive 6 modeli
 - ✅ `About` — kontakt + GitHub
 - ✅ `NotFound`
 

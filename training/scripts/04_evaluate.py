@@ -6,8 +6,11 @@ Wykonuje:
     2. Predykcję na wskazanym splicie (val | test).
     3. Pełną ewaluację dla obu reguł decyzyjnych: argmax i minimalny koszt oczekiwany
        (QWK, AUC, undertriage, mistriage, confusion matrix …).
-    4. Wykresy: macierze pomyłek, krzywe ROC, kalibracja, ważność cech.
-    5. Zapis do runs/<run>/figures/ (wykresy + metrics_<split>.json);
+    4. Podgrupy: pacjenci z kompletem parametrów życiowych (`vitals_complete == 1`:
+       HR, SBP i RR zmierzone — populacja jak w TOPSOR, gdzie pomiar jest obowiązkowy;
+       klucze `{split}_vc_{reguła}_{metryka}`) oraz każdy oddział Yale osobno.
+    5. Wykresy: macierze pomyłek (całość i podgrupa vc), krzywe ROC, kalibracja, ważność cech.
+    6. Zapis do runs/<run>/figures/ (wykresy + metrics_<split>.json);
        dla modelu spoza runs/ — do results/figures/<model>_eval_<czas>/.
 
 Protokół: rozwój i porównania na VAL; `--split test` tylko do raportu końcowego.
@@ -27,8 +30,8 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-import joblib
 import numpy as np
 import pandas as pd
 
@@ -37,8 +40,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.dataset import get_xy, load_splits, sample_frame  # noqa: E402
+from src.data.prepare import SITE_COL, VITALS_COMPLETE_COL  # noqa: E402
 from src.ensemble import list_runs, load_run  # noqa: E402
-from src.ensemble.runs import PROBA_COLS  # noqa: E402
+from src.evaluation.cross_validation import DECISION_RULES  # noqa: E402
 from src.evaluation.metrics import decide, full_evaluation  # noqa: E402
 from src.evaluation.visualizations import (  # noqa: E402
     plot_calibration,
@@ -46,9 +50,8 @@ from src.evaluation.visualizations import (  # noqa: E402
     plot_feature_importances,
     plot_roc_curves,
 )
-from src.models import MODEL_ALIASES, MODEL_REGISTRY, resolve_model_name  # noqa: E402
-from src.models.train import DECISION_RULES  # noqa: E402
-from src.utils.config import DATA_VERSION, FIGURES_DIR, RUNS_DIR  # noqa: E402
+from src.models import MODEL_ALIASES, MODEL_REGISTRY, load_model, resolve_model_name  # noqa: E402
+from src.utils.config import CLASS_NAMES, DATA_VERSION, FIGURES_DIR, RUNS_DIR, TARGET_COL  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 
 log = get_logger(__name__)
@@ -59,14 +62,29 @@ SUMMARY_METRICS = [
     "undertriage_rate", "critical_miss_rate", "overtriage_rate",
     "mistriage_under", "mistriage_over", "within_one_accuracy", "expected_cost",
 ]
+# Kolumny prawdopodobieństw w runs/<run>/predictions_<split>.parquet (p_esi1 … p_esi5)
+PROBA_COLS = [f"p_{name.lower()}" for name in CLASS_NAMES]
+
+# Metryki w tabeli per oddział (metryka → krótka etykieta kolumny)
+SITE_SUMMARY_METRICS: dict[str, str] = {
+    "quadratic_weighted_kappa": "QWK",
+    "undertriage_rate": "under",
+    "critical_miss_rate": "crit_miss",
+    "overtriage_rate": "over",
+}
 
 
 # ─────────────────────────────────────────
 # Wybór modelu
 # ─────────────────────────────────────────
-def find_latest_run(model_name: str, feature_set: str, include_samples: bool):
+def find_latest_run(
+    model_name: str,
+    feature_set: str,
+    include_samples: bool,
+    runs_dir: Path = RUNS_DIR,
+):
     """Najnowszy run danego modelu (z zapisanym model.joblib) dla zestawu cech."""
-    table = list_runs()
+    table = list_runs(runs_dir)
     candidates: list[str] = []
     if not table.empty:
         table = table[(table["model"] == model_name) & (table["feature_set"] == feature_set)]
@@ -74,27 +92,14 @@ def find_latest_run(model_name: str, feature_set: str, include_samples: bool):
             table = table[table["train_sample"].isna() & table["eval_sample"].isna()]
         candidates = table["run"].tolist()
     for run_name in reversed(candidates):   # list_runs: najnowsze na końcu
-        if (RUNS_DIR / run_name / "model.joblib").exists():
+        if (Path(runs_dir) / run_name / "model.joblib").exists():
             log.info(f"Najnowszy run '{model_name}' ({feature_set}): {run_name}")
-            return load_run(run_name)
+            return load_run(run_name, runs_dir)
     hint = "" if include_samples else " (runy na próbkach pomijane — dodaj --include-samples)"
     raise FileNotFoundError(
         f"Brak runa modelu '{model_name}' z zestawem '{feature_set}' i plikiem model.joblib "
-        f"w {RUNS_DIR}{hint}"
+        f"w {runs_dir}{hint}"
     )
-
-
-def load_model(path: Path, name: str | None = None) -> tuple:
-    """
-    Ładuje artefakt modelu właściwą klasą z MODEL_REGISTRY.
-
-    Returns (model, data_version artefaktu albo None, gdy podano `name` z runa).
-    """
-    data_version = None
-    if name is None:   # artefakt spoza runs/ — nazwa i wersja danych tylko z pliku
-        artifact = joblib.load(path)
-        name, data_version = artifact["name"], artifact.get("data_version")
-    return MODEL_REGISTRY[resolve_model_name(name)].load(path), data_version
 
 
 def _run_for_model_path(path: Path):
@@ -158,6 +163,75 @@ def evaluate_model(model, split: str, sample: int | None) -> tuple[dict, pd.Data
     return metrics, df, proba
 
 
+# ─────────────────────────────────────────
+# Podgrupy: komplet parametrów życiowych, oddziały
+# ─────────────────────────────────────────
+def _rule_metrics(y: np.ndarray, proba: np.ndarray, prefix: str) -> dict:
+    """Metryki obu reguł decyzyjnych bez wydruku; klucze `{prefix}_{reguła}_{metryka}`."""
+    out: dict = {}
+    for rule in DECISION_RULES:
+        key = f"{prefix}_{rule}" if prefix else rule
+        out.update(full_evaluation(y, decide(proba, rule), proba, prefix=key, print_report=False))
+    return out
+
+
+def vitals_complete_mask(df: pd.DataFrame) -> np.ndarray | None:
+    """Maska wierszy z kompletem HR, SBP i RR (None, gdy splitu nie ma kolumny `vitals_complete`)."""
+    if VITALS_COMPLETE_COL not in df.columns:
+        return None
+    return pd.to_numeric(df[VITALS_COMPLETE_COL], errors="coerce").fillna(0).to_numpy() == 1
+
+
+def evaluate_subgroups(
+    df: pd.DataFrame, proba: np.ndarray, split: str
+) -> tuple[dict, dict[str, Any]]:
+    """
+    Metryki w podgrupach.
+
+    Returns
+    -------
+    vc_metrics : dict
+        Metryki na `vitals_complete == 1` z kluczami `{split}_vc_{reguła}_{metryka}`
+        (pusty, gdy brak kolumny albo takich wierszy).
+    info : dict
+        {"vitals_complete": {"n", "n_esi1", "n_incomplete"} | None,
+         "sites": {oddział: {"n", "n_esi1", "metrics": {reguła_metryka: …}}}}
+    """
+    y = df[TARGET_COL].to_numpy()
+    proba = np.asarray(proba, dtype=float)
+    vc_metrics: dict = {}
+    info: dict[str, Any] = {"vitals_complete": None, "sites": {}}
+
+    mask = vitals_complete_mask(df)
+    if mask is None:
+        log.warning(f"Split '{split}' nie ma kolumny '{VITALS_COMPLETE_COL}' — pomijam podgrupę vc "
+                    f"(przygotuj dane ponownie: python scripts/02_preprocess.py)")
+    else:
+        info["vitals_complete"] = {
+            "n": int(mask.sum()),
+            "n_esi1": int((y[mask] == 0).sum()),
+            "n_incomplete": int((~mask).sum()),
+        }
+        if mask.any():
+            vc_metrics = _rule_metrics(y[mask], proba[mask], prefix=f"{split}_vc")
+        log.info(f"Podgrupa vitals_complete == 1: {mask.sum():,} wierszy "
+                 f"(ESI 1: {info['vitals_complete']['n_esi1']:,}), bez kompletu: {(~mask).sum():,}")
+
+    if SITE_COL in df.columns:
+        sites = df[SITE_COL].astype("string")
+        for site in sorted(sites.dropna().unique()):
+            site_mask = (sites == site).fillna(False).to_numpy(dtype=bool)
+            n_esi1 = int((y[site_mask] == 0).sum())
+            info["sites"][str(site)] = {
+                "n": int(site_mask.sum()),
+                "n_esi1": n_esi1,
+                "metrics": _rule_metrics(y[site_mask], proba[site_mask], prefix=""),
+            }
+            if n_esi1 < 30:
+                log.warning(f"Oddział {site}: tylko {n_esi1} wizyt ESI 1 — metryki ESI 1 niestabilne")
+    return vc_metrics, info
+
+
 def make_plots(
     model_name: str,
     split: str,
@@ -166,8 +240,9 @@ def make_plots(
     importances: pd.DataFrame | None,
     out_dir: Path,
     suffix: str = "",
+    vc_mask: np.ndarray | None = None,
 ) -> list[Path]:
-    """Macierze pomyłek (obie reguły), ROC, kalibracja i ważność cech."""
+    """Macierze pomyłek (obie reguły; także podgrupa vc), ROC, kalibracja i ważność cech."""
     paths = []
     for rule in DECISION_RULES:
         paths.append(plot_confusion_matrix(
@@ -175,6 +250,12 @@ def make_plots(
             save_path=out_dir / f"confusion_matrix_{split}_{rule}{suffix}.png",
             title=f"Macierz pomyłek — {model_name} ({split}, reguła {rule})",
         ))
+        if vc_mask is not None and vc_mask.any():
+            paths.append(plot_confusion_matrix(
+                y[vc_mask], decide(proba[vc_mask], rule),
+                save_path=out_dir / f"confusion_matrix_{split}_vc_{rule}{suffix}.png",
+                title=f"Macierz pomyłek — {model_name} ({split}, komplet parametrów, reguła {rule})",
+            ))
     paths.append(plot_roc_curves(
         y, proba,
         save_path=out_dir / f"roc_{split}{suffix}.png",
@@ -204,14 +285,30 @@ def _json_default(obj):
     return str(obj)
 
 
-def _print_summary(metrics: dict, split: str) -> None:
-    print(f"\n{'metryka':28s} {'argmax':>10s} {'koszt':>10s}")
+def _fmt(value: Any) -> str:
+    return f"{value:.4f}" if isinstance(value, float) else "—"
+
+
+def _print_summary(metrics: dict, split: str, subgroups: dict[str, Any] | None = None) -> None:
+    """Tabela: wszystkie wiersze i podgrupa vc (obie reguły) + metryki per oddział."""
+    print(f"\n{'metryka':28s} {'argmax':>10s} {'koszt':>10s} {'vc argmax':>10s} {'vc koszt':>10s}")
     for m in SUMMARY_METRICS:
-        cells = []
-        for rule in DECISION_RULES:
-            v = metrics.get(f"{split}_{rule}_{m}")
-            cells.append(f"{v:.4f}" if isinstance(v, float) else "—")
-        print(f"{m:28s} {cells[0]:>10s} {cells[1]:>10s}")
+        cells = [_fmt(metrics.get(f"{split}_{rule}_{m}")) for rule in DECISION_RULES]
+        cells += [_fmt(metrics.get(f"{split}_vc_{rule}_{m}")) for rule in DECISION_RULES]
+        print(f"{m:28s} " + " ".join(f"{c:>10s}" for c in cells))
+    vc = (subgroups or {}).get("vitals_complete")
+    if vc:
+        print(f"vc = komplet HR/SBP/RR: n={vc['n']:,} (ESI 1: {vc['n_esi1']:,}), "
+              f"bez kompletu: {vc['n_incomplete']:,}")
+
+    sites = (subgroups or {}).get("sites") or {}
+    if sites:
+        columns = [(m, label, rule) for m, label in SITE_SUMMARY_METRICS.items() for rule in DECISION_RULES]
+        header = " ".join(f"{label + ' ' + rule:>16s}" for _, label, rule in columns)
+        print(f"\n{'oddział':8s} {'n':>9s} {'ESI 1':>6s} {header}")
+        for site, row in sites.items():
+            cells = " ".join(f"{_fmt(row['metrics'].get(f'{rule}_{m}')):>16s}" for m, _, rule in columns)
+            print(f"{site:8s} {row['n']:>9,} {row['n_esi1']:>6,} {cells}")
 
 
 def main() -> None:
@@ -254,13 +351,12 @@ def main() -> None:
         model_path = run.path / "model.joblib"
         if not model_path.exists():
             parser.error(f"Run {run.name} nie ma pliku model.joblib (trenowany z --no-save?)")
-        model, _ = load_model(model_path, name=run.model)
-        data_version = run.info.get("data_version")
         label = run.name
     else:
         model_path = Path(args.model)
-        model, data_version = load_model(model_path)
         label = model_path.stem
+    model = load_model(model_path)          # klasa wg nazwy modelu w artefakcie
+    data_version = (run.info.get("data_version") if run is not None else None) or model.data_version
 
     log.info("=" * 60)
     log.info(f"EWALUACJA: {label} — split '{args.split}'")
@@ -275,11 +371,15 @@ def main() -> None:
 
     # 2–3. Predykcje + metryki
     metrics, df, proba = evaluate_model(model, args.split, args.sample)
-    y = df["target"].to_numpy()
+    y = df[TARGET_COL].to_numpy()
     if run is not None:
         _check_saved_predictions(run, args.split, df["row_id"], proba)
 
-    # 4. Wykresy + zapis
+    # 4. Podgrupy: komplet parametrów (populacja TOPSOR) i oddziały
+    vc_metrics, subgroups = evaluate_subgroups(df, proba, args.split)
+    metrics.update(vc_metrics)
+
+    # 5. Wykresy + zapis
     if run is not None:
         out_dir = run.path / "figures"
     else:
@@ -289,7 +389,8 @@ def main() -> None:
 
     if not args.no_plots:
         log.info("Generowanie wykresów…")
-        make_plots(model.name, args.split, y, proba, model.feature_importances(), out_dir, suffix)
+        make_plots(model.name, args.split, y, proba, model.feature_importances(), out_dir, suffix,
+                   vc_mask=vitals_complete_mask(df))
 
     payload = {
         "run": run.name if run is not None else None,
@@ -302,12 +403,13 @@ def main() -> None:
         "data_version": DATA_VERSION,
         "evaluated_at": datetime.now().isoformat(timespec="seconds"),
         "metrics": metrics,
+        "subgroups": subgroups,
     }
     metrics_path = out_dir / f"metrics_{args.split}{suffix}.json"
     metrics_path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
 
     print(f"\n=== {label} — {args.split.upper()} (n={len(df):,}) ===")
-    _print_summary(metrics, args.split)
+    _print_summary(metrics, args.split, subgroups)
 
     log.info("✓ Ewaluacja zakończona!")
     log.info(f"  Wyniki: {out_dir}")

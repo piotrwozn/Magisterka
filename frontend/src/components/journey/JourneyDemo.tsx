@@ -8,28 +8,29 @@ import { ModelComparison } from "@/components/demo/ModelComparison";
 import { ShapWaterfall } from "@/components/demo/ShapWaterfall";
 import { VitalsInput } from "@/components/demo/VitalsInput";
 import { ClinicalNoteInput } from "@/components/demo/ClinicalNoteInput";
-import { MTSCategoryBadge } from "@/components/shared/MTSCategoryBadge";
+import { PatientContextInput } from "@/components/demo/PatientContextInput";
+import { ESILevelBadge } from "@/components/shared/ESILevelBadge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { usePredict } from "@/hooks/usePredict";
-import { MTS_CATEGORIES, type MTSCategoryId } from "@/lib/constants";
+import { ESI_LEVELS, type EsiLevelId } from "@/lib/constants";
 import { EXAMPLE_PATIENTS } from "@/lib/mockData";
 import { useDemoStore } from "@/stores/demoStore";
 
 export function JourneyDemo() {
   const { t, i18n } = useTranslation("sections");
   const lang = (i18n.resolvedLanguage ?? "pl").slice(0, 2) as "pl" | "en";
-  const { vitals, clinicalNote, result, setResult, reset, loadExample } = useDemoStore();
+  const { vitals, clinicalNote, context, result, setResult, reset, loadExample } = useDemoStore();
   const { mutate, isPending } = usePredict();
 
-  const handleSubmit = () => mutate({ vitals, clinicalNote }, { onSuccess: setResult });
+  const handleSubmit = () => mutate({ vitals, clinicalNote, ...context }, { onSuccess: setResult });
   const handleRandom = () => {
     const ex = EXAMPLE_PATIENTS[Math.floor(Math.random() * EXAMPLE_PATIENTS.length)]!;
     loadExample({ ...ex.vitals }, ex.clinicalNote);
   };
 
-  const cat = result ? MTS_CATEGORIES[result.finalCategory as MTSCategoryId] : null;
+  const cat = result ? ESI_LEVELS[result.finalCategory as EsiLevelId] : null;
 
   return (
     <div className="grid gap-4 lg:grid-cols-[1fr_1fr]">
@@ -39,6 +40,11 @@ export function JourneyDemo() {
           {t("demo.form.vitalsTitle")}
         </h4>
         <VitalsInput />
+
+        <h4 className="mb-2 mt-4 text-xs font-bold uppercase tracking-[0.2em] text-primary">
+          {t("demo.form.contextTitle")}
+        </h4>
+        <PatientContextInput />
 
         <h4 className="mb-2 mt-4 text-xs font-bold uppercase tracking-[0.2em] text-primary">
           {t("demo.form.noteTitle")}
@@ -104,7 +110,7 @@ export function JourneyDemo() {
               exit={{ opacity: 0 }}
               className="space-y-3"
             >
-              {/* Kategoria + pewność */}
+              {/* Poziom ESI + pewność */}
               <Card
                 className="bg-card/70 p-5 backdrop-blur-md"
                 style={{ borderColor: `${cat.color}40` }}
@@ -114,7 +120,7 @@ export function JourneyDemo() {
                     <p className="text-[10px] uppercase tracking-wider text-muted-foreground">
                       {t("demo.result.category")}
                     </p>
-                    <MTSCategoryBadge category={cat.id} lang={lang} size="lg" showWait />
+                    <ESILevelBadge category={cat.id} lang={lang} size="lg" showWait />
                     <p className="text-[10px] text-muted-foreground">
                       {t("demo.result.processingTime")}: {result.processingTimeMs}ms
                     </p>

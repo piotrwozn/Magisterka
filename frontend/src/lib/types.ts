@@ -1,6 +1,9 @@
 /**
  * Type definitions shared across frontend.
- * Matches backend API schema.
+ * Matches backend API schema (backend/app/models/schemas.py, camelCase).
+ *
+ * Every `category` is an ESI class index: 0–4 = ESI 1–5
+ * (TOPSOR colours red, orange, yellow, green, blue — display only).
  */
 
 export interface Vitals {
@@ -13,13 +16,24 @@ export interface Vitals {
   o2: number;
 }
 
-export interface PredictRequest {
+export type Sex = "M" | "F";
+export type ArrivalMode = "ambulance" | "self" | "other";
+
+/** Optional patient context (features of the models; omitted = unknown). */
+export interface PatientContext {
+  sex?: Sex;
+  arrivalMode?: ArrivalMode;
+  o2Device?: boolean;
+}
+
+export interface PredictRequest extends PatientContext {
   vitals: Vitals;
   clinicalNote: string;
 }
 
 export interface ModelPrediction {
   modelName: string;
+  /** ESI class index 0–4 (= ESI 1–5) */
   category: number;
   probabilities: number[];
   confidence: number;
@@ -47,6 +61,7 @@ export interface ConflictInfo {
 }
 
 export interface PredictResponse {
+  /** ESI class index 0–4 (= ESI 1–5) after the safety rules */
   finalCategory: number;
   confidence: number;
   modelPredictions: ModelPrediction[];

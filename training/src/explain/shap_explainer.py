@@ -39,7 +39,7 @@ from src.utils.config import (
     RANDOM_SEED,
     SHAP_BACKGROUND_SIZE,
     SHAP_TOP_FEATURES,
-    TOPSOR_COLORS,
+    TOPSOR_HEX,
 )
 from src.utils.logger import get_logger
 
@@ -56,14 +56,6 @@ METHOD_OUTPUT_SPACE: dict[str, str] = {
 PERMUTATION_MAX_BACKGROUND: int = 100   # tło metody permutacyjnej (koszt ∝ tło × cechy)
 SKLEARN_TREE_CLASSES = ("RandomForestClassifier", "ExtraTreesClassifier", "DecisionTreeClassifier")
 
-# Kolory TOPSOR (do wykresów; kolejność = config.TOPSOR_COLORS = ESI 1 … ESI 5)
-TOPSOR_HEX: dict[str, str] = {
-    "Red": "#D32F2F",
-    "Orange": "#F57C00",
-    "Yellow": "#FBC02D",
-    "Green": "#388E3C",
-    "Blue": "#1976D2",
-}
 
 
 class ExplainerUnavailable(RuntimeError):
@@ -535,10 +527,10 @@ def shap_summary_plot(
     values = shap_values
     title = "SHAP — wszystkie poziomy ESI"
     extra: dict[str, Any] = {}
-    if class_idx is None and isinstance(shap_values, list) and len(shap_values) == len(TOPSOR_COLORS):
+    if class_idx is None and isinstance(shap_values, list) and len(shap_values) == N_CLASSES:
         # słupki w kolejności ESI 1 → 5 i w kolorach TOPSOR (shap indeksuje kolory pozycją słupka)
         extra["class_inds"] = "original"
-        extra["color"] = lambda i: TOPSOR_HEX[TOPSOR_COLORS[i]]
+        extra["color"] = lambda i: TOPSOR_HEX[CLASS_NAMES[i]]
     if class_idx is not None:
         values = shap_values[class_idx] if isinstance(shap_values, list) else np.asarray(shap_values)[:, class_idx, :]
         title = f"SHAP — {class_names[class_idx]}"

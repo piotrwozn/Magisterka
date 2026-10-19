@@ -6,7 +6,7 @@ w jednym miejscu, by uniknąć rozproszenia "magic numbers".
 
 Etykieta: natywny Emergency Severity Index (ESI 1–5) — ten sam algorytm,
 który polskie SOR-y stosują w systemie TOPSOR (Dz.U. 2021 poz. 1182, § 2 pkt 9).
-Brak jakiegokolwiek mapowania na MTS.
+Etykieta nie jest mapowana na żadną inną skalę triażu.
 """
 
 from __future__ import annotations
@@ -61,6 +61,35 @@ DATA_AUDIT_MD: Path = PROJECT_ROOT / "DATA_AUDIT.md"
 # Wersja logiki przygotowania danych. Zmień, gdy zmieniasz prepare/engineering —
 # trening odmówi użycia splitów przygotowanych starszą wersją.
 DATA_VERSION: str = "esi-v2"
+
+# ─────────────────────────────────────────
+# PATH ENV OVERRIDES (testy end-to-end w katalogu tymczasowym, inne dyski)
+# ─────────────────────────────────────────
+# Czytane RAZ przy imporcie — podprocesy dziedziczą je ze środowiska. Nazwy stałych bez zmian.
+#   SOR_AI_ESI_DATA_DIR → splity ESI, manifest, listy cech (raport z audytu też tam —
+#                         raport innych danych nie nadpisuje wersjonowanego DATA_AUDIT.md),
+#   SOR_AI_RUNS_DIR     → runs/,
+#   SOR_AI_LOGS_DIR     → logs/ (logi treningu, ewaluacji, eksperymentów, badania Optuny).
+def _env_path(var: str) -> Path | None:
+    raw = os.environ.get(var, "").strip()
+    return Path(raw).expanduser().resolve() if raw else None
+
+
+if (_override := _env_path("SOR_AI_ESI_DATA_DIR")) is not None:
+    ESI_DATA_DIR = _override
+    TRAIN_PARQUET = ESI_DATA_DIR / "train.parquet"
+    VAL_PARQUET = ESI_DATA_DIR / "val.parquet"
+    TEST_PARQUET = ESI_DATA_DIR / "test.parquet"
+    FEATURE_SETS_JSON = ESI_DATA_DIR / "feature_sets.json"
+    DATA_MANIFEST_JSON = ESI_DATA_DIR / "manifest.json"
+    DATA_AUDIT_MD = ESI_DATA_DIR / "DATA_AUDIT.md"
+if (_override := _env_path("SOR_AI_RUNS_DIR")) is not None:
+    RUNS_DIR = _override
+if (_override := _env_path("SOR_AI_LOGS_DIR")) is not None:
+    LOGS_DIR = _override
+    TRAINING_LOGS_DIR = LOGS_DIR / "training"
+    EVAL_LOGS_DIR = LOGS_DIR / "evaluation"
+    EXPERIMENTS_DIR = LOGS_DIR / "experiments"
 
 # Utwórz katalogi przy imporcie
 for _dir in [
@@ -130,8 +159,16 @@ TOPSOR_MAX_WAIT_MINUTES: dict[str, int] = {
     "Green": 120,
     "Blue": 240,
 }
-# Alias dla modułów wyjaśnień, które posługują się kolorami
-MTS_MAX_WAIT_MINUTES = TOPSOR_MAX_WAIT_MINUTES
+
+# Odcienie kolorów TOPSOR do wykresów i UI (klucz = nazwa klasy z CLASS_NAMES).
+# Wyłącznie prezentacja — etykietą zawsze jest poziom ESI.
+TOPSOR_HEX: dict[str, str] = {
+    "ESI1": "#D32F2F",   # czerwony
+    "ESI2": "#F57C00",   # pomarańczowy
+    "ESI3": "#FBC02D",   # żółty
+    "ESI4": "#388E3C",   # zielony
+    "ESI5": "#1976D2",   # niebieski
+}
 
 # Klasy wysokiej pilności (do metryk bezpieczeństwa): ESI 1–2
 HIGH_ACUITY_CLASSES: tuple[int, ...] = (0, 1)
@@ -292,15 +329,104 @@ LOGREG_DEFAULT_PARAMS: dict = {
 # ─────────────────────────────────────────
 # OPTUNA — TUNING
 # ─────────────────────────────────────────
-# Domyślne ustawienia dobrane tak, by tuning wszystkich modeli zmieścił się w jedną noc
-# na stacji klasy i9 + RTX 4080 (pełne 400 tys. wierszy × 5 foldów × 100 prób = dni).
-OPTUNA_N_TRIALS: int = 50
-TUNE_CV_FOLDS: int = 3
-TUNE_MAX_ROWS: int | None = 150_000     # próbka TRAIN do tuningu; finalny trening na całości
-# EBM jest wielokrotnie wolniejszy od pozostałych — mniej prób domyślnie
-OPTUNA_N_TRIALS_PER_MODEL: dict[str, int] = {"ebm": 15}
-OPTUNA_TIMEOUT_SECONDS: int | None = None  # bez limitu czasu
+# Budżety tuningu w PROFILACH (03_train.py --profile, run_all.py --profile). Liczba prób i limit
+# czasu dotyczą CAŁEGO badania Optuny: wznowienie po awarii dokańcza tylko brakujące próby i czas.
+# Klucze modelu: n_trials, tune_rows (0 = cały zbiór dopasowania X_fit), n_folds, timeout_s.
+# Klucze profilu: train_sample / eval_sample (None = pełne splity).
+# Szacunki czasu (i9-14900K + RTX 4080 Super, zestaw 'triage', "standard"): ~11–12 h sekwencyjnie,
+# ~7–8 h w dwóch torach (GPU: xgboost → catboost, CPU: reszta); każdy model ma też limit czasu.
+DEFAULT_TUNING_PROFILE: str = "standard"
+TUNE_CV_FOLDS: int = 3                  # foldy CV, gdy tune_model wywołano bez profilu
+
+
+def _budget(n_trials: int, tune_rows: int, n_folds: int, timeout_s: int) -> dict:
+    return {"n_trials": n_trials, "tune_rows": tune_rows, "n_folds": n_folds, "timeout_s": timeout_s}
+
+
+def _uniform_profile(train_sample: int | None, eval_sample: int | None, **budget) -> dict:
+    """Profil testowy: ten sam (mały) budżet dla każdego modelu."""
+    models = ("logreg", "lightgbm", "xgboost", "catboost", "random_forest", "ebm")
+    return {"train_sample": train_sample, "eval_sample": eval_sample,
+            **{m: _budget(**budget) for m in models}}
+
+
+_H = 3600
+TUNING_PROFILES: dict[str, dict] = {
+    # CI / test instalacji: kilka minut na wszystkie modele
+    "smoke": _uniform_profile(6_000, 4_000, n_trials=2, tune_rows=3_000, n_folds=2, timeout_s=120),
+    # Test całego pipeline'u w domu przed nocnym przebiegiem (~20–30 min)
+    "quick": _uniform_profile(60_000, None, n_trials=3, tune_rows=20_000, n_folds=2, timeout_s=300),
+    # Domyślny nocny przebieg. GBDT i logreg strojone na całym X_fit (optimum wielkości liścia
+    # zależy od liczby wierszy); RF i EBM na 150 tys. (ich parametry dobrze się przenoszą).
+    "standard": {
+        "train_sample": None, "eval_sample": None,
+        "logreg": _budget(20, 0, 3, 45 * 60),
+        "lightgbm": _budget(120, 0, 3, 2 * _H),
+        "xgboost": _budget(100, 0, 3, int(3.5 * _H)),
+        "catboost": _budget(60, 0, 3, 4 * _H),
+        "random_forest": _budget(40, 150_000, 3, int(1.5 * _H)),
+        "ebm": _budget(25, 150_000, 3, 4 * _H),
+    },
+    # ≈ 1,7 × próby i czas "standard"; EBM strojony na 250 tys. wierszy
+    "thorough": {
+        "train_sample": None, "eval_sample": None,
+        "logreg": _budget(25, 0, 3, 75 * 60),
+        "lightgbm": _budget(200, 0, 3, int(3.4 * _H)),
+        "xgboost": _budget(170, 0, 3, int(6.0 * _H)),
+        "catboost": _budget(100, 0, 3, int(6.8 * _H)),
+        "random_forest": _budget(70, 150_000, 3, int(2.55 * _H)),
+        "ebm": _budget(40, 250_000, 3, int(6.8 * _H)),
+    },
+}
+
+# Budżet zastępczy, gdy hardware.device_for() zwraca 'cpu' dla biblioteki GPU (brak karty,
+# za stary sterownik, wymuszone SOR_AI_DEVICE_*=cpu). Próba na CPU trwa kilka–kilkanaście razy
+# dłużej, więc mniej wierszy i prób. Profile bez wpisu (smoke, quick) — budżet bez zmian.
+CPU_FALLBACK_BUDGETS: dict[str, dict[str, dict]] = {
+    "standard": {
+        "xgboost": _budget(50, 150_000, 3, 3 * _H),
+        "catboost": _budget(25, 100_000, 3, 4 * _H),
+    },
+    "thorough": {
+        "xgboost": _budget(85, 150_000, 3, int(5.1 * _H)),
+        "catboost": _budget(40, 100_000, 3, int(6.8 * _H)),
+    },
+}
+
+# Wersja przestrzeni hiperparametrów (src/models/tuning.py) — część klucza badania Optuny.
+# PODBIJ przy każdej zmianie zakresów, wyborów albo protokołu foldu danego modelu: stare próby
+# nie zostaną wtedy wymieszane z nowymi (nowe badanie zamiast cichego łączenia).
+SEARCH_SPACE_VERSION: dict[str, int] = {
+    "logreg": 2,
+    "lightgbm": 2,
+    "xgboost": 2,
+    "catboost": 2,
+    "random_forest": 2,
+    "ebm": 2,
+}
+
+# Parametry STAŁE w czasie tuningu (finalny model bierze wartości domyślne z sekcji modeli):
+#   RF: 300 drzew w CV, 500 w finalnym modelu (więcej drzew nie pogarsza log loss),
+#   EBM: 8 worków w CV (3 foldy × 8 = 24 rdzenie), 14 w finalnym; interakcje zawsze 0.
+TUNE_FIXED_PARAMS: dict[str, dict] = {
+    "random_forest": {"n_estimators": 300},
+    "ebm": {"outer_bags": 8, "interactions": 0},
+}
+# Parametry "liczności" skalowane przed finalnym treningiem o sqrt(n_fit / n_fold_train):
+# optimum minimalnej wielkości liścia rośnie ~ √n (pomiar: ×4 danych → ×2 optimum).
+TUNE_SQRT_SCALED_PARAMS: dict[str, list[str]] = {
+    "lightgbm": ["min_child_samples"],
+    "xgboost": ["min_child_weight"],
+}
+# Strażnik rozmiaru RF: próba, której finalny model (500 drzew) miałby > tylu bajtów, jest przerywana
+TUNE_RF_MAX_MODEL_BYTES: float = 1.5e9
+
 OPTUNA_STORAGE_DIR: Path = LOGS_DIR / "optuna"
+OPTUNA_HEARTBEAT_INTERVAL_S: int = 60     # "puls" trwającej próby w bazie SQLite
+OPTUNA_GRACE_PERIOD_S: int = 180          # brak pulsu dłużej → próba FAIL i ponowienie
+OPTUNA_MAX_RETRY: int = 1                 # ile razy ponowić próbę przerwaną awarią procesu
+OPTUNA_MAX_CONSECUTIVE_FAILS: int = 5     # tyle błędów z rzędu → koniec badania
+OPTUNA_PRUNER_STARTUP_TRIALS: int = 5     # MedianPruner: pierwsze próby zawsze do końca
 
 # ─────────────────────────────────────────
 # OLLAMA (LLM medyczny)

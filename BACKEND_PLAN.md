@@ -2,6 +2,10 @@
 
 > Dokument opisuje pełną architekturę backendu dla systemu wspomagania decyzji
 > triażowych. Frontend (`sorai-triage.com`) jest gotowy i oczekuje API opisanego poniżej.
+>
+> **Etykieta:** Emergency Severity Index (ESI 1–5). Każde pole `category` w API to
+> indeks klasy 0–4 = ESI 1–5; kolory TOPSOR (czerwony, pomarańczowy, żółty, zielony,
+> niebieski) służą wyłącznie do wyświetlania. Aktualny stan kodu: `backend/README.md`.
 
 ---
 
@@ -54,8 +58,8 @@ Pielęgniarka SOR
 │  │  1. Walidacja (Pydantic)                             │   │
 │  │  2. Warstwa 0: Llama 3.2 3B → parse clinical note   │   │
 │  │  3. Feature engineering (vitals + cc_* z LLM)       │   │
-│  │  4. Imputation brakujących cech (mediana train set)  │   │
-│  │  5. Warstwa 1A: Ensemble 7 modeli → predykcja + SHAP │   │
+│  │  4. Braki cech zostają NaN (jak w treningu)          │   │
+│  │  5. Warstwa 1A: Ensemble 6 modeli → ESI 1–5 + SHAP   │   │
 │  │  6. Warstwa 1B: MedGemma 27B → reasoning + flags    │   │
 │  │  7. Reguły bezpieczeństwa (hardcoded)                │   │
 │  │  8. Warstwa 2: Qwen3 32B → synteza (jeśli konflikt) │   │
@@ -140,7 +144,8 @@ backend/
 │   ├── catboost_*.joblib
 │   ├── lightgbm_*.joblib
 │   ├── xgboost_*.joblib
-│   └── imputation_medians.json  # Mediany cech z train setu (do imputacji)
+│   ├── imputation_medians.json  # Mediany cech z train setu (diagnostyka, słownik cc_*)
+│   └── ensemble_weights.json    # (opcjonalnie) wagi modeli + reguła decyzyjna
 │
 ├── tests/
 │   ├── test_predict.py
@@ -239,80 +244,54 @@ def map_cc_to_features(parsed: dict) -> dict[str, int]:
 ### Modele do załadowania przy starcie
 
 ```python
-# app/models/registry.py
+# app/models/ensemble.py (TARGET_MODELS w app/models/registry.py)
 
-MODELS_TO_LOAD = [
-    "catboost",     # catboost_*.joblib    — status: trained ✓
-    "lightgbm",     # lightgbm_*.joblib    — status: trained ✓
-    "xgboost",      # xgboost_*.joblib     — status: trained po tuningu ✓
-    "random_forest",    # po wytrenowaniu
-    "extra_trees",      # po wytrenowaniu
-    "hist_gbt",         # po wytrenowaniu
-    "ebm",              # po wytrenowaniu
-    # "stacking",       # meta-learner LogReg — po wytrenowaniu wszystkich
-]
+ENSEMBLE_MODELS = (
+    "xgboost", "lightgbm", "catboost",   # gradient boosting (GPU w treningu)
+    "random_forest",                     # bagging
+    "ebm",                               # glassbox (interpret-core)
+    "logreg",                            # liniowy punkt odniesienia
+)
 ```
+
+Źródła artefaktów (pierwszy poprawny wygrywa): `backend/models/<model>_*.joblib`,
+`models/<model>_*.joblib`, `training/runs/<run>/model.joblib` (pełne dane przed
+próbkami `smoke`/`quick`, ukończone runy z `DONE.json` przed przerwanymi, potem najnowszy).
 
 ### Inference pipeline
 
 ```python
 # app/pipeline/layer1a_ml.py
 
-def predict_ensemble(features_df: pd.DataFrame, registry: ModelRegistry) -> EnsembleResult:
-    predictions = {}
-    probabilities = {}
-
-    for model_name, model_data in registry.loaded_models.items():
-        model       = model_data["model"]
-        feat_names  = model_data["feature_names"]
-
-        # Wyrównaj kolumny — uzupełnij brakujące imputacją
-        X = align_features(features_df, feat_names, registry.imputation_medians)
-
-        proba = model.predict_proba(X)
-        predictions[model_name]  = int(np.argmax(proba[0]))
-        probabilities[model_name] = proba[0].tolist()
-
-    # Stacking (jeśli dostępny meta-learner)
-    if "stacking" in registry.loaded_models:
-        final_category, final_confidence = stacking_predict(probabilities, registry)
-    else:
-        # Fallback: ważona średnia (wg QWK każdego modelu)
-        final_category, final_confidence = weighted_average(probabilities, MODEL_WEIGHTS)
-
-    return EnsembleResult(
-        final_category   = final_category,
-        confidence       = final_confidence,
-        model_predictions = [
-            ModelPrediction(
-                model_name   = name,
-                category     = predictions[name],
-                probabilities = probabilities[name],
-                confidence   = max(probabilities[name]),
-            )
-            for name in predictions
-        ],
-    )
+def run_ensemble(df_row, registry, config=None):
+    config = config or registry.ensemble           # wagi + reguła decyzyjna
+    for model_id in config.active(registry.loaded_ids):   # tylko modele z wagą > 0
+        proba = full_proba(model, X, classes)      # 5 prawdopodobieństw ESI 1..5
+        category = decide(proba, config.rule)      # "argmax" | "cost"
+        weighted_proba += proba * config.weight(model_id)
+    weighted_proba /= total_weight
+    final_category = decide(weighted_proba, config.rule)
 ```
 
-### Wagi modeli (fallback bez stacking)
+### Wagi modeli i reguła decyzyjna
 
-```python
-MODEL_WEIGHTS = {
-    "catboost":     0.8729,   # real QWK test
-    "lightgbm":     0.8705,   # real QWK test
-    "xgboost":      0.876,    # aktualizować po treningu
-    "random_forest":  0.84,   # est.
-    "extra_trees":    0.83,   # est.
-    "hist_gbt":       0.84,   # est.
-    "ebm":            0.81,   # est.
+Domyślnie **równe wagi** wszystkich załadowanych modeli i reguła **argmax** — żadnych
+zaszytych w kodzie metryk z testu. Własne wagi (dobrane na zbiorze WALIDACYJNYM, np.
+`src.ensemble.optimize_weights`) wkleja się do `backend/models/ensemble_weights.json`:
+
+```json
+{
+  "weights": {"xgboost": 0.35, "lightgbm": 0.25, "catboost": 0.40},
+  "rule": "cost"
 }
 ```
 
+Modele spoza `weights` mają wagę 0 (nie są uruchamiane). `"rule": "cost"` = decyzja
+Bayesa z macierzą kosztów z treningu (niedotriażowanie 3× droższe). Błędny plik
+zatrzymuje start backendu z czytelnym komunikatem.
+
 ### Latency
-- 2–3 wytrenowane modele: **~50ms**
-- 7 modeli: **~150ms**
-- 7 modeli + stacking: **~200ms**
+- 6 modeli (CPU): **~100–200ms**
 
 ---
 
@@ -326,22 +305,24 @@ nie zawierają (np. "pacjent blady, spocony, niespokojny").
 
 ```python
 MEDGEMMA_SYSTEM = """
-Jesteś asystentem klinicznym w SOR. Analizujesz notatki triażowe
-i oceniasz pilność przypadku medycznego.
+Jesteś asystentem klinicznym w SOR. Oceniasz pilność według Emergency Severity
+Index (ESI 1 = natychmiastowa interwencja ratująca życie, ESI 2 = sytuacja wysokiego
+ryzyka / strefa zagrożenia, ESI 3–5 = pacjent stabilny, ≥ 2 / 1 / 0 zasobów).
 Zwróć TYLKO JSON z oceną kliniczną.
 """
 
 MEDGEMMA_SCHEMA = {
     "type": "object",
     "properties": {
-        "category":    {"type": "integer", "minimum": 0, "maximum": 4},
+        "esi":         {"type": "integer", "minimum": 1, "maximum": 5},
         "confidence":  {"type": "number",  "minimum": 0, "maximum": 1},
         "reasoning":   {"type": "string",  "maxLength": 400},
         "risk_flags":  {"type": "array",   "items": {"type": "string"}},
         "key_findings":{"type": "array",   "items": {"type": "string"}},
     },
-    "required": ["category", "confidence", "reasoning", "risk_flags", "key_findings"]
+    "required": ["esi", "confidence", "reasoning", "risk_flags", "key_findings"]
 }
+# category (API) = esi − 1
 
 def build_medgemma_prompt(vitals: Vitals, note: str, ml_category: int) -> str:
     return f"""
@@ -351,8 +332,8 @@ Parametry życiowe:
 
 Notatka: {note}
 
-Model ML sugeruje kategorię MTS: {ml_category} ({MTS_NAMES[ml_category]})
-Czy się zgadzasz? Jeśli nie — podaj uzasadnienie i proponowaną kategorię.
+Sugestia ML: {ESI_LABELS_PL[ml_category]}      # np. "ESI 2 · pomarańczowy (do 10 min)"
+Czy się zgadzasz? Jeśli nie — podaj uzasadnienie i proponowany poziom ESI.
 """
 ```
 
@@ -365,8 +346,8 @@ Czy się zgadzasz? Jeśli nie — podaj uzasadnienie i proponowaną kategorię.
 ## 7. Warstwa 2 — Synteza (Qwen3 32B)
 
 ### Kiedy się uruchamia
-**Tylko gdy** wykryto konflikt (różnica ≥ 2 stopnie MTS między modelami
-lub między ML a MedGemma). W przeciwnym razie pomijana → oszczędność latency.
+**Tylko gdy** wykryto konflikt (różnica ≥ 2 poziomy ESI między modelami
+lub między ML a MedGemma). Qwen3 zwraca `recommended_esi` (1–5). W przeciwnym razie pomijana → oszczędność latency.
 
 ```python
 # app/pipeline/layer2_synthesis.py
@@ -402,54 +383,33 @@ def should_run_synthesis(ensemble: EnsembleResult, medgemma: MedGemmaAssessment)
 ## 8. Reguły bezpieczeństwa (hardcoded)
 
 Implementowane **poza LLM** — deterministyczne, niemożliwe do "zahalucynowania".
+Progi ESI są te same co w `training/src/explain/esi_rules.py` (sprawdza to
+`backend/tests/test_safety_rules.py`). Reguły tylko PODNOSZĄ pilność.
+
+| Punkt ESI | Warunek | Skutek |
+|---|---|---|
+| A — natychmiastowa interwencja ratująca życie | SpO2 < 85%, SBP < 80, HR < 40 lub > 150, RR < 8 lub > 35, T < 32 °C lub ≥ 41 °C; skarga: zatrzymanie krążenia, brak reakcji | **ESI 1 (czerwony)** + alert lekarza |
+| B — sytuacja wysokiego ryzyka | SBP < 90, ból ≥ 7/10; skarga: niewydolność oddechowa, alert udarowy, aktywacja zespołu urazowego, myśli samobójcze / zagrożenie dla innych, celowe przedawkowanie | **minimum ESI 2 (pomarańczowy)** |
+| D — strefa zagrożenia (dorośli) | HR > 100, RR > 20, SpO2 < 92% | **minimum ESI 2 (pomarańczowy)** |
 
 ```python
-# app/pipeline/safety_rules.py
+# app/pipeline/safety_rules.py (skrót)
 
-def apply_safety_rules(
-    final_category: int,
-    model_predictions: list[ModelPrediction],
-    medgemma: MedGemmaAssessment,
-    vitals: Vitals,
-) -> SafetyResult:
-
-    alert_doctor = False
-    messages = []
-
-    # Reguła 1: Nigdy nie obniżaj poniżej minimum z modeli
-    min_model_category = min(p.category for p in model_predictions)
-    if final_category > min_model_category:
-        final_category = min_model_category
-        messages.append("Kategoria podniesiona do minimum z modeli.")
-
-    # Reguła 2: Różnica ≥ 2 stopnie → alert lekarski
-    max_diff = max(p.category for p in model_predictions) \
-             - min(p.category for p in model_predictions)
-    if max_diff >= 2:
-        alert_doctor = True
-        messages.append(f"Rozbieżność {max_diff} stopni MTS między modelami.")
-
-    # Reguła 3: Confidence < 0.6 → zawsze flaguj
-    if medgemma.confidence < 0.6:
-        alert_doctor = True
-        messages.append(f"Niska pewność MedGemma ({medgemma.confidence:.2f}).")
-
-    # Reguła 4: Vitale krytyczne → minimum Red/Orange
-    if vitals.sbp < 90 or vitals.o2 < 88 or vitals.hr > 150:
-        if final_category > 1:
-            final_category = 1
-            messages.append("Krytyczne parametry życiowe → kategoria Orange minimum.")
-
-    # Reguła 5: ML mówi Red (0) → zawsze alert
-    if min_model_category == 0:
-        alert_doctor = True
-
-    return SafetyResult(
-        final_category = final_category,
-        alert_doctor   = alert_doctor,
-        messages       = messages,
-    )
+def apply_safety_rules(final_category, confidence, model_predictions, medgemma, vitals,
+                       confidence_threshold=0.6, conflict_threshold=2,
+                       cc_flags=None, pain=None) -> SafetyResult:
+    # Reguła 1: nigdy mniej pilnie niż najpilniejszy model
+    # Reguła 2: rozbieżność ≥ 2 poziomów ESI między modelami → alert lekarza
+    # Reguła 3: niska pewność MedGemma → alert
+    # Reguła 4: reguły ESI (punkty A / B / D) → ESI 1 lub minimum ESI 2
+    #           komunikat np. "Sytuacja wysokiego ryzyka ESI: strefa zagrożenia:
+    #           HR > 100/min → minimum ESI 2 (pomarańczowy)."
+    # Reguła 5: którykolwiek model mówi ESI 1 → alert
+    # Reguła 6: ML vs MedGemma różnią się o ≥ 2 poziomy → alert
 ```
+
+Eskalacje z reguł ESI zawsze trafiają do `conflict.message` (także gdy Warstwa 2
+zwróciła własne podsumowanie).
 
 ---
 
@@ -469,11 +429,18 @@ def apply_safety_rules(
     "rr": 22,
     "o2": 94
   },
-  "clinicalNote": "Pacjent blady, spocony, ból w klatce promieniujący do żuchwy"
+  "clinicalNote": "Pacjent blady, spocony, ból w klatce promieniujący do żuchwy",
+  "sex": "M",
+  "arrivalMode": "ambulance",
+  "o2Device": false
 }
 ```
 
-**Response**:
+`sex` (`"M"` | `"F"`), `arrivalMode` (`"ambulance"` | `"self"` | `"other"`, akceptowane
+też np. `"ZRM"`, `"własny"`) i `o2Device` są opcjonalne — brak = jak w treningu
+(płeć / tlen nieznane = NaN, sposób przybycia = `self`).
+
+**Response** (`category` = indeks 0–4 = ESI 1–5; tu ESI 2):
 ```json
 {
   "finalCategory": 1,
@@ -746,10 +713,10 @@ server {
 [ ] 13. Layer 2 — Qwen3 (warunkowe)
 ```
 
-### Faza 3 — SHAP + stacking (3 dni)
+### Faza 3 — SHAP + wagi ensemble (3 dni)
 ```
 [ ] 14. SHAP explainer per model
-[ ] 15. Stacking meta-learner (po wytrenowaniu wszystkich 7 modeli)
+[ ] 15. Wagi ensemble dobrane na walidacji → backend/models/ensemble_weights.json
 [ ] 16. Aktualizacja model registry
 ```
 
@@ -775,7 +742,7 @@ API_WORKERS=2
 
 # Modele
 MODELS_DIR=/app/models
-FEATURE_SET=triage_only
+FEATURE_SET=triage
 
 # Ollama
 OLLAMA_BASE_URL=http://localhost:11434
@@ -796,7 +763,7 @@ SHAP_TOP_N=5
 SHAP_ENABLED=true
 
 # Safety
-CONFLICT_THRESHOLD=2       # różnica stopni MTS triggering alert
+CONFLICT_THRESHOLD=2       # rozbieżność poziomów ESI między modelami → alert
 CONFIDENCE_THRESHOLD=0.6   # min confidence MedGemma
 ```
 

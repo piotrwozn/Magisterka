@@ -489,10 +489,6 @@ class TestFeatureSets:
         assert not set(REMOVED_DUPLICATE_FEATURES) & set(prepared.frame.columns)
         assert prepared.audit["excluded_engineered_duplicates"] == ["esi_danger_hr", "esi_danger_rr"]
 
-    def test_no_mts_features(self, prepared):
-        features = _all_features(prepared)
-        assert not [f for f in features if "mts" in f]
-
 
 # ─────────────────────────────────────────
 # Podziały

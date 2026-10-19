@@ -2,9 +2,9 @@
 Streamlit demo SOR-AI — triaż ESI 1–5 (kolory TOPSOR).
 
 Interaktywne UI:
-    1. Formularz pacjenta w schemacie kanonicznym: wiek, płeć, sposób przybycia,
-       parametry życiowe (temperatura w °C, tlenoterapia), skargi główne z listy
-       Yale (cc_*), czas przybycia. Wiersz przechodzi przez
+    1. Formularz pacjenta w schemacie kanonicznym: wiek, płeć, sposób przybycia
+       (ZRM / samodzielnie / inny), parametry życiowe (temperatura w °C, tlenoterapia),
+       skargi główne z listy Yale (cc_*), czas przybycia. Wiersz przechodzi przez
        `src.features.engineering.engineer_features` i jest wyrównywany do cech modelu
        (brakujące → NaN, tak jak w treningu).
     2. Wybór runa z runs/ (domyślnie najnowszy z zapisanym modelem) albo
@@ -43,43 +43,43 @@ try:
 except ImportError:  # helpery działają bez streamlit; main() go wymaga
     st = None
 
-from src.data.yale_schema import ARRIVAL_CATEGORIES, hour_to_bin  # noqa: E402
+from src.data.yale_schema import ARRIVAL_CATEGORIES, TRAUMA_ACTIVATION_COL, hour_to_bin  # noqa: E402
 from src.evaluation.metrics import decide  # noqa: E402
-from src.explain.mts_rules import (  # noqa: E402
+from src.explain.esi_rules import (  # noqa: E402
     check_consistency,
     explain_rule_decision,
     rule_based_triage,
 )
 from src.explain.ollama_medical import OllamaMedicalExplainer  # noqa: E402
 from src.explain.shap_explainer import (  # noqa: E402
-    TOPSOR_HEX,
     ExplainerUnavailable,
     SHAPTriageExplainer,
     load_background,
     shap_waterfall_plot,
 )
 from src.features.engineering import ENGINEERED_FEATURES, VITALS, engineer_features  # noqa: E402
-from src.models import MODEL_REGISTRY, resolve_model_name  # noqa: E402
+from src.models import load_model  # noqa: E402
 from src.models.base import BaseTriageModel  # noqa: E402
 from src.utils.config import (  # noqa: E402
     CLASS_NAMES,
     CLASS_NAMES_PL,
+    DATA_VERSION,
     OLLAMA_DEFAULT_MODEL,
     RUNS_DIR,
     TOPSOR_COLORS,
     TOPSOR_COLORS_PL,
+    TOPSOR_HEX,
     TOPSOR_MAX_WAIT_MINUTES,
 )
 
 # ─────────────────────────────────────────
 # Stałe formularza
 # ─────────────────────────────────────────
+# Klucze = src.data.yale_schema.ARRIVAL_CATEGORIES
 ARRIVAL_LABELS_PL: dict[str, str] = {
     "ambulance": "Zespół ratownictwa medycznego (ZRM)",
-    "self": "Samodzielnie",
-    "police": "Policja",
-    "other": "Inny",
-    "unknown": "Nieznany",
+    "self": "Samodzielnie (pieszo, samochodem, transportem publicznym)",
+    "other": "Inny (np. policja, wózek)",
 }
 
 # (kolumna kanoniczna, etykieta, min, max, domyślnie, krok)
@@ -110,6 +110,7 @@ COMPLAINT_LABELS_PL: dict[str, str] = {
     "cc_alteredmentalstatus": "Zaburzenia świadomości",
     "cc_seizures": "Drgawki",
     "cc_strokealert": "Alert udarowy",
+    TRAUMA_ACTIVATION_COL: "Aktywacja zespołu urazowego",
     "cc_respiratorydistress": "Niewydolność oddechowa",
     "cc_cardiacarrest": "Zatrzymanie krążenia",
     "cc_unresponsive": "Brak reakcji",
@@ -164,14 +165,6 @@ def default_run_index(runs: list[dict[str, Any]]) -> int:
         if not run["is_sample"]:
             return i
     return 0
-
-
-def load_model(path: Path | str) -> BaseTriageModel:
-    """model.joblib → instancja właściwej klasy modelu (z MODEL_REGISTRY)."""
-    import joblib
-
-    name = joblib.load(path)["name"]
-    return MODEL_REGISTRY[resolve_model_name(name)].load(path)
 
 
 def complaint_columns(model_features: list[str] | None = None) -> list[str]:
@@ -252,7 +245,7 @@ def level_info(class_idx: int) -> dict[str, Any]:
         "label_pl": CLASS_NAMES_PL[class_idx],
         "color": color,
         "color_pl": TOPSOR_COLORS_PL[class_idx],
-        "hex": TOPSOR_HEX[color],
+        "hex": TOPSOR_HEX[CLASS_NAMES[class_idx]],
         "max_wait_minutes": TOPSOR_MAX_WAIT_MINUTES[color],
     }
 
@@ -351,7 +344,11 @@ def patient_form(all_complaints: list[str]) -> dict[str, Any]:
         not_measured = st.multiselect(
             "Niezmierzone (brak pomiaru)", [col for col, *_ in VITAL_FIELDS],
             format_func=lambda c: labels[c],
-            help="Brak pomiaru to informacja dla modelu (np. pacjent od razu na sali resuscytacyjnej).",
+            help=(
+                "W TOPSOR pomiar jest obowiązkowy. Brak pomiaru model odczytuje jak w Yale "
+                "(pacjent od razu na sali resuscytacyjnej) — wynik bez parametrów "
+                "jest mniej wiarygodny."
+            ),
         )
         vitals: dict[str, float | None] = {}
         for col, label, lo, hi, default, step in VITAL_FIELDS:
@@ -400,8 +397,8 @@ def main() -> None:
         "reguły ESI, SHAP, lokalny LLM (Ollama)."
     )
     st.caption(
-        "Historia projektu: wcześniejsza wersja przewidywała kategorie Manchester Triage System "
-        "przez mapowanie z ESI. Obecnie etykietą jest natywny ESI — bez mapowania."
+        "Modele trenowane na danych Yale (USA) bez cech specyficznych dla USA (ubezpieczenie, "
+        "rasa, język …). Wynik to sugestia — decyzję podejmuje pielęgniarka triażowa."
     )
 
     # ─── Sidebar — model ───
@@ -434,6 +431,11 @@ def main() -> None:
         st.error("Model nie ma zapisanych nazw cech (`feature_names`). Wytrenuj go ponownie.")
         return
     st.sidebar.caption(f"{model.name} · zestaw cech: {model.feature_set} · {len(model.feature_names)} cech")
+    if model.data_version and model.data_version != DATA_VERSION:
+        st.sidebar.warning(
+            f"Model trenowano na danych '{model.data_version}', bieżąca wersja danych to "
+            f"'{DATA_VERSION}' — cechy mogą się różnić. Przetrenuj model."
+        )
 
     use_ollama = st.sidebar.checkbox("Wyjaśnienie medyczne LLM (Ollama)", value=False)
     ollama_model_name = OLLAMA_DEFAULT_MODEL

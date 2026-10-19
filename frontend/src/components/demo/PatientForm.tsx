@@ -2,6 +2,7 @@ import { Dice5, Loader2, Send } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { ClinicalNoteInput } from "@/components/demo/ClinicalNoteInput";
+import { PatientContextInput } from "@/components/demo/PatientContextInput";
 import { VitalsInput } from "@/components/demo/VitalsInput";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -11,12 +12,12 @@ import { useDemoStore } from "@/stores/demoStore";
 
 export function PatientForm() {
   const { t } = useTranslation("sections");
-  const { vitals, clinicalNote, setResult, reset, loadExample } = useDemoStore();
+  const { vitals, clinicalNote, context, setResult, reset, loadExample } = useDemoStore();
   const { mutate, isPending } = usePredict();
 
   const handleSubmit = () => {
     mutate(
-      { vitals, clinicalNote },
+      { vitals, clinicalNote, ...context },
       {
         onSuccess: (data) => setResult(data),
       },
@@ -36,6 +37,13 @@ export function PatientForm() {
           {t("demo.form.vitalsTitle")}
         </h3>
         <VitalsInput />
+      </Card>
+
+      <Card className="p-5">
+        <h3 className="mb-4 text-sm font-bold uppercase tracking-wider text-primary">
+          {t("demo.form.contextTitle")}
+        </h3>
+        <PatientContextInput />
       </Card>
 
       <Card className="p-5">

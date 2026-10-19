@@ -2,8 +2,9 @@
 Krok 6 (opcjonalny): stratified K-fold cross-validation modelu na zbiorze TRAIN.
 
 Szacuje stabilność modelu (średnia ± odchylenie standardowe metryk po foldach).
-`val` i `test` nie są używane. W każdym foldzie 10% części treningowej idzie
-na early stopping. Metryki dla reguł decyzyjnych argmax i koszt.
+`val` i `test` nie są używane. Foldy stratyfikowane po ESI × oddział (jak podział
+danych). W każdym foldzie 10% części treningowej idzie na early stopping.
+Metryki dla reguł decyzyjnych argmax i koszt.
 
 Zapis:
     results/tables/cv_<model>_<zestaw>[_n<próbka>]_<czas>_per_fold.csv
@@ -34,7 +35,8 @@ from src.data.dataset import (  # noqa: E402
     resolve_feature_set,
     sample_frame,
 )
-from src.evaluation.cross_validation import cross_validate_model  # noqa: E402
+from src.data.prepare import SITE_COL  # noqa: E402
+from src.evaluation.cross_validation import cross_validate_model, make_strata  # noqa: E402
 from src.models import MODEL_ALIASES, MODEL_REGISTRY, get_model, resolve_model_name  # noqa: E402
 from src.utils.config import (  # noqa: E402
     CV_N_SPLITS,
@@ -51,7 +53,8 @@ CONSOLE_METRICS = [
 ]
 
 # Parametry sprzętowe ustawiane w runtime — przy CV z parametrów runa wybiera je bieżąca maszyna
-_HARDWARE_PARAMS = ("device", "task_type", "devices")
+_HARDWARE_PARAMS = ("device", "task_type", "devices", "gpu_ram_part")
+WEIGHT_STRATEGIES = ("none", "balanced", "sqrt_balanced", "custom")
 
 
 def _config_from_run(run_ref: str) -> dict:
@@ -59,15 +62,20 @@ def _config_from_run(run_ref: str) -> dict:
     from src.ensemble import load_run
 
     run = load_run(run_ref)
-    params = {k: v for k, v in (run.info.get("params") or {}).items() if k not in _HARDWARE_PARAMS}
-    class_weights = run.info.get("class_weights")
+    info = run.info
+    params = {k: v for k, v in (info.get("params") or {}).items() if k not in _HARDWARE_PARAMS}
+    class_weights = info.get("class_weights")
+    # `weights_strategy` (nowe runy; 'optuna_qwk' = wagi klas z Optuny) lub `sample_weight_strategy`
+    weights = info.get("weights_strategy") or info.get("sample_weight_strategy")
+    if weights not in WEIGHT_STRATEGIES:
+        weights = None          # wagi klas z runa (class_weights) mają pierwszeństwo
     log.info(f"Parametry z runa: {run.name}")
     return {
         "model": run.model,
-        "feature_set": run.info.get("feature_set", "triage"),
+        "feature_set": info.get("feature_set", "triage"),
         "params": params,
         "class_weights": {int(k): float(v) for k, v in class_weights.items()} if class_weights else None,
-        "weights": run.info.get("sample_weight_strategy"),
+        "weights": weights,
     }
 
 
@@ -90,7 +98,7 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=CV_N_SPLITS, help="Liczba foldów")
     parser.add_argument(
         "--weights", default=None,
-        choices=["none", "balanced", "sqrt_balanced", "custom"],
+        choices=list(WEIGHT_STRATEGIES),
         help=f"Wagi klas (domyślnie: {DEFAULT_SAMPLE_WEIGHT_STRATEGY} albo strategia runa)",
     )
     parser.add_argument("--sample", type=int, default=None,
@@ -120,6 +128,9 @@ def main() -> None:
     X, y = get_xy(df_train, feature_set)
     log.info(f"TRAIN: {X.shape[0]:,} × {X.shape[1]}"
              + (f" (próbka {args.sample:,} — tylko do testów)" if args.sample else ""))
+    # Warstwy foldów: ESI × oddział (gdy kolumna oddziału jest w splicie)
+    site = df_train[SITE_COL] if SITE_COL in df_train.columns else None
+    strata = make_strata(y, site, n_splits=args.k)
 
     # 2. Factory dla modelu
     def model_factory():
@@ -140,6 +151,7 @@ def main() -> None:
         feature_set=feature_set,
         save_path=save_path,
         model_name=model_name,
+        strata=strata,
     )
 
     # 4. Podsumowanie na konsoli

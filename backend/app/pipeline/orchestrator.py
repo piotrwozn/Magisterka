@@ -1,4 +1,7 @@
-"""Main orchestrator — ties all layers together for a single /predict call."""
+"""Main orchestrator — ties all layers together for a single /predict call.
+
+Categories are ESI class indexes (0–4 = ESI 1–5).
+"""
 from __future__ import annotations
 
 import logging
@@ -19,6 +22,16 @@ from app.pipeline.feature_engineering import align_features, build_feature_row
 from app.pipeline.safety_rules import apply_safety_rules
 
 log = logging.getLogger(__name__)
+
+# SHAP (TreeExplainer) works for these models; EBM and logreg are skipped.
+# Tie-break order when weights are equal: fastest explainers first.
+SHAP_MODELS: tuple[str, ...] = ("lightgbm", "xgboost", "catboost", "random_forest")
+
+
+def shap_candidates(model_ids: list[str], weights: dict[str, float]) -> list[str]:
+    """Tree models in `model_ids` ordered by ensemble weight (desc), then SHAP_MODELS order."""
+    candidates = [m for m in SHAP_MODELS if m in model_ids]
+    return sorted(candidates, key=lambda m: -weights.get(m, 0.0))
 
 
 def _build_ollama() -> OllamaClient | None:
@@ -46,7 +59,10 @@ async def predict(request: PredictRequest, registry: ModelRegistry) -> PredictRe
 
     # ── Build feature row ───────────────────────────────────────────
     all_cc = [k for k in registry.medians.keys() if k.startswith("cc_")]
-    df_row = build_feature_row(request.vitals, cc_features, extra, all_cc_columns=all_cc)
+    df_row = build_feature_row(
+        request.vitals, cc_features, extra, all_cc_columns=all_cc,
+        is_male=request.sex, arrival_mode=request.arrival_mode, o2_device=request.o2_device,
+    )
 
     # ── Layer 1A: ensemble ML inference ─────────────────────────────
     final_category, final_confidence, model_predictions = layer1a_ml.run_ensemble(df_row, registry)
@@ -68,7 +84,7 @@ async def predict(request: PredictRequest, registry: ModelRegistry) -> PredictRe
         client=ollama,
         model=settings.ollama_synthesis_model,
     )
-    # If synthesis suggests a more urgent category, honour it (safer)
+    # If synthesis suggests a more urgent ESI level, honour it (safer)
     if synthesis is not None and synthesis.recommended_category < final_category:
         final_category = synthesis.recommended_category
 
@@ -81,30 +97,37 @@ async def predict(request: PredictRequest, registry: ModelRegistry) -> PredictRe
         vitals=request.vitals,
         confidence_threshold=settings.confidence_threshold,
         conflict_threshold=settings.conflict_threshold,
+        cc_flags=cc_features,
+        pain=extra.get("triage_pain"),
     )
 
-    # Layer 2 message overrides safety message when present
-    conflict_message = synthesis.summary if synthesis is not None else safety.message
+    # Layer 2 summary replaces the safety message when present; ESI-rule
+    # escalations are always kept (the clinician must see why the level went up)
+    if synthesis is not None:
+        conflict_message = " ".join([synthesis.summary, *safety.escalations])
+    else:
+        conflict_message = safety.message
 
-    # ── SHAP (best loaded model) ────────────────────────────────────
+    # ── SHAP (highest-weight tree model; next one if it fails) ──────
     shap_top: list[ShapValue] = []
     if settings.shap_enabled:
-        best_id = max(
-            (p.model_name for p in model_predictions),
-            key=lambda m: layer1a_ml.MODEL_WEIGHTS.get(m, 0.0),
-            default=None,
-        )
-        if best_id and best_id in registry.models:
-            bundle = registry.models[best_id]
+        predicted = [p.model_name for p in model_predictions]
+        for model_id in shap_candidates(predicted, registry.ensemble.weights):
+            bundle = registry.models[model_id]
+            classes = list(bundle.get("classes") or range(5))
+            if safety.final_category not in classes:   # class absent in this model's training
+                continue
             X_aligned = align_features(df_row.copy(), bundle["feature_names"], registry.medians)
             shap_dicts = top_n_shap(
-                model_id=best_id,
+                model_id=model_id,
                 model=bundle["model"],
                 X=X_aligned,
-                predicted_class=safety.final_category,
+                predicted_class=classes.index(safety.final_category),   # SHAP output column
                 top_n=settings.shap_top_n,
             )
-            shap_top = [ShapValue(**s) for s in shap_dicts]
+            if shap_dicts:
+                shap_top = [ShapValue(**s) for s in shap_dicts]
+                break
 
     duration_ms = int((time.perf_counter() - t_start) * 1000)
     log.info(

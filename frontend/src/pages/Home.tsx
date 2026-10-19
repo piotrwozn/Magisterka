@@ -10,6 +10,8 @@ import { JourneyResults } from "@/components/journey/JourneyResults";
 import { JourneyTechStack } from "@/components/journey/JourneyTechStack";
 import { JourneyTimeline } from "@/components/journey/JourneyTimeline";
 import { CinematicJourney, type JourneyChapter } from "@/components/sections/CinematicJourney";
+import { MODELS, RESULTS } from "@/lib/constants";
+import { formatMetric } from "@/lib/utils";
 
 function buildChapters(lang: "pl" | "en"): JourneyChapter[] {
   const isPl = lang === "pl";
@@ -46,14 +48,14 @@ function buildChapters(lang: "pl" | "en"): JourneyChapter[] {
           stat: { value: "90s", label: isPl ? "na pacjenta" : "per patient" },
         },
         {
-          eyebrow: isPl ? "Manchester Triage System" : "Manchester Triage System",
-          title: isPl ? "Pięć klas pilności. Jedna decyzja." : "Five urgency classes. One verdict.",
+          eyebrow: "Emergency Severity Index",
+          title: isPl ? "Pięć poziomów ESI. Jedna decyzja." : "Five ESI levels. One verdict.",
           body: isPl
-            ? "Czerwony, Pomarańczowy, Żółty, Zielony, Niebieski. Rozkład klas 36× niesymetryczny (Red 68,6% vs Blue 1,9%). Zaniżenie pilności kosztuje 3× więcej niż jej zawyżenie."
-            : "Red, Orange, Yellow, Green, Blue. 36× class imbalance (Red 68.6% vs Blue 1.9%). Undertriage carries 3× the clinical cost of overtriage.",
+            ? "ESI 1–5, w TOPSOR wyświetlane jako czerwony, pomarańczowy, żółty, zielony i niebieski (maks. 0 / 10 / 60 / 120 / 240 min). ESI 1 to tylko 0,9% wizyt — 47× rzadziej niż ESI 3. Zaniżenie pilności kosztuje 3× więcej niż jej zawyżenie."
+            : "ESI 1–5, shown in TOPSOR as red, orange, yellow, green and blue (max 0 / 10 / 60 / 120 / 240 min). ESI 1 is only 0.9% of visits — 47× rarer than ESI 3. Undertriage carries 3× the clinical cost of overtriage.",
           side: "right",
           shape: "starburst",
-          stat: { value: "36×", label: "imbalance" },
+          stat: { value: "0.9%", label: "ESI 1" },
         },
       ],
     },
@@ -65,11 +67,11 @@ function buildChapters(lang: "pl" | "en"): JourneyChapter[] {
         {
           eyebrow: "Yale EMMLC",
           title: isPl
-            ? "558 029 wizyt SOR. 1090 cech klinicznych."
-            : "558,029 ED visits. 1090 clinical features.",
+            ? "558 027 wizyt SOR. Tylko dane z triażu."
+            : "558,027 ED visits. Triage data only.",
           body: isPl
-            ? "Anonimizowany dataset z Yale-New Haven Hospital. Średni wiek 50 lat, 55% kobiet. Vitalne parametry, 200 typów chief complaint, choroby współistniejące, leki, notatki triażowe."
-            : "Anonymized dataset from Yale-New Haven Hospital. Mean age 50, 55% female. Vitals, 200 chief-complaint categories, comorbidities, medications, triage notes.",
+            ? "Anonimizowany zbiór z Yale-New Haven Health (3 oddziały). Model widzi to, co pielęgniarka w chwili triażu i co jest dostępne w każdym SOR: parametry życiowe, wiek, płeć, sposób przybycia, 199 kategorii skarg głównych — bez cech typowo amerykańskich (np. ubezpieczenia)."
+            : "Anonymized dataset from Yale-New Haven Health (3 sites). The model sees what the nurse knows at triage and what any ED has: vital signs, age, sex, arrival mode, 199 chief-complaint categories — no US-specific features (e.g. insurance).",
           side: "left",
           shape: "lattice2D",
           stat: { value: "558k", label: isPl ? "wizyt" : "visits" },
@@ -99,13 +101,13 @@ function buildChapters(lang: "pl" | "en"): JourneyChapter[] {
         },
         {
           eyebrow: isPl ? "Layer 1A · ML" : "Layer 1A · ML",
-          title: isPl ? "Ensemble siedmiu modeli" : "Ensemble of seven models",
+          title: isPl ? "Ensemble sześciu modeli" : "Ensemble of six models",
           body: isPl
-            ? "CatBoost, XGBoost, LightGBM, RF, ExtraTrees, HistGBT, EBM. Stacking z meta-learnerem LogReg. SHAP top-5 cech dla każdej predykcji."
-            : "CatBoost, XGBoost, LightGBM, RF, ExtraTrees, HistGBT, EBM. LogReg stacking. SHAP top-5 features per prediction.",
+            ? "XGBoost, LightGBM, CatBoost, Random Forest, EBM, LogReg. Ważona średnia prawdopodobieństw ESI 1–5 z wagami dobranymi na walidacji. SHAP top-5 cech dla każdej predykcji."
+            : "XGBoost, LightGBM, CatBoost, Random Forest, EBM, LogReg. Weighted average of ESI 1–5 probabilities, weights chosen on validation. SHAP top-5 features per prediction.",
           side: "left",
           shape: "constellation",
-          stat: { value: "7", label: isPl ? "modeli" : "models" },
+          stat: { value: String(MODELS.length), label: isPl ? "modeli" : "models" },
         },
         {
           eyebrow: isPl ? "Layer 1B · NLP" : "Layer 1B · NLP",
@@ -121,8 +123,8 @@ function buildChapters(lang: "pl" | "en"): JourneyChapter[] {
           eyebrow: isPl ? "Layer 2 · Synteza" : "Layer 2 · Synthesis",
           title: isPl ? "Qwen3 rozstrzyga konflikt" : "Qwen3 resolves conflict",
           body: isPl
-            ? "Łączy wynik tabelaryczny z oceną kliniczną. Zasada nadrzędna: eskaluj, nigdy nie obniżaj. Różnica ≥ 2 stopnie → alert lekarski."
-            : "Combines tabular and clinical scores. Master rule: escalate, never downgrade. Gap ≥ 2 grades → doctor alert.",
+            ? "Łączy wynik tabelaryczny z oceną kliniczną. Zasada nadrzędna: eskaluj, nigdy nie obniżaj. Różnica ≥ 2 poziomów ESI → alert lekarski."
+            : "Combines tabular and clinical scores. Master rule: escalate, never downgrade. Gap ≥ 2 ESI levels → doctor alert.",
           side: "left",
           shape: "pyramid",
           stat: { value: "Δ≥2", label: "alert" },
@@ -150,14 +152,14 @@ function buildChapters(lang: "pl" | "en"): JourneyChapter[] {
         {
           eyebrow: "Optuna",
           title: isPl
-            ? "MultivariateTPE · 5-fold CV · 150 trials"
-            : "MultivariateTPE · 5-fold CV · 150 trials",
+            ? "MultivariateTPE · k-fold CV · wznawianie"
+            : "MultivariateTPE · k-fold CV · resumable",
           body: isPl
-            ? "Stały seed dla fair comparison. Wagi klas jako hiperparametry. n_startup_trials=50 eksploracji. SQLite storage do wznowienia."
-            : "Fixed seed for fair comparison. Class weights as hyperparameters. 50 startup trials. SQLite for resume.",
+            ? "Jedno polecenie trenuje wszystkie modele: GPU tam, gdzie pomaga (XGBoost, CatBoost), CPU z ostrzeżeniem, gdy GPU zawiedzie. Budżety prób i czasu wg profilu, SQLite storage — wznowienie po awarii lub restarcie."
+            : "One command trains every model: GPU where it helps (XGBoost, CatBoost), CPU with a warning when the GPU fails. Trial and time budgets per profile, SQLite storage — resume after a crash or reboot.",
           side: "right",
           shape: "torus",
-          stat: { value: "150", label: isPl ? "trials/model" : "trials/model" },
+          stat: { value: "GPU", label: isPl ? "+ CPU fallback" : "+ CPU fallback" },
         },
       ],
     },
@@ -168,13 +170,15 @@ function buildChapters(lang: "pl" | "en"): JourneyChapter[] {
       stages: [
         {
           eyebrow: isPl ? "Holdout test set" : "Holdout test set",
-          title: isPl ? "QWK 0,8718. Critical miss 0,06%." : "QWK 0.8718. Critical miss 0.06%.",
+          title: RESULTS
+            ? `QWK ${formatMetric(RESULTS.qwk, 4)}. Critical miss ${formatMetric(RESULTS.criticalMiss, 2, "%")}.`
+            : isPl ? "Wyniki ESI po treningu końcowym." : "ESI results after the final training.",
           body: isPl
-            ? "Quadratic Weighted Kappa — najlepsza metryka dla klasyfikacji ordinalnej. Undertriage 2,7% przy targecie < 2%. Stabilne przez foldy CV."
-            : "Quadratic Weighted Kappa — the right metric for ordinal classification. Undertriage 2.7% against < 2% target. Stable across CV folds.",
+            ? "Quadratic Weighted Kappa — metryka dla klasyfikacji porządkowej. Bezpieczeństwo: undertriage (ESI 1–2 jako ESI 3–5) i critical miss (ESI 1 jako ESI 4–5). Wagi ensembla dobierane na walidacji, raport na teście."
+            : "Quadratic Weighted Kappa — the metric for ordinal classification. Safety: undertriage (ESI 1–2 as ESI 3–5) and critical miss (ESI 1 as ESI 4–5). Ensemble weights chosen on validation, reported on test.",
           side: "left",
           shape: "waveform",
-          stat: { value: "0.8718", label: "QWK" },
+          stat: { value: formatMetric(RESULTS?.qwk, 4), label: "QWK" },
         },
         {
           shape: "columns",

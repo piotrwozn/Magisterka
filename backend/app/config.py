@@ -11,7 +11,7 @@ PROJECT_ROOT = BACKEND_ROOT.parent
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=BACKEND_ROOT / ".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=BACKEND_ROOT / ".env", env_file_encoding="utf-8", extra="ignore")
 
     # API
     api_host: str = "0.0.0.0"
@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # Models
     models_dir: Path = BACKEND_ROOT / "models"
-    feature_set: str = "triage_only"
+    feature_set: str = "triage"                     # training feature set of the served models
     project_root: Path = PROJECT_ROOT
 
     # Ollama (Layer 0 / 1B / 2)
@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     shap_top_n: int = 5
 
     # Safety thresholds
-    conflict_threshold: int = 2          # category diff triggering doctor alert
+    conflict_threshold: int = 2          # ESI-level spread between models triggering a doctor alert
     confidence_threshold: float = 0.6    # min MedGemma confidence
 
 

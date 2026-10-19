@@ -87,7 +87,7 @@ def ensure_prepared(strategy: str | None = None) -> None:
 
     strategy=None → strategia podziału z istniejącego manifestu (np. 'site'),
     a bez manifestu 'random'. Przy `SOR_AI_NO_AUTO_PREPARE=1` zamiast przygotowania
-    (≈ 11 GB RAM) zgłasza RuntimeError.
+    (kilka GB RAM, kilka minut) zgłasza RuntimeError.
     """
     reason = _not_prepared_reason()
     if reason is None:
