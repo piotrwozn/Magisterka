@@ -170,7 +170,7 @@ class ExperimentTracker:
         y_val: np.ndarray | pd.Series | None = None,
         X_test: pd.DataFrame | None = None,
         y_test: np.ndarray | pd.Series | None = None,
-        feature_set: str = "triage_only",
+        feature_set: str = "triage",
     ) -> None:
         """Statystyki danych treningowych."""
         info = {

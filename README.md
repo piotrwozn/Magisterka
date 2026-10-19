@@ -1,135 +1,109 @@
-# SOR-AI: System Klasyfikacji Triażu MTS oparty na ML
+# SOR-AI: system wspomagania triażu ESI oparty na ML
 
 > Praca magisterska — wspomaganie decyzji triażowych na Szpitalnym Oddziale Ratunkowym
 
 ## Cel
 
-System klasyfikuje pacjentów do jednej z 5 kategorii Manchester Triage System (Red/Orange/Yellow/Green/Blue) na podstawie danych dostępnych w momencie triażu (vital signs, główna skarga, demografia, historia medyczna). Dla każdej decyzji generowane są **dwie warstwy wyjaśnień**:
+System przypisuje pacjenta do jednego z 5 poziomów **Emergency Severity Index (ESI)**. To ten sam
+algorytm, którym segregują pacjentów polskie SOR-y w systemie TOPSOR (Dz.U. 2021 poz. 1182,
+§ 2 pkt 9), z kolorami TOPSOR:
 
-1. **Model-level (SHAP/LIME/DiCE)** — które cechy popchnęły model w stronę tej kategorii?
+| ESI | kolor | czas do lekarza |
+|---|---|---|
+| 1 | czerwony | natychmiast |
+| 2 | pomarańczowy | do 10 min |
+| 3 | żółty | do 60 min |
+| 4 | zielony | do 120 min |
+| 5 | niebieski | do 240 min |
+
+Model uczy się na danych dostępnych w momencie triażu: parametry życiowe, skarga główna, wiek,
+sposób przybycia (opcjonalnie także historia pacjenta). Każdą decyzję wyjaśniają dwie warstwy:
+
+1. **Model-level (SHAP/LIME/DiCE)** — które cechy popchnęły model w stronę tego poziomu?
 2. **Medical-level (lokalny LLM przez Ollama)** — dlaczego medycznie ta klasyfikacja ma sens?
 
 ## Architektura
 
 ```
-INPUT PACJENTA → [Structured branch (XGBoost)] + [Text branch (BERT, opcjonalnie)]
-              → [Late fusion (stacking/MLP)]
-              → PREDYKCJA MTS 1-5
-              → [SHAP] + [Ollama medical reasoning] + [MTS rule engine]
+INPUT PACJENTA → [modele tabelaryczne: XGBoost, LightGBM, CatBoost, RF, EBM, LogReg]
+              + [warstwa tekstowa: notatka pielęgniarki (LLM, opcjonalnie)]
+              → ręcznie dobrane połączenie modeli (na zbiorze walidacyjnym)
+              → POZIOM ESI 1–5 (reguła argmax albo minimalnego kosztu niedotriażowania)
+              → [SHAP] + [Ollama medical reasoning] + [kontrola parametrów życiowych]
 ```
 
-Pełna analiza techniczna: [`TECHNICAL_ANALYSIS.md`](TECHNICAL_ANALYSIS.md).
+Pełna analiza techniczna: [`training/SOR_AI_Technical_Analysis.md`](training/SOR_AI_Technical_Analysis.md).
 
 ## Stack
 
 | Warstwa | Technologie |
 |---------|-------------|
-| ML | scikit-learn, XGBoost, LightGBM, EBM (interpret) |
-| DL | PyTorch + HuggingFace Transformers (HerBERT/BioClinBERT) |
+| ML | scikit-learn, XGBoost, LightGBM, CatBoost, EBM (interpret), Optuna |
 | XAI | shap, lime, dice-ml |
-| LLM | Ollama (Mistral / Llama3 / MedLlama2) |
-| UI | Streamlit (demo), FastAPI (backend) |
-| Tracking | MLflow |
+| LLM | Ollama (lokalnie) |
+| UI | Streamlit (demo), React (frontend), FastAPI + Spring Boot (backend) |
+| Tracking | JSON + logi per run, opcjonalnie MLflow |
 
 ## Dataset
 
-**Yale EMMLC** (admissionprediction) — 560 486 wizyt × 972 zmienne, ESI 1–5 jako proxy dla MTS po wzbogaceniu o dyskryminatory parametrów życiowych (Strategia 2 z TECHNICAL_ANALYSIS.md §6).
+**Yale EMMLC** ([admissionprediction](https://github.com/yaleemmlc/admissionprediction)):
+560 486 wizyt × 972 zmienne, 3 oddziały w USA, natywne ESI 1–5.
 
-- Plik: `data/raw/5v_cleandf.rdata`
-- Konwersja: `python scripts/01_convert_rdata.py`
+Przygotowanie danych usuwa elementy typowe dla USA i błędy poprzedniej wersji pipeline'u:
+- temperatura °F → °C,
+- brak rasy, wyznania i ubezpieczenia wśród cech,
+- jawne kodowanie kategorii,
+- braki zostają jako NaN zamiast mediany,
+- brak przecieku przez `disposition`.
 
-## Instalacja
+Szczegóły i liczby: [`training/DATA_AUDIT.md`](training/DATA_AUDIT.md).
+
+## Trening
 
 ```bash
-# 1. Środowisko wirtualne
-python -m venv .venv
-source .venv/bin/activate    # Linux/Mac
-# .venv\Scripts\activate     # Windows
-
-# 2. Zależności
+cd training
 pip install -r requirements.txt
-
-# 3. (Opcjonalnie) Ollama dla wyjaśnień medycznych
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull mistral
+python scripts/02_preprocess.py          # dane → splity ESI + raport z audytu
+python scripts/03_train.py --model all   # 6 modeli → runs/ + runs/leaderboard.csv
+python scripts/07_compare_runs.py        # porównanie + materiał do ręcznego łączenia
 ```
 
-## Uruchomienie
-
-```bash
-# Krok 1 — konwersja .RData → .parquet
-python scripts/01_convert_rdata.py
-
-# Krok 2 — preprocessing + ESI→MTS mapping + zapis splitów
-python scripts/02_preprocess.py
-
-# Krok 3 — trening modeli
-python scripts/03_train.py --model xgboost --tune
-
-# Krok 4 — ewaluacja na test set
-python scripts/04_evaluate.py --model xgboost
-
-# Krok 5 — demo aplikacji
-streamlit run app/streamlit_app.py
-```
+Pełna instrukcja (modele, tuning, metryki, łączenie modeli, czasy):
+[`training/README.md`](training/README.md).
 
 ## Struktura projektu
 
 ```
-sor-ai-triage/
-├── training/              # ML training — kod, dane, eksperymenty
-│   ├── src/               # modele, tuning, ewaluacja, explainability
-│   │   ├── data/          # ładowanie, preprocessing, ESI→MTS, splity
-│   │   ├── models/        # XGBoost, LightGBM, RF, EBM, fusion + tuning + train pipeline
-│   │   ├── evaluation/    # metryki, CV, wizualizacje
-│   │   ├── explain/       # SHAP, LIME, DiCE, MTS rules, Ollama
-│   │   └── utils/         # config, logger, experiment_tracker
-│   ├── scripts/           # CLI: 01_convert → 06_cross_validate
-│   ├── notebooks/         # EDA, training, explainability
-│   ├── app/               # Streamlit demo
-│   ├── tests/             # testy jednostkowe ML (66+ testów)
-│   ├── data/              # dane surowe i przetworzone
-│   └── logs/              # logi treningu + JSON-y eksperymentów
-├── backend/               # system produkcyjny (FastAPI + Spring Boot + Kafka)
-│   ├── app/               # FastAPI ML inference service
-│   ├── gateway/           # Spring Boot API gateway (Java 21)
-│   ├── tests/             # testy backendu (79 testów, 85% coverage)
-│   └── docker-compose.yml
-├── frontend/              # React 18 + TypeScript + Tailwind + three.js
-│   └── src/               # 93 pliki — journey, demo, i18n PL/EN
-├── models/                # wytrenowane .joblib (wspólne dla training/ i backend/)
-├── results/               # figury, tabele, raporty do pracy magisterskiej
+Magisterka/
+├── training/              # trening modeli ESI
+│   ├── src/
+│   │   ├── data/          # schemat Yale, przygotowanie danych, splity, dostęp do danych
+│   │   ├── features/      # cechy kliniczne (°C, NEWS2, strefa zagrożenia ESI, braki)
+│   │   ├── models/        # 6 modeli + trening + tuning Optuną
+│   │   ├── ensemble/      # narzędzia do ręcznego łączenia modeli
+│   │   ├── evaluation/    # metryki, CV, wykresy, niepewność
+│   │   ├── explain/       # SHAP, LIME, DiCE, kontrola parametrów, Ollama
+│   │   └── utils/         # konfiguracja, logowanie, wykrywanie GPU
+│   ├── scripts/           # 01_convert → 07_compare_runs
+│   ├── tests/
+│   ├── app/               # demo Streamlit
+│   ├── DATA_AUDIT.md      # raport z audytu danych (generowany)
+│   └── runs/              # wyniki treningów (lokalnie, poza gitem)
+├── backend/               # FastAPI (inferencja) + Spring Boot (gateway) + Kafka
+└── frontend/              # React 18 + TypeScript
 ```
-
-## Logowanie i tracking eksperymentów
-
-**Każdy** run treningu automatycznie generuje:
-
-1. **Plik tekstowy** `logs/training/<model>/<run_id>.log` — pełna historia z konsoli
-   (params, per-iteration metrics, czas treningu, top features).
-2. **JSON eksperymentu** `logs/experiments/<model>_<run_id>.json` — strukturalne metadane:
-   - `params` — wszystkie hiperparametry
-   - `data` — info o splitach (n_train, n_val, class_distribution)
-   - `training_history` — `mlogloss`/`merror` co iterację
-   - `metrics` — końcowe QWK, AUC, undertriage, etc.
-   - `feature_importances` — top 30 cech
-   - `environment` — git_commit, python_version, hostname (reprodukowalność)
-   - `artifacts` — ścieżki do modelu, logu, configu
-
-Szczegóły: [`logs/README.md`](logs/README.md).
-
-Opcjonalnie: trening z `--mlflow` dodatkowo loguje do MLflow (`mlflow ui`).
 
 ## Kluczowe metryki
 
 | Metryka | Po co? |
 |---------|--------|
-| **Quadratic Weighted Kappa** | główna metryka — dystans ordinalny ma znaczenie |
-| **Per-class AUC-ROC** | szczególnie dla Red i Orange (rzadkie, krytyczne) |
-| **Undertriage rate** | **bezpieczeństwo** — pacjent Red błędnie zaklasyfikowany jako Yellow |
-| **Overtriage rate** | efektywność oddziału |
-| **5×5 confusion matrix** | wizualizacja błędów ordinalnych |
+| **Quadratic Weighted Kappa** | główna metryka — odległość między poziomami ma znaczenie |
+| **Undertriage rate** | bezpieczeństwo — ESI 1–2 zaklasyfikowane jako ESI 3–5 |
+| **Critical miss rate** | ESI 1 zaklasyfikowane jako ESI 4–5 |
+| **Mistriage (under/over)** | błąd o dowolny poziom (standard w literaturze ESI) |
+| **AUC, log loss, Brier** | jakość prawdopodobieństw (ważne przy łączeniu modeli) |
+| **Expected cost** | średni koszt decyzji (niedotriażowanie 3× droższe) |
 
 ## Licencja
 
-MIT (kod). Dataset Yale EMMLC: CC-BY (cytowanie wymagane — patrz §11 w `TECHNICAL_ANALYSIS.md`).
+MIT (kod). Dataset Yale EMMLC: CC-BY (cytowanie wymagane).

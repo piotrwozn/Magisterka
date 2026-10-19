@@ -44,6 +44,22 @@ optuna_studies.db
 *.pt
 *.pth
 
+# ─── Trening (training/) — artefakty generowane lokalnie ───
+# Surowe dane Yale (5v_cleandf.rdata, yale_emmlc_raw.parquet) zostają w repo;
+# splity ESI odtwarza `make prepare`, modele i predykcje `make train-all`.
+training/data/processed/esi/
+training/data/processed/*.parquet
+!training/data/processed/yale_emmlc_raw.parquet
+training/runs/
+training/logs/
+training/mlruns/
+training/models/*
+!training/models/.gitkeep
+training/results/figures/*
+training/results/tables/*
+training/results/reports/*
+!training/results/**/.gitkeep
+
 # ─── Dane (poza listingiem katalogu) ───
 data/raw/*.csv
 data/raw/*.RData

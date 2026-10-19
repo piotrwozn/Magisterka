@@ -1,169 +1,216 @@
 """
-Cross-validation dla modeli triażowych.
+Cross-validation dla modeli triażowych (stratified k-fold na zbiorze TRAIN).
 
-Stratified k-fold (k=10) — zachowuje rozkład klas w każdym foldzie.
-Raportuje średnią ± odchylenie standardowe wszystkich metryk.
+Protokół (bez przecieku danych):
+    - CV działa WYŁĄCZNIE na splicie `train` — `val` i `test` zostają nietknięte.
+    - StratifiedKFold po klasie ESI — każdy fold ma rozkład ESI 1–5 jak całość.
+    - W każdym foldzie z części treningowej wydzielane jest 10% na early stopping
+      (`src.data.dataset.early_stopping_split`); fold walidacyjny służy tylko do oceny.
+    - Metryki dla obu reguł decyzyjnych: argmax i minimalny koszt oczekiwany
+      (klucze `argmax_<metryka>` i `cost_<metryka>`).
+    - Raport: średnia ± odchylenie standardowe po foldach.
 
-UWAGA: Dla preferowanego workflow chronologicznego — stosuj TimeSeriesSplit
-zamiast StratifiedKFold. K-fold jest przydatny gdy chcemy oszacować
-"theoretical upper bound" performance bez efektu temporalnego.
+Brak wariantu czasowego (TimeSeriesSplit): Yale EMMLC nie ma roku ani znacznika
+czasu wizyty — kolejność wierszy nie jest chronologiczna, więc podział "czasowy"
+byłby w rzeczywistości arbitralny i mylący.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Callable
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit
+from sklearn.model_selection import StratifiedKFold
 
-from src.evaluation.metrics import full_evaluation
+from src.data.dataset import early_stopping_split
+from src.evaluation.metrics import decide, full_evaluation
 from src.utils.config import (
     CV_N_SPLITS,
+    DEFAULT_SAMPLE_WEIGHT_STRATEGY,
     EVAL_LOGS_DIR,
     RANDOM_SEED,
-    TABLES_DIR,
 )
 from src.utils.logger import get_logger, get_training_logger
 
 log = get_logger(__name__)
 
+DECISION_RULES = ("argmax", "cost")
 
+# Metryki wypisywane w podsumowaniu (CSV zawiera wszystkie)
+KEY_METRICS = [
+    "quadratic_weighted_kappa", "f1_macro", "auc_macro", "log_loss", "brier",
+    "undertriage_rate", "critical_miss_rate", "overtriage_rate",
+    "mistriage_under", "mistriage_over", "expected_cost",
+]
+
+# Kolumny techniczne — pomijane w podsumowaniu mean ± std
+_META_COLUMNS = ("fold", "n_fit", "n_early_stopping", "n_val")
+
+
+# ─────────────────────────────────────────
+# Cross-validation
+# ─────────────────────────────────────────
 def cross_validate_model(
-    model_factory,
+    model_factory: Callable,
     X: pd.DataFrame,
     y: np.ndarray | pd.Series,
     n_splits: int = CV_N_SPLITS,
-    cv_strategy: str = "stratified",
-    sample_weight_strategy: str = "custom",
+    sample_weight_strategy: str = DEFAULT_SAMPLE_WEIGHT_STRATEGY,
+    feature_set: str = "triage",
     save_path: Path | str | None = None,
     fit_kwargs: dict | None = None,
+    model_name: str | None = None,
 ) -> pd.DataFrame:
     """
-    Cross-validation dla modelu triażowego.
+    Stratified k-fold CV dla modelu triażowego.
 
     Parameters
     ----------
     model_factory : callable
         Funkcja zwracająca świeżą instancję BaseTriageModel
-        (np. lambda: XGBoostTriageModel(params=best_params)).
+        (np. lambda: get_model("lightgbm", params=best_params)).
     X : pd.DataFrame
+        Cechy z TRAIN (np. `get_xy(splits["train"], feature_set)[0]`).
     y : np.ndarray | pd.Series
+        Klasy 0–4 (= ESI 1–5).
     n_splits : int
-        Liczba foldów (domyślnie 10).
-    cv_strategy : str
-        'stratified' | 'temporal' (TimeSeriesSplit).
+        Liczba foldów (domyślnie CV_N_SPLITS).
     sample_weight_strategy : str
+        none | balanced | sqrt_balanced | custom.
+    feature_set : str
+        Nazwa zestawu cech (do logów treningu).
     save_path : Path
-        CSV z wynikami per fold (opcjonalne).
+        Bazowa ścieżka CSV z wynikami (opcjonalne) — zob. `save_cv_results`.
     fit_kwargs : dict
         Dodatkowe argumenty do model.fit().
+    model_name : str, optional
+        Nazwa do logów; domyślnie `model_factory().name`.
 
     Returns
     -------
-    pd.DataFrame z metrykami per fold (każdy wiersz = jeden fold)
+    pd.DataFrame z metrykami per fold (każdy wiersz = jeden fold).
     """
     fit_kwargs = fit_kwargs or {}
+    X = X.reset_index(drop=True)
+    y_series = pd.Series(np.asarray(y), name="target")
+    model_name = model_name or getattr(model_factory(), "name", "model")
 
-    # CV splitter
-    if cv_strategy == "stratified":
-        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
-        split_iter = splitter.split(X, y)
-    elif cv_strategy == "temporal":
-        splitter = TimeSeriesSplit(n_splits=n_splits)
-        split_iter = splitter.split(X)
-    else:
-        raise ValueError(f"Nieznana strategia CV: {cv_strategy}")
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_SEED)
 
-    # Logger CV
+    # Logger CV (logs/evaluation/cv_<model>/<run_id>.log)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     cv_logger, cv_log_path = get_training_logger(
-        model_name=f"cv_{cv_strategy}",
+        model_name=f"cv_{model_name}",
         run_id=run_id,
         log_dir=EVAL_LOGS_DIR,
     )
 
-    cv_logger.info(f"=== Cross-validation ({cv_strategy}, k={n_splits}) ===")
-    cv_logger.info(f"Total samples: {len(X):,}, features: {X.shape[1]}")
+    cv_logger.info(f"=== Cross-validation: {model_name} (stratified, k={n_splits}) ===")
+    cv_logger.info(f"Próbki TRAIN: {len(X):,}, cechy: {X.shape[1]} ({feature_set}), "
+                   f"wagi: {sample_weight_strategy}")
 
     fold_results: list[dict] = []
-    y_array = np.asarray(y)
+    failed: list[int] = []
+    t0 = time.time()
 
-    for fold_idx, (train_idx, val_idx) in enumerate(split_iter):
-        cv_logger.info(f"\n──── Fold {fold_idx + 1} / {n_splits} ────")
-        cv_logger.info(f"  train: {len(train_idx):,}, val: {len(val_idx):,}")
+    for fold_idx, (train_idx, val_idx) in enumerate(splitter.split(X, y_series)):
+        cv_logger.info(f"──── Fold {fold_idx + 1} / {n_splits} ────")
 
-        X_train = X.iloc[train_idx]
-        y_train = y_array[train_idx]
+        X_fit, y_fit, X_es, y_es = early_stopping_split(
+            X.iloc[train_idx], y_series.iloc[train_idx]
+        )
         X_val = X.iloc[val_idx]
-        y_val = y_array[val_idx]
+        y_val = y_series.iloc[val_idx].to_numpy()
+        cv_logger.info(f"  fit: {len(X_fit):,} (+{len(X_es):,} early stopping), ocena: {len(X_val):,}")
 
         # Świeża instancja modelu
         model = model_factory()
-        # Wyłączamy zapisywanie do JSON eksperymentu per fold (zapisujemy zbiorczo)
         try:
             model.fit(
-                X_train, y_train,
-                X_val=X_val, y_val=y_val,
+                X_fit, y_fit,
+                X_val=X_es, y_val=y_es,
                 sample_weight_strategy=sample_weight_strategy,
-                run_id=f"{run_id}_fold{fold_idx}",
+                run_id=f"{run_id}_cv{fold_idx}",
+                feature_set=feature_set,
                 **fit_kwargs,
             )
+            proba = model.predict_proba(X_val)
         except Exception as e:
-            cv_logger.error(f"Fold {fold_idx} błąd treningu: {e}")
+            cv_logger.exception(f"Fold {fold_idx} — błąd treningu/predykcji: {e}")
+            failed.append(fold_idx)
             continue
 
-        # Ewaluacja
-        try:
-            y_pred = model.predict(X_val)
-            y_proba = model.predict_proba(X_val)
-            metrics = full_evaluation(y_val, y_pred, y_proba, print_report=False)
-            metrics["fold"] = fold_idx
-            metrics["n_train"] = len(train_idx)
-            metrics["n_val"] = len(val_idx)
-            metrics["training_duration_s"] = model.training_duration_s
-            fold_results.append(metrics)
+        metrics: dict = {
+            "fold": fold_idx,
+            "n_fit": len(X_fit),
+            "n_early_stopping": len(X_es),
+            "n_val": len(X_val),
+            "training_duration_s": model.training_duration_s,
+        }
+        for rule in DECISION_RULES:
+            metrics.update(full_evaluation(
+                y_val, decide(proba, rule), proba, print_report=False, prefix=rule,
+            ))
+        fold_results.append(metrics)
 
-            cv_logger.info(
-                f"  Fold {fold_idx} → QWK={metrics['quadratic_weighted_kappa']:.4f}, "
-                f"undertriage={metrics['undertriage_rate']:.4f}, "
-                f"AUC_macro={metrics.get('auc_macro', float('nan')):.4f}"
-            )
-        except Exception as e:
-            cv_logger.error(f"Fold {fold_idx} błąd ewaluacji: {e}")
+        cv_logger.info(
+            f"  Fold {fold_idx} → QWK={metrics['argmax_quadratic_weighted_kappa']:.4f} "
+            f"(koszt: {metrics['cost_quadratic_weighted_kappa']:.4f}), "
+            f"undertriage={metrics['argmax_undertriage_rate']:.4f} "
+            f"(koszt: {metrics['cost_undertriage_rate']:.4f}), "
+            f"AUC_macro={metrics.get('argmax_auc_macro', float('nan')):.4f}"
+        )
 
     if not fold_results:
-        raise RuntimeError("Wszystkie foldy się wywaliły — sprawdź log.")
+        raise RuntimeError(f"Wszystkie foldy zakończyły się błędem — sprawdź log: {cv_log_path}")
+    if failed:
+        cv_logger.warning(f"Foldy z błędem (pominięte w średniej): {failed}")
 
     cv_df = pd.DataFrame(fold_results)
 
-    # Spłaszcz confusion_matrix do stringa, by można było zapisać do CSV
-    if "confusion_matrix" in cv_df.columns:
-        cv_df["confusion_matrix"] = cv_df["confusion_matrix"].apply(
-            lambda cm: json.dumps(cm) if isinstance(cm, list) else str(cm)
-        )
+    # Macierze pomyłek → JSON (zapisywalne do CSV)
+    for col in [c for c in cv_df.columns if c.endswith("confusion_matrix")]:
+        cv_df[col] = cv_df[col].apply(lambda cm: json.dumps(cm) if isinstance(cm, list) else str(cm))
 
-    # Statystyki
-    numeric_cols = cv_df.select_dtypes(include=[np.number]).columns.tolist()
-    summary = cv_df[numeric_cols].agg(["mean", "std", "min", "max"]).T
+    summary = summarize_cv(cv_df)
 
-    cv_logger.info("\n══════════════════════════════════════════════")
-    cv_logger.info("  WYNIKI CV (mean ± std)")
     cv_logger.info("══════════════════════════════════════════════")
-    for metric, row in summary.iterrows():
-        if any(metric.startswith(p) for p in ["fold", "n_train", "n_val", "support_"]):
-            continue
-        cv_logger.info(
-            f"  {metric:30s} {row['mean']:.4f} ± {row['std']:.4f}  [{row['min']:.4f}, {row['max']:.4f}]"
-        )
+    cv_logger.info(f"  WYNIKI CV (mean ± std, {len(cv_df)}/{n_splits} foldów)")
+    cv_logger.info("══════════════════════════════════════════════")
+    for rule in DECISION_RULES:
+        cv_logger.info(f"  ─── reguła: {rule} ───")
+        for metric in KEY_METRICS:
+            key = f"{rule}_{metric}"
+            if key not in summary.index:
+                continue
+            row = summary.loc[key]
+            cv_logger.info(
+                f"  {metric:28s} {row['mean']:.4f} ± {row['std']:.4f}  "
+                f"[{row['min']:.4f}, {row['max']:.4f}]"
+            )
+    if "training_duration_s" in summary.index:
+        cv_logger.info(f"  Czas treningu foldu: {summary.loc['training_duration_s', 'mean']:.1f} s (średnio), "
+                       f"całe CV: {time.time() - t0:.1f} s")
+    cv_logger.info(f"Log CV: {cv_log_path}")
 
     if save_path is not None:
         save_cv_results(cv_df, summary, save_path, run_id=run_id)
 
     return cv_df
+
+
+def summarize_cv(cv_df: pd.DataFrame) -> pd.DataFrame:
+    """mean / std / min / max każdej metryki numerycznej po foldach (wiersz = metryka)."""
+    numeric_cols = [
+        c for c in cv_df.select_dtypes(include=[np.number]).columns
+        if c not in _META_COLUMNS and "_support_" not in c
+    ]
+    return cv_df[numeric_cols].agg(["mean", "std", "min", "max"]).T
 
 
 def save_cv_results(
@@ -172,21 +219,21 @@ def save_cv_results(
     save_path: Path | str,
     run_id: str | None = None,
 ) -> dict[str, Path]:
-    """Zapisuje wyniki CV (per fold + summary)."""
+    """Zapisuje wyniki CV: `<save_path>_<run_id>_per_fold.csv` i `..._summary.csv`."""
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     base = save_path.parent / save_path.stem
 
-    paths = {}
-    paths["per_fold"] = Path(f"{base}_{run_id}_per_fold.csv")
-    paths["summary"] = Path(f"{base}_{run_id}_summary.csv")
-
+    paths = {
+        "per_fold": Path(f"{base}_{run_id}_per_fold.csv"),
+        "summary": Path(f"{base}_{run_id}_summary.csv"),
+    }
     cv_df.to_csv(paths["per_fold"], index=False)
-    summary.to_csv(paths["summary"], index=True)
+    summary.to_csv(paths["summary"], index=True, index_label="metric")
 
-    log.info(f"Zapisano CV results:")
+    log.info("Zapisano wyniki CV:")
     log.info(f"  Per fold: {paths['per_fold']}")
     log.info(f"  Summary:  {paths['summary']}")
 

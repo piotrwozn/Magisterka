@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sor-ai-triage"
 version = "0.1.0"
-description = "SOR-AI: System Klasyfikacji Triażu MTS oparty na ML (praca magisterska)"
+description = "SOR-AI: klasyfikacja ESI (TOPSOR) na SOR oparta na ML (praca magisterska)"
 authors = [
     { name = "Piotr (Magisterka)" }
 ]
@@ -14,7 +14,7 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 keywords = [
     "triage", "machine-learning", "explainable-ai",
-    "emergency-department", "mts", "esi", "xgboost", "shap"
+    "emergency-department", "esi", "topsor", "xgboost", "shap"
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

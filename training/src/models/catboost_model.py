@@ -1,14 +1,14 @@
 """
 CatBoost — model komplementarny w ensemble.
 
-CatBoost wybrany jako 5. model bazowy z trzech powodów:
-    1. Ordered boosting — redukuje target leakage, lepsza generalizacja
-       na małych klasach (Red, Yellow w naszym przypadku).
+CatBoost wybrany jako model bazowy z trzech powodów:
+    1. Silna regularyzacja — dobra generalizacja na małych klasach
+       (ESI 1, ESI 5).
     2. Inny inductive bias niż XGB/LGBM — Symmetric Trees (oblivious
        decision trees) wprowadzają regularyzację strukturalną, co daje
        mniejszą korelację błędów z XGB/LGBM w ensemble.
-    3. Świetna wydajność CPU multi-threaded — `thread_count=-1` skaluje
-       liniowo do ~16 wątków, potem saturacja.
+    3. Działa na CPU i GPU — urządzenie wybierane automatycznie
+       (SOR_AI_DEVICE=auto|cpu|gpu).
 
 Cały trening jest w pełni logowany (per-iteration mlogloss → JSON tracker).
 """
@@ -21,7 +21,8 @@ import numpy as np
 import pandas as pd
 
 from src.models.base import BaseTriageModel, compute_sample_weights
-from src.utils.config import CATBOOST_DEFAULT_PARAMS
+from src.utils.config import CATBOOST_DEFAULT_PARAMS, DEFAULT_SAMPLE_WEIGHT_STRATEGY
+from src.utils.hardware import use_gpu
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -71,12 +72,18 @@ def _normalize_catboost_params(params: dict[str, Any]) -> dict[str, Any]:
 
 
 class CatBoostTriageModel(BaseTriageModel):
-    """Model CatBoost dla 5-klasowej klasyfikacji triażu MTS (CPU multi-threaded)."""
+    """Model CatBoost dla 5-klasowej klasyfikacji ESI (CPU lub GPU)."""
 
     name = "catboost"
 
     def __init__(self, params: dict[str, Any] | None = None):
         merged = {**CATBOOST_DEFAULT_PARAMS, **(params or {})}
+        if "task_type" not in merged:
+            merged["task_type"] = "GPU" if use_gpu() else "CPU"
+        if merged["task_type"] == "GPU":
+            merged.setdefault("devices", "0")
+        else:
+            merged.pop("devices", None)
         merged = _normalize_catboost_params(merged)
         super().__init__(params=merged)
 
@@ -90,12 +97,12 @@ class CatBoostTriageModel(BaseTriageModel):
         y_train: np.ndarray | pd.Series,
         X_val: pd.DataFrame | None = None,
         y_val: np.ndarray | pd.Series | None = None,
-        sample_weight_strategy: str = "custom",
+        sample_weight_strategy: str = DEFAULT_SAMPLE_WEIGHT_STRATEGY,
         run_id: str | None = None,
         use_mlflow: bool = False,
-        feature_set: str = "triage_only",
+        feature_set: str = "triage",
         verbose: int | bool = 100,
-        early_stopping_rounds: int = 100,
+        early_stopping_rounds: int | None = None,
         **kwargs,
     ) -> "CatBoostTriageModel":
         """Trenuje CatBoost z pełnym logowaniem."""
@@ -141,7 +148,9 @@ class CatBoostTriageModel(BaseTriageModel):
         fit_kwargs = {
             "eval_set": eval_pool,
             "verbose_eval": verbose if isinstance(verbose, int) and verbose > 0 else False,
-            "early_stopping_rounds": early_stopping_rounds if eval_pool is not None else None,
+            "early_stopping_rounds": (
+                (early_stopping_rounds or self.params.get("od_wait", 200)) if eval_pool is not None else None
+            ),
             "use_best_model": eval_pool is not None,
         }
         # CatBoost nie akceptuje None dla early_stopping_rounds

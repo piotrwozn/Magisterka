@@ -1,14 +1,16 @@
 """
-Krok 3: Trening modelu.
+Krok 3: trening modeli ESI.
 
-Cienki wrapper na `src.models.train.main()` — pozwala uruchomić trening
-tym samym CLI co `python -m src.models.train`.
+Cienki wrapper na `src.models.train.main()` — to samo CLI co `python -m src.models.train`.
 
 Użycie:
+    python scripts/03_train.py --model all                     # 6 modeli, zestaw 'triage'
     python scripts/03_train.py --model xgboost
-    python scripts/03_train.py --model lightgbm --tune --n-trials 50
-    python scripts/03_train.py --model stacking --feature-set full
-    python scripts/03_train.py --model ebm --weights custom
+    python scripts/03_train.py --model lightgbm,catboost --feature-set full
+    python scripts/03_train.py --model all --tune              # Optuna (długo)
+    python scripts/03_train.py --model all --sample 20000 --eval-sample 10000 --tag smoke
+
+Wyniki: runs/<run>/ (model, metryki, predykcje val/test) + runs/leaderboard.csv.
 """
 
 from __future__ import annotations

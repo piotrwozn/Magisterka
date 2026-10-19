@@ -6,6 +6,12 @@
 **Wersja:** 1.0  
 **Sprzęt docelowy:** Lokalny serwer (bez ograniczeń VRAM)
 
+> **Aktualizacja (październik 2026): etykieta to ESI, nie MTS.** Polskie SOR-y segregują pacjentów
+> algorytmem ESI w systemie TOPSOR (Dz.U. 2021 poz. 1182, § 2 pkt 9), a 5 kolorów z tabeli poniżej
+> to kolory TOPSOR przypisane poziomom ESI 1–5. Modele trenują się na natywnym ESI z Yale, bez
+> mapowania ESI→MTS. Wyniki XGBoost z §4.3 pochodzą z poprzedniej wersji pipeline'u (°F
+> traktowane jako °C, mapowanie na MTS) i są nieważne. Aktualny opis treningu: `training/README.md`.
+
 ---
 
 ## 1. Cel systemu

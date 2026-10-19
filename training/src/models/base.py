@@ -25,9 +25,15 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.utils.class_weight import compute_class_weight, compute_sample_weight
+from sklearn.utils.class_weight import compute_sample_weight
 
-from src.utils.config import CUSTOM_CLASS_WEIGHTS, MODELS_DIR
+from src.utils.config import (
+    CLASS_NAMES,
+    CUSTOM_CLASS_WEIGHTS,
+    DATA_VERSION,
+    DEFAULT_SAMPLE_WEIGHT_STRATEGY,
+    MODELS_DIR,
+)
 from src.utils.experiment_tracker import ExperimentTracker
 from src.utils.logger import get_logger, get_training_logger
 
@@ -39,7 +45,7 @@ log = get_logger(__name__)
 # ─────────────────────────────────────────
 def compute_sample_weights(
     y: np.ndarray | pd.Series,
-    strategy: str = "custom",
+    strategy: str = DEFAULT_SAMPLE_WEIGHT_STRATEGY,
     class_weights: dict[int, float] | None = None,
 ) -> np.ndarray:
     """
@@ -47,9 +53,13 @@ def compute_sample_weights(
 
     Parameters
     ----------
-    y : target labels
+    y : target labels (0–4)
     strategy : str
-        'balanced' | 'custom' | 'none' (ignorowane gdy class_weights podane)
+        'none'          — brak wag (domyślne; skalibrowane prawdopodobieństwa)
+        'balanced'      — n / (k · n_c)
+        'sqrt_balanced' — pierwiastek z 'balanced' (łagodniejsze wyrównanie)
+        'custom'        — CUSTOM_CLASS_WEIGHTS z config.py
+        (ignorowane, gdy podano class_weights)
     class_weights : dict, optional
         Mapa {klasa: waga} z Optuny — nadpisuje strategy.
 
@@ -66,6 +76,9 @@ def compute_sample_weights(
     if strategy == "balanced":
         return compute_sample_weight("balanced", y)
 
+    if strategy == "sqrt_balanced":
+        return np.sqrt(compute_sample_weight("balanced", y))
+
     if strategy == "custom":
         return np.array([CUSTOM_CLASS_WEIGHTS.get(int(yi), 1.0) for yi in y])
 
@@ -77,23 +90,13 @@ def compute_sample_weights(
 
 def compute_class_weights_dict(
     y: np.ndarray | pd.Series,
-    strategy: str = "custom",
+    strategy: str = DEFAULT_SAMPLE_WEIGHT_STRATEGY,
 ) -> dict[int, float]:
-    """Wagi klas jako dict {class_id: waga}."""
+    """Wagi klas jako dict {class_id: waga} (ta sama logika co compute_sample_weights)."""
     y = np.asarray(y)
     classes = np.unique(y)
-
-    if strategy == "balanced":
-        weights = compute_class_weight("balanced", classes=classes, y=y)
-        return dict(zip(classes.tolist(), weights.tolist()))
-
-    if strategy == "custom":
-        return {int(c): CUSTOM_CLASS_WEIGHTS.get(int(c), 1.0) for c in classes}
-
-    if strategy == "none":
-        return {int(c): 1.0 for c in classes}
-
-    raise ValueError(f"Nieznana strategia wag: {strategy}")
+    weights = compute_sample_weights(y, strategy=strategy)
+    return {int(c): float(weights[y == c][0]) for c in classes}
 
 
 # ─────────────────────────────────────────
@@ -113,6 +116,7 @@ class BaseTriageModel(abc.ABC):
         self.params = dict(params or {})
         self.model: Any = None
         self.feature_names: list[str] | None = None
+        self.feature_set: str | None = None
         self.classes_: np.ndarray | None = None
         self.is_fitted: bool = False
 
@@ -155,9 +159,10 @@ class BaseTriageModel(abc.ABC):
         y_train: np.ndarray | pd.Series,
         X_val: pd.DataFrame | None = None,
         y_val: np.ndarray | pd.Series | None = None,
-        feature_set: str = "triage_only",
+        feature_set: str = "triage",
     ) -> None:
         """Loguje statystyki danych treningowych."""
+        self.feature_set = feature_set
         if self.tracker is None:
             return
         self.tracker.log_data_info(X_train, y_train, X_val, y_val, feature_set=feature_set)
@@ -202,12 +207,17 @@ class BaseTriageModel(abc.ABC):
         y_train: np.ndarray | pd.Series,
         X_val: pd.DataFrame | None = None,
         y_val: np.ndarray | pd.Series | None = None,
-        sample_weight_strategy: str = "custom",
+        sample_weight_strategy: str = DEFAULT_SAMPLE_WEIGHT_STRATEGY,
         run_id: str | None = None,
         use_mlflow: bool = False,
         **kwargs,
     ) -> "BaseTriageModel":
-        """Trenuje model. Zwraca self."""
+        """
+        Trenuje model. Zwraca self.
+
+        X_val / y_val służą WYŁĄCZNIE do early stopping (w pipeline treningu
+        to wydzielona część TRAIN — zbiór `val` zostaje nietknięty).
+        """
 
     @abc.abstractmethod
     def predict(self, X: pd.DataFrame) -> np.ndarray:
@@ -215,7 +225,7 @@ class BaseTriageModel(abc.ABC):
 
     @abc.abstractmethod
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        """Prawdopodobieństwa per klasa, shape (n, 5)."""
+        """Prawdopodobieństwa per klasa ESI 1–5, shape (n, 5)."""
 
     # ──────── Cechy dodatkowe ────────
     def feature_importances(self) -> pd.DataFrame | None:
@@ -255,7 +265,11 @@ class BaseTriageModel(abc.ABC):
             "params": self.params,
             "model": self.model,
             "feature_names": self.feature_names,
+            "feature_set": self.feature_set,
             "classes_": self.classes_,
+            "class_names": CLASS_NAMES,
+            "label": "esi",                # indeks 0–4 = ESI 1–5
+            "data_version": DATA_VERSION,
             "training_duration_s": self.training_duration_s,
         }
         joblib.dump(artifact, path)
@@ -279,6 +293,7 @@ class BaseTriageModel(abc.ABC):
         instance = cls(params=artifact.get("params"))
         instance.model = artifact["model"]
         instance.feature_names = artifact.get("feature_names")
+        instance.feature_set = artifact.get("feature_set")
         instance.classes_ = artifact.get("classes_")
         instance.run_id = artifact.get("run_id")
         instance.training_duration_s = artifact.get("training_duration_s")

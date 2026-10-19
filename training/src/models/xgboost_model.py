@@ -1,5 +1,5 @@
 """
-XGBoost — główny model produkcyjny.
+XGBoost — gradient boosting (drzewa poziomowe), główny model tabelaryczny.
 
 XGBoost wybrany jako model bazowy z dwóch powodów:
     1. Doskonała wydajność na danych tabularnych (szczególnie z brakami).
@@ -19,24 +19,31 @@ import numpy as np
 import pandas as pd
 
 from src.models.base import BaseTriageModel, compute_sample_weights
-from src.utils.config import XGB_DEFAULT_PARAMS
+from src.utils.config import DEFAULT_SAMPLE_WEIGHT_STRATEGY, XGB_DEFAULT_PARAMS
+from src.utils.hardware import use_gpu
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
 
 class XGBoostTriageModel(BaseTriageModel):
-    """Model XGBoost dla 5-klasowej klasyfikacji triażu MTS."""
+    """Model XGBoost dla 5-klasowej klasyfikacji ESI."""
 
     name = "xgboost"
 
     def __init__(self, params: dict[str, Any] | None = None):
         merged = {**XGB_DEFAULT_PARAMS, **(params or {})}
+        merged.setdefault("device", "cuda" if use_gpu() else "cpu")
         super().__init__(params=merged)
 
-    def _build_model(self):
+    def _build_model(self, with_eval_set: bool = True):
         import xgboost as xgb
-        return xgb.XGBClassifier(**self.params)
+
+        params = dict(self.params)
+        if not with_eval_set:
+            # Early stopping wymaga zbioru ewaluacyjnego
+            params.pop("early_stopping_rounds", None)
+        return xgb.XGBClassifier(**params)
 
     def fit(
         self,
@@ -44,10 +51,10 @@ class XGBoostTriageModel(BaseTriageModel):
         y_train: np.ndarray | pd.Series,
         X_val: pd.DataFrame | None = None,
         y_val: np.ndarray | pd.Series | None = None,
-        sample_weight_strategy: str = "custom",
+        sample_weight_strategy: str = DEFAULT_SAMPLE_WEIGHT_STRATEGY,
         run_id: str | None = None,
         use_mlflow: bool = False,
-        feature_set: str = "triage_only",
+        feature_set: str = "triage",
         verbose: int | bool = 100,
         **kwargs,
     ) -> "XGBoostTriageModel":
@@ -57,8 +64,8 @@ class XGBoostTriageModel(BaseTriageModel):
         Parameters
         ----------
         X_train, y_train : dane treningowe
-        X_val, y_val : dane walidacyjne (do early stopping)
-        sample_weight_strategy : 'balanced' | 'custom' | 'none'
+        X_val, y_val : zbiór do early stopping
+        sample_weight_strategy : 'none' | 'balanced' | 'sqrt_balanced' | 'custom'
         run_id : str, optional
             Identyfikator eksperymentu (timestamp). Auto jeśli None.
         use_mlflow : bool
@@ -82,13 +89,14 @@ class XGBoostTriageModel(BaseTriageModel):
             f"min={sample_weights.min():.2f}, max={sample_weights.max():.2f}"
         )
 
-        # 3. Eval set
+        # 3. Eval set — tylko zbiór early stopping (metryka na train co rundę
+        #    podwajałaby czas treningu przy ~400 tys. wierszy)
         eval_set = []
         if X_val is not None and y_val is not None:
-            eval_set = [(X_train, y_train), (X_val, y_val)]
+            eval_set = [(X_val, y_val)]
 
         # 4. Trenuj
-        self.model = self._build_model()
+        self.model = self._build_model(with_eval_set=bool(eval_set))
         t0 = self._start_timer()
 
         fit_kwargs = {
@@ -133,13 +141,10 @@ class XGBoostTriageModel(BaseTriageModel):
         if not evals_result:
             return
 
-        # Zmapuj indeksy validation_0/1 → 'train'/'val'
+        # Jedyny eval set to zbiór early stopping → 'val'
         eval_set_keys = list(evals_result.keys())
-        rename = {}
-        if len(eval_set_keys) >= 1:
-            rename[eval_set_keys[0]] = "train"
-        if len(eval_set_keys) >= 2:
-            rename[eval_set_keys[1]] = "val"
+        rename = {key: "val" if len(eval_set_keys) == 1 else f"eval{i}"
+                  for i, key in enumerate(eval_set_keys)}
 
         # Wyciągnij liczbę iteracji
         first_key = eval_set_keys[0]

@@ -1,12 +1,17 @@
 """
 Konfiguracja globalna projektu SOR-AI.
 
-Wszystkie ścieżki, stałe, hiperparametry i progi medyczne MTS
-zdefiniowane w jednym miejscu, by uniknąć rozproszenia "magic numbers".
+Wszystkie ścieżki, stałe, hiperparametry i progi kliniczne zdefiniowane
+w jednym miejscu, by uniknąć rozproszenia "magic numbers".
+
+Etykieta: natywny Emergency Severity Index (ESI 1–5) — ten sam algorytm,
+który polskie SOR-y stosują w systemie TOPSOR (Dz.U. 2021 poz. 1182, § 2 pkt 9).
+Brak jakiegokolwiek mapowania na MTS.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # ─────────────────────────────────────────
@@ -25,6 +30,10 @@ FIGURES_DIR: Path = RESULTS_DIR / "figures"
 TABLES_DIR: Path = RESULTS_DIR / "tables"
 REPORTS_DIR: Path = RESULTS_DIR / "reports"
 
+# Każdy trening zapisuje komplet artefaktów do runs/<run_name>/
+# (model, metryki, predykcje val/test do ręcznego łączenia modeli).
+RUNS_DIR: Path = PROJECT_ROOT / "runs"
+
 LOGS_DIR: Path = PROJECT_ROOT / "logs"
 TRAINING_LOGS_DIR: Path = LOGS_DIR / "training"     # logi z treningu modeli
 EVAL_LOGS_DIR: Path = LOGS_DIR / "evaluation"       # logi z ewaluacji
@@ -32,16 +41,26 @@ EXPERIMENTS_DIR: Path = LOGS_DIR / "experiments"    # JSON-owe metadane eksperym
 
 # MLflow tracking
 MLFLOW_TRACKING_URI: str = f"file://{(PROJECT_ROOT / 'mlruns').as_posix()}"
-MLFLOW_EXPERIMENT_NAME: str = "sor-ai-triage"
+MLFLOW_EXPERIMENT_NAME: str = "sor-ai-triage-esi"
 
-# Pliki danych
+# Surowe dane Yale EMMLC
 RDATA_FILE: Path = DATA_RAW_DIR / "5v_cleandf.rdata"
 RAW_PARQUET: Path = DATA_PROCESSED_DIR / "yale_emmlc_raw.parquet"
-PROCESSED_PARQUET: Path = DATA_PROCESSED_DIR / "yale_emmlc_processed.parquet"
 
-TRAIN_PARQUET: Path = DATA_PROCESSED_DIR / "train.parquet"
-VAL_PARQUET: Path = DATA_PROCESSED_DIR / "val.parquet"
-TEST_PARQUET: Path = DATA_PROCESSED_DIR / "test.parquet"
+# Przygotowane dane ESI (wynik `scripts/02_preprocess.py`)
+ESI_DATA_DIR: Path = DATA_PROCESSED_DIR / "esi"
+TRAIN_PARQUET: Path = ESI_DATA_DIR / "train.parquet"
+VAL_PARQUET: Path = ESI_DATA_DIR / "val.parquet"
+TEST_PARQUET: Path = ESI_DATA_DIR / "test.parquet"
+FEATURE_SETS_JSON: Path = ESI_DATA_DIR / "feature_sets.json"
+DATA_MANIFEST_JSON: Path = ESI_DATA_DIR / "manifest.json"
+
+# Raport z audytu danych (wersjonowany w repo — mały plik tekstowy)
+DATA_AUDIT_MD: Path = PROJECT_ROOT / "DATA_AUDIT.md"
+
+# Wersja logiki przygotowania danych. Zmień, gdy zmieniasz prepare/engineering —
+# trening odmówi użycia splitów przygotowanych starszą wersją.
+DATA_VERSION: str = "esi-v1"
 
 # Utwórz katalogi przy imporcie
 for _dir in [
@@ -65,194 +84,198 @@ for _dir in [
 RANDOM_SEED: int = 42
 
 # ─────────────────────────────────────────
-# KLASYFIKACJA MTS
+# SPRZĘT
 # ─────────────────────────────────────────
-# Mapowanie ESI (Emergency Severity Index) → MTS (Manchester Triage System).
-# Zob. Strategia 2 w TECHNICAL_ANALYSIS.md §6 — to mapowanie BAZOWE,
-# które dodatkowo wzbogaca się o dyskryminatory parametrów życiowych.
-ESI_TO_MTS: dict[int, str] = {
-    1: "Red",      # Immediate / Natychmiastowy
-    2: "Orange",   # Very Urgent / Bardzo pilny
-    3: "Yellow",   # Urgent / Pilny
-    4: "Green",    # Standard / Standardowy
-    5: "Blue",     # Non-Urgent / Niepilny
-}
+# 'auto' = GPU jeśli dostępne (nvidia-smi), inaczej CPU. Nadpisz: SOR_AI_DEVICE=cpu|gpu
+DEVICE: str = os.environ.get("SOR_AI_DEVICE", "auto").lower()
 
-# Zakodowane numerycznie 0–4 (do treningu modeli, kolejność rosnąca pilności = malejąca)
-ESI_TO_MTS_NUMERIC: dict[int, int] = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4}
+# ─────────────────────────────────────────
+# ETYKIETA — ESI (bez mapowania)
+# ─────────────────────────────────────────
+ESI_COL: str = "esi"          # oryginalny poziom ESI 1–5
+TARGET_COL: str = "target"    # indeks klasy 0–4 (0 = ESI 1, ..., 4 = ESI 5)
+N_CLASSES: int = 5
 
-# Nazwy klas w kolejności indeksów 0–4 (Red, Orange, Yellow, Green, Blue)
-CLASS_NAMES: list[str] = ["Red", "Orange", "Yellow", "Green", "Blue"]
+# Nazwy klas w kolejności indeksów 0–4
+CLASS_NAMES: list[str] = ["ESI1", "ESI2", "ESI3", "ESI4", "ESI5"]
+
+# Kolory TOPSOR przypisane poziomom ESI (ESI 1 = czerwony, …, ESI 5 = niebieski)
+TOPSOR_COLORS: list[str] = ["Red", "Orange", "Yellow", "Green", "Blue"]
+TOPSOR_COLORS_PL: list[str] = ["czerwony", "pomarańczowy", "żółty", "zielony", "niebieski"]
+
 CLASS_NAMES_PL: list[str] = [
-    "Czerwony (Natychmiastowy)",
-    "Pomarańczowy (Bardzo pilny)",
-    "Żółty (Pilny)",
-    "Zielony (Standardowy)",
-    "Niebieski (Niepilny)",
+    "ESI 1 · czerwony (natychmiast)",
+    "ESI 2 · pomarańczowy (do 10 min)",
+    "ESI 3 · żółty (do 60 min)",
+    "ESI 4 · zielony (do 120 min)",
+    "ESI 5 · niebieski (do 240 min)",
 ]
 
-# Maksymalny czas oczekiwania (minuty) — zgodnie z protokołem MTS
-MTS_MAX_WAIT_MINUTES: dict[str, int] = {
+# Maksymalny czas do pierwszego kontaktu z lekarzem w TOPSOR (minuty), wg koloru
+TOPSOR_MAX_WAIT_MINUTES: dict[str, int] = {
     "Red": 0,
     "Orange": 10,
     "Yellow": 60,
     "Green": 120,
     "Blue": 240,
 }
+# Alias dla modułów wyjaśnień, które posługują się kolorami
+MTS_MAX_WAIT_MINUTES = TOPSOR_MAX_WAIT_MINUTES
+
+# Klasy wysokiej pilności (do metryk bezpieczeństwa): ESI 1–2
+HIGH_ACUITY_CLASSES: tuple[int, ...] = (0, 1)
+# Klasy niskiej pilności: ESI 4–5
+LOW_ACUITY_CLASSES: tuple[int, ...] = (3, 4)
 
 # ─────────────────────────────────────────
-# WAGI KLAS (asymetryczne — undertriage > overtriage)
+# WAGI KLAS (opcjonalne — domyślnie trenujemy BEZ wag)
 # ─────────────────────────────────────────
-# Kategoria Red to ~1-2% danych, ale jej pominięcie kosztuje życie.
-# Te wagi forsują model, by NIE pomijał Red/Orange.
+# Domyślna strategia 'none' daje skalibrowane prawdopodobieństwa, które najlepiej
+# nadają się do ręcznego łączenia modeli. Asymetrię kosztów (niedotriażowanie
+# gorsze niż przetriażowanie) realizuje reguła decyzyjna z macierzy kosztów
+# poniżej — działa tak samo dla pojedynczego modelu i dla ensemble.
+DEFAULT_SAMPLE_WEIGHT_STRATEGY: str = "none"
+
+# Strategia 'custom' — ręczne wagi (rozkład ESI w Yale: ~0.9 / 29 / 42 / 22 / 5 %)
 CUSTOM_CLASS_WEIGHTS: dict[int, float] = {
-    0: 10.0,   # Red    — najwyższy priorytet
-    1: 5.0,    # Orange — wysoki priorytet
-    2: 1.0,    # Yellow — baseline
-    3: 2.0,    # Green  — umiarkowany
-    4: 3.0,    # Blue   — umiarkowany (mała klasa)
+    0: 10.0,   # ESI 1 — rzadka, krytyczna
+    1: 2.0,    # ESI 2 — pominięcie = niebezpieczne niedotriażowanie
+    2: 1.0,    # ESI 3 — baseline
+    3: 1.0,    # ESI 4
+    4: 2.0,    # ESI 5 — mała klasa
 }
 
-# Macierz kosztów dla ordinal cost-sensitive loss.
-# Wiersz = prawdziwa klasa, kolumna = predykcja.
-# Undertriage (predykcja niższej pilności) jest 3× droższy niż overtriage.
+# ─────────────────────────────────────────
+# MACIERZ KOSZTÓW (decyzja kosztowa na prawdopodobieństwach)
+# ─────────────────────────────────────────
+# koszt[prawda, predykcja] = |p - t|^2 × (UNDER jeśli p > t, OVER jeśli p < t)
+# p > t oznacza przewidzenie NIŻSZEJ pilności niż prawdziwa (niedotriażowanie).
 UNDERTRIAGE_COST_MULTIPLIER: float = 3.0
 OVERTRIAGE_COST_MULTIPLIER: float = 1.0
 
 # ─────────────────────────────────────────
-# PODZIAŁ DANYCH (TEMPORAL SPLIT)
+# PODZIAŁ DANYCH
 # ─────────────────────────────────────────
-# Zob. TECHNICAL_ANALYSIS.md §2.6 — używamy podziału chronologicznego,
-# aby zwalidować model w warunkach zmienności sezonowej.
-TEST_SIZE: float = 0.10            # 10% najnowszych danych = test
-VAL_SIZE_OF_TRAINVAL: float = 0.111  # ~10% z train+val = walidacja
+# Yale EMMLC nie ma roku ani identyfikatora pacjenta — podział chronologiczny
+# nie jest możliwy. Domyślnie: losowy, stratyfikowany po ESI × oddział.
+# Alternatywa: --split site (oddział C = test zewnętrzny).
+TEST_SIZE: float = 0.10            # 10% = test (ostateczna ocena)
+VAL_SIZE: float = 0.10             # 10% = walidacja (porównanie / łączenie modeli)
+EARLY_STOPPING_FRACTION: float = 0.10   # 10% TRAIN wydzielone na early stopping
+HOLDOUT_SITE: str = "C"            # oddział trzymany jako test w --split site
 
 # ─────────────────────────────────────────
-# HIPERPARAMETRY MODELI
+# HIPERPARAMETRY MODELI (domyślne — sensowne bez tuningu)
 # ─────────────────────────────────────────
 XGB_DEFAULT_PARAMS: dict = {
     "objective": "multi:softprob",
-    "num_class": 5,
-    "eval_metric": ["mlogloss", "merror"],
-    "max_depth": 8,
+    "num_class": N_CLASSES,
+    "eval_metric": "mlogloss",
+    "tree_method": "hist",
+    "n_estimators": 3000,
     "learning_rate": 0.05,
-    "n_estimators": 1000,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
+    "max_depth": 8,
     "min_child_weight": 5,
-    "gamma": 0.1,
-    "reg_alpha": 0.1,
+    "subsample": 0.8,
+    "colsample_bytree": 0.7,
+    "reg_alpha": 0.0,
     "reg_lambda": 1.0,
-    "tree_method": "hist",   # 'gpu_hist' jeśli masz GPU
-    "device": "cuda",
+    "max_bin": 256,
+    "early_stopping_rounds": 100,
     "random_state": RANDOM_SEED,
-    "early_stopping_rounds": 50,
     "n_jobs": -1,
+    # "device" ustawiane w runtime (auto: cuda jeśli dostępne)
 }
 
 LGBM_DEFAULT_PARAMS: dict = {
     "objective": "multiclass",
-    "num_class": 5,
-    "n_estimators": 1000,
-    "max_depth": 8,
-    "num_leaves": 63,
+    "num_class": N_CLASSES,
+    "n_estimators": 5000,
     "learning_rate": 0.05,
+    "num_leaves": 127,
+    "max_depth": -1,
+    "min_child_samples": 50,
     "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_samples": 20,
-    "class_weight": "balanced",
+    "subsample_freq": 1,           # bez tego LightGBM ignoruje subsample
+    "colsample_bytree": 0.7,
+    "reg_alpha": 0.0,
+    "reg_lambda": 1.0,
     "random_state": RANDOM_SEED,
     "n_jobs": -1,
     "verbosity": -1,
 }
+LGBM_EARLY_STOPPING_ROUNDS: int = 100
 
-RF_DEFAULT_PARAMS: dict = {
-    "n_estimators": 500,
-    "max_depth": 20,
-    "min_samples_split": 10,
-    "min_samples_leaf": 5,
-    "class_weight": "balanced",
-    "random_state": RANDOM_SEED,
-    "n_jobs": -1,
-}
-
-EBM_DEFAULT_PARAMS: dict = {
-    "max_bins": 256,
-    "interactions": 10,
-    "learning_rate": 0.01,
-    "min_samples_leaf": 5,
-    "random_state": RANDOM_SEED,
-}
-
-# CatBoost — multi-threaded CPU (komplementarny boosting do XGB/LGBM).
-# Uwaga: CatBoost używa innych nazw:
-#   - `random_seed`   (nie random_state)
-#   - `thread_count`  (nie n_jobs)
-#   - `iterations`    (nie n_estimators)
-#   - `depth`         (nie max_depth)
-#   - `l2_leaf_reg`   (nie reg_lambda)
-#   - `rsm`           (nie colsample_bylevel)
+# CatBoost — inne nazwy parametrów (iterations, depth, random_seed, thread_count).
 CATBOOST_DEFAULT_PARAMS: dict = {
     "loss_function": "MultiClass",
     "eval_metric": "MultiClass",
-    "classes_count": 5,
-    "iterations": 2000,
-    "learning_rate": 0.05,
+    "classes_count": N_CLASSES,
+    "iterations": 5000,
+    "learning_rate": 0.08,
     "depth": 8,
     "l2_leaf_reg": 3.0,
-    "border_count": 254,             # liczba binów dla cech numerycznych (max quality)
-    "bootstrap_type": "MVS",         # nowoczesny CPU-default w CatBoost
-    "subsample": 0.8,
-    "rsm": 0.8,                       # column sampling per level
-    "grow_policy": "SymmetricTree",  # CatBoost signature — najbardziej stabilny
-    "boosting_type": "Plain",        # szybsza wersja (Ordered tylko dla <50k samples)
+    "border_count": 254,
+    "grow_policy": "SymmetricTree",
     "random_seed": RANDOM_SEED,
-    "thread_count": -1,               # wszystkie rdzenie CPU
-    "task_type": "GPU",
-    "devices": "0",
-    "allow_writing_files": False,    # nie twórz folderu catboost_info/
-    "od_type": "Iter",                # early stopping mode
-    "od_wait": 100,                   # patience
-    "verbose": 100,                   # log co 100 iteracji
+    "thread_count": -1,
+    "allow_writing_files": False,
+    "od_type": "Iter",
+    "od_wait": 200,
+    "verbose": 200,
+    # "task_type" ustawiane w runtime (auto: GPU jeśli dostępne)
 }
 
-# ExtraTrees — maksymalna randomizacja (komplementarna do RF).
-# Większość parametrów jak RF, ale domyślnie bootstrap=False,
-# a criterion może być też 'friedman_mse' / 'mae' / 'poisson'.
-ET_DEFAULT_PARAMS: dict = {
-    "n_estimators": 500,
-    "max_depth": 20,
-    "min_samples_split": 10,
-    "min_samples_leaf": 5,
+# Random Forest — jedyny model baggingowy (dywersyfikacja ensemble).
+# Braki obsługiwane natywnie (scikit-learn >= 1.4).
+# min_samples_leaf=20: przy ~400 tys. wierszy model ma ~300 MB zamiast kilku GB,
+# a prawdopodobieństwa są gładsze (lepiej nadają się do łączenia modeli).
+RF_DEFAULT_PARAMS: dict = {
+    "n_estimators": 300,
+    "criterion": "gini",
+    "max_features": "sqrt",
+    "min_samples_leaf": 20,
+    "max_samples": 0.5,            # bootstrap z 50% wierszy — szybciej i mniejszy model
+    "bootstrap": True,
     "class_weight": None,
-    "bootstrap": False,
     "random_state": RANDOM_SEED,
     "n_jobs": -1,
-    "verbose": 1,
 }
 
-# HistGradientBoosting — gradient boosting na histogramach (sklearn).
-# Inny inductive bias niż XGB/LGBM/CatBoost.
-HISTGBT_DEFAULT_PARAMS: dict = {
-    "learning_rate": 0.05,
-    "max_iter": 1000,
-    "max_depth": 6,
-    "max_leaf_nodes": 63,
-    "min_samples_leaf": 20,
-    "l2_regularization": 1.0,
-    "max_bins": 255,
-    "early_stopping": "auto",
-    "validation_fraction": 0.1,
-    "n_iter_no_change": 10,
-    "tol": 1e-7,
+# Explainable Boosting Machine — model "glassbox" (interpretowalność, MDR).
+# interactions=0: w wersji wieloklasowej interpret nie wizualizuje interakcji par cech,
+# więc czysty GAM zachowuje pełną interpretowalność (i trenuje się szybciej).
+EBM_DEFAULT_PARAMS: dict = {
+    "max_bins": 256,
+    "interactions": 0,
+    "learning_rate": 0.015,
+    "outer_bags": 4,
+    "max_rounds": 5000,
+    "early_stopping_rounds": 100,
+    "random_state": RANDOM_SEED,
+    "n_jobs": -1,
+}
+
+# Regresja logistyczna (multinomialna) — liniowy punkt odniesienia.
+LOGREG_DEFAULT_PARAMS: dict = {
+    "C": 1.0,
+    "max_iter": 2000,
+    "tol": 1e-4,
     "random_state": RANDOM_SEED,
 }
 
 # ─────────────────────────────────────────
 # OPTUNA — TUNING
 # ─────────────────────────────────────────
-OPTUNA_N_TRIALS: int = 300
+# Domyślne ustawienia dobrane tak, by tuning wszystkich modeli zmieścił się w jedną noc
+# na stacji klasy i9 + RTX 4080 (pełne 400 tys. wierszy × 5 foldów × 100 prób = dni).
+OPTUNA_N_TRIALS: int = 50
+TUNE_CV_FOLDS: int = 3
+TUNE_MAX_ROWS: int | None = 150_000     # próbka TRAIN do tuningu; finalny trening na całości
+# EBM jest wielokrotnie wolniejszy od pozostałych — mniej prób domyślnie
+OPTUNA_N_TRIALS_PER_MODEL: dict[str, int] = {"ebm": 15}
 OPTUNA_TIMEOUT_SECONDS: int | None = None  # bez limitu czasu
+OPTUNA_STORAGE_DIR: Path = LOGS_DIR / "optuna"
 
 # ─────────────────────────────────────────
 # OLLAMA (LLM medyczny)
@@ -266,7 +289,7 @@ OLLAMA_TIMEOUT_S: int = 120
 # ─────────────────────────────────────────
 # CV (cross-validation)
 # ─────────────────────────────────────────
-CV_N_SPLITS: int = 10
+CV_N_SPLITS: int = 5
 
 # ─────────────────────────────────────────
 # SHAP

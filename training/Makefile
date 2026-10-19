@@ -1,60 +1,69 @@
-# SOR-AI: Makefile dla typowych operacji
-# Użycie:
-#   make install   — zainstaluj zależności
-#   make convert   — krok 1: .RData → parquet
-#   make preprocess — krok 2: preprocessing + split
-#   make train     — krok 3: trening XGBoost
-#   make tune      — trening z tuningiem Optuna
-#   make eval      — ewaluacja najnowszego modelu
-#   make explain   — wyjaśnienia dla 5 pacjentów
-#   make demo      — uruchom Streamlit demo
-#   make test      — pytest
-#   make clean     — usuń modele, logi, processed data
+# SOR-AI: trening modeli klasyfikacji ESI
+#
+# Najczęściej:
+#   make install      — zależności
+#   make prepare      — przygotowanie danych Yale → splity ESI + DATA_AUDIT.md
+#   make train-all    — wszystkie modele, zestaw 'triage' (bez tuningu)
+#   make tune-all     — tuning Optuną + trening wszystkich modeli (długo: ok. 1 noc)
+#   make compare      — porównanie modeli + materiał do ręcznego łączenia
+#   make test         — testy
+#
+# Pojedynczy model: make train MODEL=xgboost   (FEATURES=full, ARGS="--weights balanced")
 
-.PHONY: install convert preprocess train train-all tune eval explain demo test clean lint
+PYTHON ?= python
+MODEL ?= xgboost
+FEATURES ?= triage
+ARGS ?=
+
+.PHONY: install convert prepare prepare-site train train-all train-full tune tune-all \
+        smoke compare eval explain cv demo mlflow test test-fast lint format clean clean-all
 
 install:
-	pip install -r requirements.txt
+	$(PYTHON) -m pip install -r requirements.txt
 
+# --- Dane ---
 convert:
-	python scripts/01_convert_rdata.py
+	$(PYTHON) scripts/01_convert_rdata.py
 
-preprocess:
-	python scripts/02_preprocess.py
+prepare:
+	$(PYTHON) scripts/02_preprocess.py --split random
 
-# Pojedyncze modele
+# Walidacja zewnętrzna: oddział C w całości jako test
+prepare-site:
+	$(PYTHON) scripts/02_preprocess.py --split site
+
+# --- Trening ---
 train:
-	python scripts/03_train.py --model xgboost --feature-set triage_only --weights custom
+	$(PYTHON) scripts/03_train.py --model $(MODEL) --feature-set $(FEATURES) $(ARGS)
 
-train-lgbm:
-	python scripts/03_train.py --model lightgbm --feature-set triage_only --weights custom
+train-all:
+	$(PYTHON) scripts/03_train.py --model all --feature-set $(FEATURES) $(ARGS)
 
-train-rf:
-	python scripts/03_train.py --model random_forest --feature-set triage_only --weights custom
-
-train-ebm:
-	python scripts/03_train.py --model ebm --feature-set triage_only --weights custom
-
-train-stacking:
-	python scripts/03_train.py --model stacking --feature-set triage_only --weights custom
-
-# Wszystkie modele (do porównań)
-train-all: train train-lgbm train-rf train-ebm
+train-full:
+	$(PYTHON) scripts/03_train.py --model all --feature-set full $(ARGS)
 
 tune:
-	python scripts/03_train.py --model xgboost --tune --n-trials 50 --feature-set triage_only
+	$(PYTHON) scripts/03_train.py --model $(MODEL) --feature-set $(FEATURES) --tune $(ARGS)
+
+tune-all:
+	$(PYTHON) scripts/03_train.py --model all --feature-set $(FEATURES) --tune $(ARGS)
+
+# Szybki test całego pipeline'u na próbce (kilka minut) — nie do raportowania
+smoke:
+	$(PYTHON) scripts/03_train.py --model all --sample 20000 --eval-sample 10000 --tag smoke
+
+# --- Wyniki ---
+compare:
+	$(PYTHON) scripts/07_compare_runs.py --feature-set $(FEATURES)
 
 eval:
-	python scripts/04_evaluate.py --model-name xgboost --feature-set triage_only
+	$(PYTHON) scripts/04_evaluate.py --model-name $(MODEL)
 
 explain:
-	python scripts/05_explain.py --model-name xgboost --n-patients 5
-
-explain-ollama:
-	python scripts/05_explain.py --model-name xgboost --n-patients 5 --use-ollama
+	$(PYTHON) scripts/05_explain.py --model-name $(MODEL) --n-patients 5
 
 cv:
-	python scripts/06_cross_validate.py --model xgboost --k 10
+	$(PYTHON) scripts/06_cross_validate.py --model $(MODEL) --feature-set $(FEATURES)
 
 demo:
 	streamlit run app/streamlit_app.py
@@ -62,15 +71,12 @@ demo:
 mlflow:
 	mlflow ui --backend-store-uri file://$(PWD)/mlruns --port 5000
 
-# Pełen pipeline od zera
-full-pipeline: convert preprocess train eval explain
-	@echo "[+] Pełen pipeline zakończony!"
-
+# --- Jakość ---
 test:
-	pytest tests/ -v
+	$(PYTHON) -m pytest tests/ -v
 
 test-fast:
-	pytest tests/ -q --tb=line
+	$(PYTHON) -m pytest tests/ -q -m "not slow"
 
 lint:
 	@which ruff > /dev/null && ruff check src/ tests/ scripts/ app/ || echo "Zainstaluj ruff: pip install ruff"
@@ -78,18 +84,15 @@ lint:
 format:
 	@which black > /dev/null && black src/ tests/ scripts/ app/ || echo "Zainstaluj black: pip install black"
 
+# --- Sprzątanie ---
 clean:
-	@echo "Usuwam modele, logi, processed data..."
+	@echo "Usuwam logi, wyniki i przygotowane splity (runy w runs/ zostają)…"
 	rm -rf logs/training/* logs/experiments/* logs/evaluation/*
-	rm -rf models/*.joblib
-	rm -rf results/figures/* results/tables/* results/reports/*
-	rm -rf data/processed/*.parquet data/processed/*.csv
-	rm -rf mlruns/
-	rm -rf .pytest_cache/ __pycache__/ src/**/__pycache__/
+	rm -rf results/figures/* results/tables/*
+	rm -rf data/processed/esi
+	rm -rf mlruns/ .pytest_cache/
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	@echo "[+] Czyszczenie zakończone."
 
 clean-all: clean
-	rm -rf data/processed/yale_emmlc_raw.parquet
-	rm -rf data/processed/yale_emmlc_processed.parquet
-	@echo "[+] Czyszczenie pełne (raz z parquet)."
+	rm -rf runs/ logs/
+	@echo "Usunięto także wszystkie runy (modele, predykcje, leaderboard)."

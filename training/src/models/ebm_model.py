@@ -4,10 +4,14 @@ Explainable Boosting Machine — model "szklanej skrzynki".
 EBM (Microsoft InterpretML) to algorytm GAM z interakcjami,
 który osiąga wyniki bliskie XGBoost, ale jest INHERENTLY INTERPRETABLE.
 
-UWAGA BADAWCZA (zob. TECHNICAL_ANALYSIS.md §3.4):
+UWAGA BADAWCZA:
     Porównanie EBM z czarno-skrzynkowym XGBoost+SHAP to świetny materiał
     badawczy: EBM ma wbudowaną interpretowalność (każdy feature ma
     wizualizowalną funkcję), co w medycynie jest bezcenne.
+
+Braki (NaN) obsługiwane natywnie. Najwolniejszy model w zestawie
+(godziny na pełnym zbiorze) — `outer_bags` w config.py skraca czas kosztem
+stabilności krzywych.
 """
 
 from __future__ import annotations
@@ -18,14 +22,14 @@ import numpy as np
 import pandas as pd
 
 from src.models.base import BaseTriageModel, compute_sample_weights
-from src.utils.config import EBM_DEFAULT_PARAMS
+from src.utils.config import DEFAULT_SAMPLE_WEIGHT_STRATEGY, EBM_DEFAULT_PARAMS
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
 
 class EBMTriageModel(BaseTriageModel):
-    """Explainable Boosting Machine dla 5-klasowej klasyfikacji triażu MTS."""
+    """Explainable Boosting Machine dla 5-klasowej klasyfikacji ESI."""
 
     name = "ebm"
 
@@ -43,10 +47,10 @@ class EBMTriageModel(BaseTriageModel):
         y_train: np.ndarray | pd.Series,
         X_val: pd.DataFrame | None = None,
         y_val: np.ndarray | pd.Series | None = None,
-        sample_weight_strategy: str = "custom",
+        sample_weight_strategy: str = DEFAULT_SAMPLE_WEIGHT_STRATEGY,
         run_id: str | None = None,
         use_mlflow: bool = False,
-        feature_set: str = "triage_only",
+        feature_set: str = "triage",
         **kwargs,
     ) -> "EBMTriageModel":
         """Trenuje EBM."""
@@ -80,15 +84,11 @@ class EBMTriageModel(BaseTriageModel):
         self.classes_ = self.model.classes_
         self.is_fitted = True
 
-        # 4. Train + val accuracy
-        train_acc = self.model.score(X_train, y_train)
-        self.train_logger.info(f"Train accuracy: {train_acc:.4f}")
-        self.tracker.log_metrics({"train_accuracy": train_acc})
-
+        # 4. Dokładność na zbiorze early stopping (EBM ma własną walidację wewnętrzną)
         if X_val is not None and y_val is not None:
             val_acc = self.model.score(X_val, y_val)
-            self.train_logger.info(f"Val accuracy:   {val_acc:.4f}")
-            self.tracker.log_metrics({"val_accuracy": val_acc})
+            self.train_logger.info(f"Accuracy (zbiór ES): {val_acc:.4f}")
+            self.tracker.log_metrics({"es_accuracy": val_acc})
 
         self.train_logger.info(f"Trening EBM zakończony w {duration:.1f}s")
 
@@ -106,6 +106,18 @@ class EBMTriageModel(BaseTriageModel):
         if not self.is_fitted:
             raise RuntimeError("Model nie wytrenowany.")
         return self.model.predict_proba(X)
+
+    def feature_importances(self) -> pd.DataFrame | None:
+        """Ważność termów EBM (efekty główne i interakcje par cech)."""
+        if self.model is None:
+            return None
+        try:
+            importances = self.model.term_importances()
+            names = list(self.model.term_names_)
+        except AttributeError:
+            return None
+        df = pd.DataFrame({"feature": names, "importance": importances})
+        return df.sort_values("importance", ascending=False).reset_index(drop=True)
 
     # ──────── EBM-specific: wbudowana interpretowalność ────────
     def explain_global(self):

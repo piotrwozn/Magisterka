@@ -1,12 +1,22 @@
 """
-Uncertainty Quantification dla ensemble modeli triażowych.
+Uncertainty Quantification dla zestawu modeli ESI (5 klas: ESI 1–5).
 
 Analizuje niepewność predykcji na poziomie:
   - Per-model:   confidence (max proba), entropy, margin (top1−top2)
-  - Cross-model: agreement, conflict (różnica ≥2 stopnie MTS)
+  - Cross-model: agreement, conflict (różnica ≥2 poziomy ESI między modelami)
+
+Źródła prawdopodobieństw:
+  - runy z runs/ (domyślnie) — zapisane predictions_<split>.parquet, bez ponownego liczenia;
+  - pliki model.joblib (--model-paths) — predykcje liczone na nowo na wskazanym splicie,
+    każdy model na własnym zestawie cech z artefaktu.
+
+Protokół: analizy robocze na `val`; `--split test` wyłącznie do raportu końcowego.
 
 Użycie:
-    python -m src.evaluation.uncertainty --model-paths models/xgboost_*.joblib
+    python -m src.evaluation.uncertainty                                  # najnowsze runy 'triage', val
+    python -m src.evaluation.uncertainty --runs RUN_A RUN_B --split test
+    python -m src.evaluation.uncertainty --include-samples --sample 3000  # szybki test na runach z próbek
+    python -m src.evaluation.uncertainty --model-paths runs/*/model.joblib --shap
 """
 
 from __future__ import annotations
@@ -16,16 +26,22 @@ import json
 from pathlib import Path
 from typing import Any
 
-import joblib
 import numpy as np
 import pandas as pd
 
-from src.utils.config import CLASS_NAMES, MODELS_DIR, REPORTS_DIR
+from src.utils.config import (
+    CLASS_NAMES,
+    N_CLASSES,
+    RANDOM_SEED,
+    REPORTS_DIR,
+    RUNS_DIR,
+    SHAP_BACKGROUND_SIZE,
+    SHAP_TOP_FEATURES,
+    TARGET_COL,
+)
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
-
-CLASS_NAMES_PL = ["Czerwony", "Pomarańczowy", "Żółty", "Zielony", "Niebieski"]
 
 
 # ─────────────────────────────────────────
@@ -58,7 +74,7 @@ def _predicted_class(proba: np.ndarray) -> np.ndarray:
 def compute_model_uq(
     proba: np.ndarray, y_true: np.ndarray | None = None
 ) -> dict[str, np.ndarray]:
-    """Metryki UQ dla pojedynczego modelu."""
+    """Metryki UQ dla pojedynczego modelu (predykcja = argmax)."""
     from sklearn.metrics import cohen_kappa_score
 
     preds = _predicted_class(proba)
@@ -69,7 +85,7 @@ def compute_model_uq(
         "margin": _margin(proba),
     }
     for i in range(proba.shape[1]):
-        result[f"proba_class_{i}"] = proba[:, i]
+        result[f"proba_{CLASS_NAMES[i].lower()}" if i < len(CLASS_NAMES) else f"proba_class_{i}"] = proba[:, i]
 
     if y_true is not None:
         result["correct"] = (preds == y_true).astype(float)
@@ -83,28 +99,28 @@ def compute_ensemble_uq(
     y_true: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """
-    Metryki UQ dla całego ensemble.
+    Metryki UQ dla całego zestawu modeli.
 
     Parameters
     ----------
     probas : dict[str, np.ndarray]
         {model_name: np.ndarray shape (n, 5)}
     y_true : np.ndarray, optional
+        Klasy 0–4 (= ESI 1–5).
 
     Returns
     -------
     dict z kluczami:
-        per_model      : {model_name: dict} — metryki per model
-        ensemble       : dict — metryki ensemble (średnia prob)
-        agreement      : np.ndarray (n,) — ile modeli zgadza się z większością
-        unanimity      : np.ndarray (n,) — czy wszystkie modele zgodne
-        max_disagreement: np.ndarray (n,) — max różnica między predykcjami (w stopniach MTS)
-        conflict_mask  : np.ndarray (n,) — True gdy max_disagreement ≥ 2
-        vote_matrix    : np.ndarray (n, 5) — liczba głosów per klasa
+        per_model       : {model_name: dict} — metryki per model
+        ensemble        : dict — metryki ensemble (średnia prob)
+        agreement       : np.ndarray (n,) — odsetek modeli zgodnych z większością
+        unanimity       : np.ndarray (n,) — czy wszystkie modele zgodne
+        max_disagreement: np.ndarray (n,) — max różnica między predykcjami (w poziomach ESI)
+        conflict_mask   : np.ndarray (n,) — True gdy max_disagreement ≥ 2
+        vote_matrix     : np.ndarray (n, 5) — liczba głosów per klasa
     """
     model_names = list(probas.keys())
     n_models = len(model_names)
-    n_samples = next(iter(probas.values())).shape[0]
 
     # Per-model
     per_model = {}
@@ -117,8 +133,8 @@ def compute_ensemble_uq(
     ensemble_preds = ensemble["prediction"]
 
     # Voting — ile modeli głosuje na każdą klasę (one-hot encoding)
-    all_preds_stacked = np.column_stack([per_model[name]["prediction"] for name in model_names])
-    vote_matrix = (all_preds_stacked[:, :, None] == np.arange(5)).sum(axis=1)
+    all_preds = np.column_stack([per_model[name]["prediction"] for name in model_names])
+    vote_matrix = (all_preds[:, :, None] == np.arange(N_CLASSES)).sum(axis=1)
 
     # Agreement: ile modeli głosuje na klasę większościową
     majority_class = vote_matrix.argmax(axis=1)
@@ -128,11 +144,10 @@ def compute_ensemble_uq(
     # Unanimity: wszystkie modele zgodne
     unanimity = majority_votes == n_models
 
-    # Max disagreement: największa różnica między predykcjami modeli (w stopniach MTS)
-    all_preds = np.column_stack([per_model[name]["prediction"] for name in model_names])
+    # Max disagreement: największa różnica między predykcjami modeli (w poziomach ESI)
     max_disagreement = all_preds.max(axis=1) - all_preds.min(axis=1)
 
-    # Conflict: różnica ≥ 2 stopnie
+    # Conflict: różnica ≥ 2 poziomy ESI
     conflict_mask = max_disagreement >= 2
 
     # Pairwise correlation między modelami
@@ -157,23 +172,21 @@ def compute_ensemble_uq(
                 ))
 
                 # Pearson r między spłaszczonymi probami
-                flat_i = probas[ni].ravel()
-                flat_j = probas[nj].ravel()
-                r, _ = pearsonr(flat_i, flat_j)
+                r, _ = pearsonr(probas[ni].ravel(), probas[nj].ravel())
                 pairwise_proba_r[pair_key] = float(r)
 
                 # Per-class probability correlation
                 per_class_r: dict[str, float] = {}
-                for cls in range(5):
+                for cls in range(N_CLASSES):
                     rc, _ = pearsonr(probas[ni][:, cls], probas[nj][:, cls])
                     per_class_r[CLASS_NAMES[cls]] = float(rc)
                 pairwise_per_class_r[pair_key] = per_class_r
 
-                # Cross-confusion: gdy model A mówi klasa X, co mówi model B?
+                # Cross-confusion: gdy model A mówi ESI X, co mówi model B?
                 cc = confusion_matrix(
                     per_model[ni]["prediction"],
                     per_model[nj]["prediction"],
-                    labels=list(range(5)),
+                    labels=list(range(N_CLASSES)),
                 )
                 pairwise_cross_confusion[pair_key] = cc.tolist()
 
@@ -199,10 +212,7 @@ def compute_ensemble_uq(
         by_agreement = {}
         for level in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
             mask = agreement >= level
-            if mask.sum() > 0:
-                acc = ensemble_correct[mask].mean()
-            else:
-                acc = float("nan")
+            acc = ensemble_correct[mask].mean() if mask.sum() > 0 else float("nan")
             by_agreement[f"≥{level:.0%}"] = {
                 "count": int(mask.sum()),
                 "accuracy": float(acc),
@@ -219,7 +229,7 @@ def ensemble_report(result: dict[str, Any]) -> str:
     """Generuje czytelny raport UQ."""
     lines = []
     lines.append("=" * 60)
-    lines.append("SOR-AI: Uncertainty Quantification Report")
+    lines.append("SOR-AI: Uncertainty Quantification Report (ESI 1–5)")
     lines.append("=" * 60)
     lines.append("")
 
@@ -227,137 +237,104 @@ def ensemble_report(result: dict[str, Any]) -> str:
     n_conflict = int(result["conflict_mask"].sum())
     n_unanimous = int(result["unanimity"].sum())
 
-    lines.append(f"Próbek:             {n}")
-    lines.append(f"Modeli w ensemble:   {len(result['per_model'])}")
-    lines.append(f"")
-    lines.append(f"--- Ensemble Agreement ---")
-    lines.append(f"Pełna zgodność (unanimity): {n_unanimous:>6} ({n_unanimous/n*100:>5.1f}%)")
-    lines.append(f"Średnia zgodność:           {result['agreement'].mean()*100:>5.1f}%")
-    lines.append(f"Konflikt (różnica ≥2):      {n_conflict:>6} ({n_conflict/n*100:>5.1f}%)")
-    lines.append(f"")
+    lines.append(f"Próbek:              {n}")
+    lines.append(f"Modeli w zestawie:   {len(result['per_model'])}")
+    lines.append("")
+    lines.append("--- Zgodność modeli ---")
+    lines.append(f"Pełna zgodność (unanimity):   {n_unanimous:>6} ({n_unanimous/n*100:>5.1f}%)")
+    lines.append(f"Średnia zgodność:             {result['agreement'].mean()*100:>5.1f}%")
+    lines.append(f"Konflikt (różnica ≥2 poziomy): {n_conflict:>6} ({n_conflict/n*100:>5.1f}%)")
+    lines.append("")
 
-    # Distribution of agreement levels
+    # Rozkład poziomów zgodności
     edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-    lines.append(f"Rozkład zgodności:")
+    lines.append("Rozkład zgodności:")
     for i in range(len(edges) - 1):
         mask = (result["agreement"] >= edges[i]) & (result["agreement"] < edges[i + 1])
         count = int(mask.sum())
         bar = "█" * (count * 50 // max(n, 1))
         lines.append(f"  [{edges[i]:.0%}–{edges[i+1]:.0%}) {count:>5} ({count/n*100:>4.1f}%) {bar}")
-    # Top bin includes 1.0
-    mask_top = result["agreement"] == 1.0
-    count_top = int(mask_top.sum())
+    # Ostatni przedział obejmuje 1.0
+    count_top = int((result["agreement"] == 1.0).sum())
     bar_top = "█" * (count_top * 50 // max(n, 1))
     lines.append(f"  [100%         ] {count_top:>5} ({count_top/n*100:>4.1f}%) {bar_top}")
-    lines.append(f"")
+    lines.append("")
 
     # Per-model stats
-    lines.append(f"--- Per-Model Summary ---")
-    header = f"{'Model':<15s} {'QWK':>8s} {'Acc':>7s} {'Conf':>6s} {'Entropy':>8s} {'Margin':>6s}"
+    lines.append("--- Podsumowanie per model (predykcja = argmax) ---")
+    header = f"{'Model':<22s} {'QWK':>8s} {'Acc':>7s} {'Conf':>6s} {'Entropy':>8s} {'Margin':>6s}"
     lines.append(header)
     lines.append("-" * len(header))
     for name, md in result["per_model"].items():
-        qwk = md.get("qwk", float("nan"))
-        acc = md.get("accuracy", float("nan"))
         lines.append(
-            f"{name:<15s} "
-            f"{qwk:>8.4f} "
-            f"{acc:>7.4f} "
+            f"{name:<22s} "
+            f"{md.get('qwk', float('nan')):>8.4f} "
+            f"{md.get('accuracy', float('nan')):>7.4f} "
             f"{md['confidence'].mean():>6.3f} "
             f"{md['entropy'].mean():>8.4f} "
             f"{md['margin'].mean():>6.3f}"
         )
 
     ens = result["ensemble"]
-    lines.append(f"  {'ENSEMBLE (avg prob)':<15s} "
-                  f"{ens.get('qwk', float('nan')):>8.4f} "
-                  f"{ens.get('accuracy', float('nan')):>7.4f} "
-                  f"{ens['confidence'].mean():>6.3f} "
-                  f"{ens['entropy'].mean():>8.4f} "
-                  f"{ens['margin'].mean():>6.3f}")
-    lines.append(f"")
+    lines.append(f"{'ŚREDNIA (avg prob)':<22s} "
+                 f"{ens.get('qwk', float('nan')):>8.4f} "
+                 f"{ens.get('accuracy', float('nan')):>7.4f} "
+                 f"{ens['confidence'].mean():>6.3f} "
+                 f"{ens['entropy'].mean():>8.4f} "
+                 f"{ens['margin'].mean():>6.3f}")
+    lines.append("")
 
     if "accuracy_by_agreement" in result:
-        lines.append(f"--- Accuracy by Agreement Level ---")
+        lines.append("--- Accuracy średniej wg poziomu zgodności ---")
         for level, data in result["accuracy_by_agreement"].items():
-            lines.append(f"  Agreement {level:>5s}: n={data['count']:>6}, accuracy={data['accuracy']:.4f}")
-
-    lines.append(f"")
-
-    # Compact summary na koniec
-    lines.append(f"═" * 50)
-    lines.append(f"ENSEMBLE SUMMARY (modele: {', '.join(result['per_model'].keys())})")
-    lines.append(f"═" * 50)
-    for name, md in result["per_model"].items():
-        lines.append(f"  {name:<15s}  QWK={md.get('qwk', float('nan')):.4f}  "
-                      f"ACC={md.get('accuracy', float('nan')):.4f}  "
-                      f"Conf={md['confidence'].mean():.3f}")
-    ens = result["ensemble"]
-    lines.append(f"  {'──' + '─'*13}")
-    lines.append(f"  {'ENSEMBLE':<15s}  QWK={ens.get('qwk', float('nan')):.4f}  "
-                  f"ACC={ens.get('accuracy', float('nan')):.4f}  "
-                  f"Conf={ens['confidence'].mean():.3f}")
-    lines.append(f"")
+            lines.append(f"  Zgodność {level:>5s}: n={data['count']:>6}, accuracy={data['accuracy']:.4f}")
+        lines.append("")
 
     # Pairwise correlation between models
     if result.get("pairwise_pred_qwk"):
-        lines.append(f"─" * 50)
-        lines.append(f"PAIRWISE MODEL CORRELATION")
-        lines.append(f"─" * 50)
-        lines.append(f"{'Pair':<30s} {'Pred QWK':>10s} {'Proba r':>10s}")
-        lines.append(f"{'─' * 52}")
-        for pair in result["pairwise_pred_qwk"]:
-            q = result["pairwise_pred_qwk"][pair]
+        lines.append("─" * 60)
+        lines.append("KORELACJA MODELI (PARAMI)")
+        lines.append("─" * 60)
+        lines.append(f"{'Para':<40s} {'Pred QWK':>10s} {'Proba r':>10s}")
+        lines.append("─" * 62)
+        for pair, q in result["pairwise_pred_qwk"].items():
             r = result["pairwise_proba_r"].get(pair, float("nan"))
-            lines.append(f"{pair:<30s} {q:>10.4f} {r:>10.4f}")
-        lines.append(f"")
+            lines.append(f"{pair:<40s} {q:>10.4f} {r:>10.4f}")
+        lines.append("")
 
         # Per-class probability correlation
         if result.get("pairwise_per_class_r"):
-            lines.append(f"  Per-class Proba r:")
-            cls_header = f"{'Pair':<22s}"
-            for cn in CLASS_NAMES:
-                cls_header += f" {cn:>8s}"
-            lines.append(cls_header)
+            lines.append("  Korelacja prawdopodobieństw per poziom ESI (Pearson r):")
+            lines.append(f"{'Para':<40s}" + "".join(f" {cn:>8s}" for cn in CLASS_NAMES))
             for pair, per_class in result["pairwise_per_class_r"].items():
-                line = f"{pair:<22s}"
-                for cn in CLASS_NAMES:
-                    line += f" {per_class[cn]:>8.4f}"
-                lines.append(line)
-            lines.append(f"")
+                lines.append(f"{pair:<40s}" + "".join(f" {per_class[cn]:>8.4f}" for cn in CLASS_NAMES))
+            lines.append("")
 
         # Cross-confusion matrices
         if result.get("pairwise_cross_confusion"):
-            lines.append(f"  Cross-confusion (rows=model_A, cols=model_B):")
+            lines.append("  Cross-confusion (wiersze = model A, kolumny = model B):")
             for pair, cc in result["pairwise_cross_confusion"].items():
-                models_in_pair = pair.split(" vs ")
                 lines.append(f"  {pair}:")
-                header = f"       "
-                for cn in CLASS_NAMES:
-                    header += f" {cn:>8s}"
-                lines.append(header)
+                lines.append(f"  {'':>6s}" + "".join(f" {cn:>8s}" for cn in CLASS_NAMES))
                 for row_idx, row in enumerate(cc):
-                    line = f"  {models_in_pair[0][:7]:>4s} {CLASS_NAMES[row_idx]:>4s}"
-                    for val in row:
-                        line += f" {val:>8d}"
-                    lines.append(line)
-                # Agreement %
+                    lines.append(f"  {CLASS_NAMES[row_idx]:>6s}" + "".join(f" {val:>8d}" for val in row))
                 total = sum(sum(row) for row in cc)
-                agree = sum(cc[i][i] for i in range(5))
-                lines.append(f"  {' ':<11s} Zgodność: {agree/total*100:.1f}%")
-                lines.append(f"")
+                agree = sum(cc[i][i] for i in range(len(cc)))
+                lines.append(f"  {'':>6s} Zgodność: {agree / max(total, 1) * 100:.1f}%")
+                lines.append("")
 
     # Conflict examples
     conflict_idx = np.where(result["conflict_mask"])[0]
     if len(conflict_idx) > 0:
-        lines.append(f"--- Konflikt (różnica ≥2 stopnie): {len(conflict_idx)} przypadków ---")
+        lines.append(f"--- Konflikt (różnica ≥2 poziomy ESI): {len(conflict_idx)} przypadków ---")
         for idx in conflict_idx[:10]:
-            preds = {}
-            for name in result["per_model"]:
-                preds[name] = int(result["per_model"][name]["prediction"][idx])
+            preds = {
+                name: CLASS_NAMES[int(md["prediction"][idx])]
+                for name, md in result["per_model"].items()
+            }
             majority = int(result["majority_class"][idx])
-            lines.append(f"  Sample {idx}: majority={CLASS_NAMES[majority]}, "
-                         f"models={preds}, "
+            lines.append(f"  Wiersz {idx}: większość={CLASS_NAMES[majority]}, "
+                         f"modele={preds}, "
                          f"margin={result['ensemble']['margin'][idx]:.3f}")
         if len(conflict_idx) > 10:
             lines.append(f"  ... i {len(conflict_idx) - 10} więcej")
@@ -366,27 +343,86 @@ def ensemble_report(result: dict[str, Any]) -> str:
 
 
 # ─────────────────────────────────────────
-# CLI
+# Źródła prawdopodobieństw: runy i modele
 # ─────────────────────────────────────────
+def _sample_positions(y: np.ndarray, n: int | None, seed: int = RANDOM_SEED) -> np.ndarray:
+    """Stratyfikowana próbka pozycji wierszy (cała tablica, gdy n jest None lub ≥ len)."""
+    positions = np.arange(len(y))
+    if n is None or n >= len(y):
+        return positions
+    from sklearn.model_selection import train_test_split
+
+    sample, _ = train_test_split(positions, train_size=n, random_state=seed, stratify=y)
+    return np.sort(sample)
+
+
+def probas_from_runs(
+    runs: list,
+    split: str = "val",
+    sample: int | None = None,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Prawdopodobieństwa z zapisanych predykcji runów (wspólne wiersze, ta sama kolejność)."""
+    from src.ensemble import aligned_probas
+
+    y, probas = aligned_probas(runs, split)
+    pos = _sample_positions(y, sample)
+    return y[pos], {name: p[pos] for name, p in probas.items()}
+
+
 def load_models(model_paths: list[Path]) -> dict[str, Any]:
-    """Ładuje modele z plików .joblib."""
-    models = {}
+    """
+    Ładuje modele z plików model.joblib (artefakty BaseTriageModel.save).
+
+    Klucz = nazwa modelu; przy duplikatach — nazwa katalogu runa (albo pliku).
+    Nazwa modelu z run_info.json runa, a poza runs/ — z samego artefaktu.
+    """
+    import joblib
+
+    from src.models import MODEL_REGISTRY
+
+    loaded: list[tuple[str, Path, Any]] = []
     for path in model_paths:
-        artifact = joblib.load(path)
-        name = artifact.get("name", path.stem.split("_")[0])
-        models[name] = artifact["model"]
-        log.info(f"Załadowano '{name}': {path} ({type(artifact['model']).__name__})")
+        path = Path(path)
+        info_path = path.parent / "run_info.json"
+        if info_path.exists():
+            name = json.loads(info_path.read_text())["model"]
+        else:
+            name = joblib.load(path)["name"]
+        model = MODEL_REGISTRY[name].load(path)
+        loaded.append((name, path, model))
+        log.info(f"Załadowano '{name}' ({model.feature_set}): {path}")
+
+    models: dict[str, Any] = {}
+    for name, path, model in loaded:
+        duplicate = sum(n == name for n, _, _ in loaded) > 1
+        key = (path.parent.name if path.name == "model.joblib" else path.stem) if duplicate else name
+        models[key] = model
     return models
 
 
-def compute_predictions(
-    models: dict[str, Any],
-    X: pd.DataFrame,
-) -> dict[str, np.ndarray]:
-    """Oblicza prawdopodobieństwa dla wszystkich modeli."""
+def load_eval_frame(models: dict[str, Any], split: str = "val", sample: int | None = None) -> pd.DataFrame:
+    """Split z kolumnami potrzebnymi wszystkim modelom ('full' ⊇ 'triage')."""
+    from src.data.dataset import load_splits, sample_frame
+
+    feature_sets = {m.feature_set or "triage" for m in models.values()}
+    feature_set = "triage" if feature_sets == {"triage"} else "full"
+    df = load_splits((split,), feature_set=feature_set)[split]
+    return sample_frame(df, sample).reset_index(drop=True)
+
+
+def model_features(model: Any, df: pd.DataFrame) -> pd.DataFrame:
+    """Macierz cech dokładnie w układzie z treningu modelu."""
+    from src.data.dataset import get_xy
+
+    X, _ = get_xy(df, model.feature_set or "triage")
+    return X[model.feature_names] if model.feature_names else X
+
+
+def compute_predictions(models: dict[str, Any], df: pd.DataFrame) -> dict[str, np.ndarray]:
+    """Oblicza prawdopodobieństwa dla wszystkich modeli (każdy na swoim zestawie cech)."""
     probas = {}
     for name, model in models.items():
-        probas[name] = model.predict_proba(X)
+        probas[name] = model.predict_proba(model_features(model, df))
         log.info(f"  {name}: proba shape {probas[name].shape}")
     return probas
 
@@ -394,24 +430,16 @@ def compute_predictions(
 # ─────────────────────────────────────────
 # SHAP Analysis (opcjonalny)
 # ─────────────────────────────────────────
-SHAP_CLASS_NAMES = ["Red", "Orange", "Yellow", "Green", "Blue"]
-
-
-def _model_supports_shap(model: Any, name: str) -> bool:
-    """Sprawdza czy model ma TreeSHAP (natywny)."""
-    import xgboost
+def _model_supports_shap(model: Any) -> bool:
+    """Czy surowy estymator ma natywny TreeSHAP (XGBoost, LightGBM, CatBoost, RF)."""
     import lightgbm as lgb
+    import xgboost
+    from catboost import CatBoostClassifier
     from sklearn.ensemble import RandomForestClassifier
 
-    if isinstance(model, (xgboost.XGBClassifier, lgb.LGBMClassifier)):
-        return True
-    if isinstance(model, RandomForestClassifier):
-        return True
-    if hasattr(model, "get_feature_importance"):
-        from catboost import CatBoostClassifier
-        if isinstance(model, CatBoostClassifier):
-            return True
-    return False
+    return isinstance(
+        model, (xgboost.XGBClassifier, lgb.LGBMClassifier, CatBoostClassifier, RandomForestClassifier)
+    )
 
 
 def _predict_shap_xgb(model: Any, X: pd.DataFrame) -> np.ndarray:
@@ -434,10 +462,9 @@ def _predict_shap_lgb(model: Any, X: pd.DataFrame) -> np.ndarray:
     gdzie pierwsze (n_features+1) kolumn to klasa 0, potem klasa 1, itd.
     Reshape do 3D → transpose do (n, n_features+1, n_classes) → drop bias.
     """
-    import lightgbm as lgb
     contribs = model.booster_.predict(X, pred_contrib=True)
     n_features = X.shape[1]
-    n_classes = model.booster_.num_class() if hasattr(model.booster_, 'num_class') else 5
+    n_classes = model.booster_.num_model_per_iteration()
     expected_cols = (n_features + 1) * n_classes
     if contribs.ndim == 2 and contribs.shape[1] == expected_cols:
         contribs = contribs.reshape(-1, n_classes, n_features + 1)
@@ -447,83 +474,89 @@ def _predict_shap_lgb(model: Any, X: pd.DataFrame) -> np.ndarray:
 
 
 def _predict_shap_cb(model: Any, X: pd.DataFrame) -> np.ndarray:
-    """SHAP values przez CatBoost natywny."""
+    """SHAP values przez CatBoost natywny.
+
+    Multiclass: CatBoost zwraca (n, n_classes, n_features+1) → (n, n_features, n_classes).
+    """
     from catboost import Pool
-    pool = Pool(X)
-    # CatBoost zwraca (n, n_features+1, n_classes) lub (n, n_features+1)
-    sv = model.get_feature_importance(data=pool, type="ShapValues")
+    sv = model.get_feature_importance(data=Pool(X), type="ShapValues")
     if sv.ndim == 3:
-        return sv[:, :-1, :]  # (n, n_features, n_classes)
+        return np.transpose(sv, (0, 2, 1))[:, :-1, :]
     # dla binary: (n, n_features+1) → (n, n_features, 1)
     return sv[:, :-1, np.newaxis]
 
 
-def _predict_shap_rf(model: Any, X: pd.DataFrame) -> np.ndarray:
-    """SHAP dla RandomForest — używa shap.TreeExplainer ale z małą próbką."""
+def _predict_shap_rf(model: Any, X: pd.DataFrame, background: pd.DataFrame) -> np.ndarray:
+    """SHAP dla RandomForest — shap.TreeExplainer (interventional) z małym tłem."""
     import shap
-    # Tylko 200 samples dla RF (wolniejszy)
-    X_small = X.sample(n=min(200, len(X)), random_state=42)
-    explainer = shap.TreeExplainer(model, data=X_small, feature_perturbation="interventional")
-    sv = explainer.shap_values(X_small, check_additivity=False)
-    # sv: (n_samples, n_features, n_classes) dla multiclass
-    return sv
+    explainer = shap.TreeExplainer(model, data=background, feature_perturbation="interventional")
+    sv = explainer.shap_values(X, check_additivity=False)
+    if isinstance(sv, list):   # starsze wersje shap: lista (n, n_features) per klasa
+        sv = np.stack(sv, axis=-1)
+    return sv  # (n, n_features, n_classes)
 
 
 def compute_model_shap(
     model: Any,
     name: str,
-    X_background: pd.DataFrame,
     X_eval: pd.DataFrame,
     feature_names: list[str],
     n_samples: int = 500,
+    X_background: pd.DataFrame | None = None,
+    top_k: int = SHAP_TOP_FEATURES,
 ) -> dict[str, Any] | None:
-    """Oblicza SHAP values dla modelu na próbce danych.
+    """Oblicza SHAP values dla surowego estymatora na próbce danych.
 
-    Używa natywnych metod modeli zamiast shap biblioteki dla wydajności.
+    Używa natywnych metod modeli zamiast biblioteki shap (poza RF) dla wydajności.
+    Modele bez TreeSHAP (logreg, EBM) → None.
     """
-    import xgboost
     import lightgbm as lgb
+    import xgboost
+    from catboost import CatBoostClassifier
 
-    if not _model_supports_shap(model, name):
+    if not _model_supports_shap(model):
         return None
 
-    # Próbkuj eval
-    if len(X_eval) > n_samples:
-        X_eval_shap = X_eval.sample(n=n_samples, random_state=42)
-    else:
-        X_eval_shap = X_eval
+    # RF przez bibliotekę shap jest wolny — mniejsza próbka
+    is_rf = not isinstance(model, (xgboost.XGBClassifier, lgb.LGBMClassifier, CatBoostClassifier))
+    n = min(n_samples, SHAP_BACKGROUND_SIZE) if is_rf else n_samples
+    X_eval_shap = X_eval.sample(n=n, random_state=RANDOM_SEED) if len(X_eval) > n else X_eval
 
-    log.info(f"  SHAP {name}: {len(X_eval_shap)} samples")
+    log.info(f"  SHAP {name}: {len(X_eval_shap)} próbek")
 
     try:
         if isinstance(model, xgboost.XGBClassifier):
             shap_values = _predict_shap_xgb(model, X_eval_shap)
         elif isinstance(model, lgb.LGBMClassifier):
             shap_values = _predict_shap_lgb(model, X_eval_shap)
-        elif hasattr(model, "get_feature_importance"):
+        elif isinstance(model, CatBoostClassifier):
             shap_values = _predict_shap_cb(model, X_eval_shap)
         else:
-            shap_values = _predict_shap_rf(model, X_eval_shap)
+            background = X_background if X_background is not None else X_eval
+            background = background.sample(
+                n=min(SHAP_BACKGROUND_SIZE, len(background)), random_state=RANDOM_SEED
+            )
+            shap_values = _predict_shap_rf(model, X_eval_shap, background)
     except Exception as e:
-        log.warning(f"  SHAP {name} failed: {e}")
+        log.warning(f"  SHAP {name} nie powiódł się: {e}")
         return None
 
     # shap_values shape: (n, n_features, n_classes)
     n_classes = shap_values.shape[2]
 
-    # Top features per class
+    # Top cechy per poziom ESI
     top_per_class = {}
     for cls in range(n_classes):
         importances = np.abs(shap_values[:, :, cls]).mean(axis=0)
-        top_idx = np.argsort(importances)[-10:][::-1]
-        top_per_class[SHAP_CLASS_NAMES[cls]] = [
+        top_idx = np.argsort(importances)[-top_k:][::-1]
+        top_per_class[CLASS_NAMES[cls]] = [
             {"feature": feature_names[i], "importance": float(importances[i])}
             for i in top_idx
         ]
 
-    # Global top features (mean |SHAP| across all classes)
+    # Globalne top cechy (średnie |SHAP| po wszystkich klasach)
     global_importances = np.abs(shap_values).mean(axis=(0, 2))
-    global_top_idx = np.argsort(global_importances)[-10:][::-1]
+    global_top_idx = np.argsort(global_importances)[-top_k:][::-1]
     global_top = [
         {"feature": feature_names[i], "importance": float(global_importances[i])}
         for i in global_top_idx
@@ -547,182 +580,156 @@ def shap_section(
     if not available:
         return lines
 
-    lines.append(f"")
-    lines.append(f"─" * 60)
-    lines.append(f"SHAP ANALYSIS — Top features per model")
-    lines.append(f"─" * 60)
-    lines.append(f"")
+    lines.append("")
+    lines.append("─" * 60)
+    lines.append(f"SHAP — najważniejsze cechy per model ({len(available)}/{n_models} modeli z TreeSHAP)")
+    lines.append("─" * 60)
+    lines.append("")
 
-    # Global top features per model
+    # Globalne top cechy per model
     for name, res in available.items():
         lines.append(f"  {name}:")
-        lines.append(f"  {'Feature':<30s} {'Importance':>10s}")
-        lines.append(f"  {'─' * 42}")
+        lines.append(f"  {'Cecha':<34s} {'|SHAP|':>10s}")
+        lines.append(f"  {'─' * 46}")
         for feat in res["global_top_features"][:8]:
-            lines.append(f"  {feat['feature']:<30s} {feat['importance']:>10.4f}")
-        lines.append(f"")
+            lines.append(f"  {feat['feature']:<34s} {feat['importance']:>10.4f}")
+        lines.append("")
 
-    # Feature overlap between models
-    all_features = {}
+    # Wspólne cechy między modelami
+    all_features: dict[str, list[str]] = {}
     for name, res in available.items():
         for feat in res["global_top_features"]:
-            f = feat["feature"]
-            if f not in all_features:
-                all_features[f] = []
-            all_features[f].append(name)
+            all_features.setdefault(feat["feature"], []).append(name)
 
-    # Features appearing in multiple models
     shared = {f: models for f, models in all_features.items() if len(models) > 1}
     if shared:
-        lines.append(f"  Wspólne cechy w top-10 wielu modeli:")
-        for feat, models in sorted(shared.items(),
-                                    key=lambda x: len(x[1]), reverse=True)[:5]:
-            lines.append(f"    {feat:<30s} → {', '.join(models)}")
+        lines.append(f"  Wspólne cechy w top-{SHAP_TOP_FEATURES} wielu modeli:")
+        for feat, models in sorted(shared.items(), key=lambda x: len(x[1]), reverse=True)[:5]:
+            lines.append(f"    {feat:<34s} → {', '.join(models)}")
 
-    # Features unique to one model
     unique = {f: models[0] for f, models in all_features.items() if len(models) == 1}
     if unique:
-        lines.append(f"  Cechy unikalne dla jednego modelu:")
-        for feat, model_name in sorted(unique.items(),
-                                        key=lambda x: x[1])[:8]:
-            lines.append(f"    {feat:<30s} ← tylko {model_name}")
+        lines.append("  Cechy unikalne dla jednego modelu:")
+        for feat, model_name in sorted(unique.items(), key=lambda x: x[1])[:8]:
+            lines.append(f"    {feat:<34s} ← tylko {model_name}")
 
-    lines.append(f"")
+    lines.append("")
     return lines
 
 
+# ─────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Uncertainty Quantification dla ensemble modeli triażowych"
+        description="Uncertainty Quantification dla zestawu modeli ESI",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
+        "--runs", nargs="+", default=None,
+        help="Katalogi runów (nazwy w runs/ lub ścieżki); domyślnie najnowszy run każdego modelu",
+    )
+    source.add_argument(
+        "--model-paths", "-m", nargs="+", type=Path, default=None,
+        help="Pliki model.joblib — predykcje liczone na nowo na --split",
+    )
+    parser.add_argument("--feature-set", "-f", default="triage",
+                        help="Zestaw cech przy wyborze najnowszych runów")
+    parser.add_argument("--include-samples", action="store_true",
+                        help="Uwzględnij runy trenowane na próbkach (--sample)")
+    parser.add_argument("--split", choices=["val", "test"], default="val",
+                        help="Zbiór analizy; 'test' wyłącznie do raportu końcowego")
+    parser.add_argument("--sample", type=int, default=None,
+                        help="Stratyfikowana próbka wierszy — do szybkich testów")
     parser.add_argument(
-        "--model-paths", "-m",
-        nargs="+",
-        type=Path,
-        default=sorted(Path(MODELS_DIR).glob("*.joblib")),
-        help="Ścieżki do plików modeli .joblib",
+        "--output", "-o", type=Path, default=None,
+        help="Plik raportu (domyślnie results/reports/uncertainty_<split>.txt)",
     )
-    parser.add_argument(
-        "--output", "-o",
-        type=Path,
-        default=REPORTS_DIR / "uncertainty_report.txt",
-        help="Ścieżka pliku raportu",
-    )
-    parser.add_argument(
-        "--json",
-        type=Path,
-        default=None,
-        help="Opcjonalnie: zapisz szczegółowe wyniki jako JSON",
-    )
-    parser.add_argument(
-        "--shap",
-        action="store_true",
-        help="Dodaj SHAP analysis (na próbce 500 testowych, ~1-3 min)",
-    )
-    parser.add_argument(
-        "--shap-samples",
-        type=int,
-        default=500,
-        help="Liczba próbek do SHAP (default: 500)",
-    )
+    parser.add_argument("--json", type=Path, default=None,
+                        help="Opcjonalnie: zapisz szczegółowe wyniki jako JSON")
+    parser.add_argument("--shap", action="store_true",
+                        help="Dodaj analizę SHAP (wymaga model.joblib; ~1–3 min)")
+    parser.add_argument("--shap-samples", type=int, default=500, help="Liczba próbek do SHAP")
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
-    # Ładuj dane testowe
-    from src.data.preprocessing import build_feature_groups, split_features
-    from src.models.train import load_splits
+    # Modele / runy
+    models: dict[str, Any] = {}
+    if args.model_paths:
+        log.info(f"Ładowanie modeli ({len(args.model_paths)})…")
+        models = load_models(args.model_paths)
+        df = load_eval_frame(models, args.split, args.sample)
+        log.info(f"Predykcje na '{args.split}' ({len(df):,} wierszy)…")
+        probas = compute_predictions(models, df)
+        y_true = df[TARGET_COL].to_numpy()
+    else:
+        from src.ensemble import latest_runs, load_run
 
-    log.info("Ładowanie danych testowych…")
-    splits = load_splits()
-    groups = build_feature_groups(splits["train"])
-    X_test, y_test, _ = split_features(splits["test"], groups, "triage_only")
-    feature_names = list(X_test.columns)
-    log.info(f"X_test: {X_test.shape}, y_test: {y_test.shape}")
-
-    # Ładuj modele
-    log.info(f"Ładowanie modeli ({len(args.model_paths)})…")
-    models = load_models(args.model_paths)
-
-    # Predykcje
-    log.info("Obliczanie predykcji…")
-    probas = compute_predictions(models, X_test)
+        if args.runs:
+            runs = [load_run(r) for r in args.runs]
+        else:
+            runs = latest_runs(args.feature_set, include_samples=args.include_samples)
+        if not runs:
+            hint = "" if args.include_samples else " (runy na próbkach pomijane — dodaj --include-samples)"
+            raise SystemExit(f"Brak runów w {RUNS_DIR}{hint}. Najpierw: python scripts/03_train.py")
+        log.info("Runy: " + ", ".join(r.name for r in runs))
+        y_true, probas = probas_from_runs(runs, args.split, args.sample)
+        if args.shap:
+            paths = [r.path / "model.joblib" for r in runs if (r.path / "model.joblib").exists()]
+            models = load_models(paths)
+    log.info(f"Wierszy: {len(y_true):,}, modeli: {len(probas)}")
 
     # UQ
     log.info("Analiza Uncertainty Quantification…")
-    result = compute_ensemble_uq(probas, y_true=y_test.values)
+    result = compute_ensemble_uq(probas, y_true=y_true)
 
     # SHAP (opcjonalny)
-    shap_results = {}
-    if args.shap and len(models) > 0:
-        log.info(f"SHAP analysis ({args.shap_samples} samples)…")
-        X_train, y_train, _ = split_features(splits["train"], groups, "triage_only")
-        bg = X_train.sample(n=min(200, len(X_train)), random_state=42)
-
+    shap_results: dict[str, dict[str, Any] | None] = {}
+    if args.shap and models:
+        log.info(f"Analiza SHAP ({args.shap_samples} próbek)…")
+        df_shap = load_eval_frame(models, args.split, args.shap_samples)
         for name, model in models.items():
-            sr = compute_model_shap(
-                model, name, bg, X_test, feature_names,
-                n_samples=args.shap_samples,
+            X = model_features(model, df_shap)
+            shap_results[name] = compute_model_shap(
+                model.model, name, X, list(X.columns), n_samples=args.shap_samples,
             )
-            if sr is not None:
-                shap_results[name] = sr
-            else:
-                shap_results[name] = None
-                log.info(f"  {name}: SHAP pominięty (brak TreeSHAP)")
+            if shap_results[name] is None:
+                log.info(f"  {name}: SHAP pominięty (brak TreeSHAP albo błąd)")
 
     # Raport
-    report_parts = [ensemble_report(result)]
+    report = ensemble_report(result)
     if shap_results:
-        report_parts.append("\n".join(shap_section(shap_results, len(models))))
-    report = "".join(report_parts)
-
+        report += "\n" + "\n".join(shap_section(shap_results, len(models)))
     print(report)
 
-    # Zapisz raport
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
-        f.write(report)
-    log.info(f"Raport zapisany: {args.output}")
+    output = args.output or REPORTS_DIR / f"uncertainty_{args.split}.txt"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(report, encoding="utf-8")
+    log.info(f"Raport zapisany: {output}")
 
-    # JSON
     if args.json:
         serializable = _make_serializable(result)
         if shap_results:
-            serializable["shap"] = {
-                name: res for name, res in shap_results.items() if res is not None
-            }
+            serializable["shap"] = {name: res for name, res in shap_results.items() if res is not None}
         args.json.parent.mkdir(parents=True, exist_ok=True)
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(serializable, f, indent=2, ensure_ascii=False)
         log.info(f"JSON zapisany: {args.json}")
 
 
-def _make_serializable(result: dict[str, Any]) -> dict[str, Any]:
-    """Konwertuje tablice numpy na listy do JSON."""
-    out = {}
-    for k, v in result.items():
-        if k == "per_model":
-            out[k] = {
-                name: {
-                    mk: mv.tolist() if isinstance(mv, np.ndarray) else mv
-                    for mk, mv in md.items()
-                }
-                for name, md in v.items()
-            }
-        elif k == "ensemble":
-            out[k] = {
-                mk: mv.tolist() if isinstance(mv, np.ndarray) else mv
-                for mk, mv in v.items()
-            }
-        elif isinstance(v, np.ndarray):
-            out[k] = v.tolist()
-        elif isinstance(v, dict):
-            out[k] = _make_serializable(v)
-        else:
-            out[k] = v
-    return out
+def _make_serializable(value: Any) -> Any:
+    """Konwertuje tablice i skalary numpy (także zagnieżdżone) na typy JSON."""
+    if isinstance(value, dict):
+        return {k: _make_serializable(v) for k, v in value.items()}
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 if __name__ == "__main__":

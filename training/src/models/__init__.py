@@ -1,12 +1,23 @@
-"""Implementacje modeli ML do klasyfikacji triażu MTS."""
+"""
+Modele klasyfikacji ESI (5 klas: ESI 1–5).
+
+Zestaw celowo zróżnicowany — pod ręczne łączenie modeli:
+    xgboost        gradient boosting, drzewa poziomowe
+    lightgbm       gradient boosting, drzewa liść-po-liściu
+    catboost       gradient boosting, drzewa symetryczne
+    random_forest  bagging (inny mechanizm niż boosting)
+    ebm            Explainable Boosting Machine — interpretowalny GAM
+    logreg         regresja logistyczna — liniowy punkt odniesienia
+
+Usunięte: hist_gbt (powielał LightGBM), extra_trees (powielał RF),
+stacking (łączenie modeli robione ręcznie na predykcjach z runs/).
+"""
 
 from src.models.base import BaseTriageModel, compute_sample_weights
 from src.models.catboost_model import CatBoostTriageModel
 from src.models.ebm_model import EBMTriageModel
-from src.models.extra_trees import ExtraTreesTriageModel
-from src.models.fusion_model import StackingTriageModel
-from src.models.hist_gbt import HistGradientBoostingTriageModel
 from src.models.lightgbm_model import LightGBMTriageModel
+from src.models.logreg_model import LogisticRegressionTriageModel
 from src.models.random_forest import RandomForestTriageModel
 from src.models.xgboost_model import XGBoostTriageModel
 
@@ -14,39 +25,41 @@ __all__ = [
     "BaseTriageModel",
     "CatBoostTriageModel",
     "EBMTriageModel",
-    "ExtraTreesTriageModel",
-    "HistGradientBoostingTriageModel",
     "LightGBMTriageModel",
+    "LogisticRegressionTriageModel",
     "RandomForestTriageModel",
-    "StackingTriageModel",
     "XGBoostTriageModel",
     "compute_sample_weights",
 ]
 
 
-# Rejestr modeli — używany przez `train.py` do wyboru modelu z CLI
+# Rejestr modeli — kolejność = kolejność treningu w `--model all`
+# (od najszybszych do najwolniejszych).
 MODEL_REGISTRY: dict[str, type[BaseTriageModel]] = {
-    "xgboost": XGBoostTriageModel,
+    "logreg": LogisticRegressionTriageModel,
     "lightgbm": LightGBMTriageModel,
-    "random_forest": RandomForestTriageModel,
-    "rf": RandomForestTriageModel,
-    "extra_trees": ExtraTreesTriageModel,
-    "et": ExtraTreesTriageModel,
-    "hist_gbt": HistGradientBoostingTriageModel,
-    "hgbt": HistGradientBoostingTriageModel,
-    "ebm": EBMTriageModel,
+    "xgboost": XGBoostTriageModel,
     "catboost": CatBoostTriageModel,
-    "cb": CatBoostTriageModel,
-    "stacking": StackingTriageModel,
-    "fusion": StackingTriageModel,
+    "random_forest": RandomForestTriageModel,
+    "ebm": EBMTriageModel,
+}
+
+MODEL_ALIASES: dict[str, str] = {
+    "lr": "logreg",
+    "lgbm": "lightgbm",
+    "xgb": "xgboost",
+    "cb": "catboost",
+    "rf": "random_forest",
 }
 
 
+def resolve_model_name(name: str) -> str:
+    key = MODEL_ALIASES.get(name.lower(), name.lower())
+    if key not in MODEL_REGISTRY:
+        raise ValueError(f"Nieznany model: '{name}'. Dostępne: {list(MODEL_REGISTRY)}")
+    return key
+
+
 def get_model(name: str, **kwargs) -> BaseTriageModel:
-    """Fabryka — zwraca instancję modelu po nazwie."""
-    name_lower = name.lower()
-    if name_lower not in MODEL_REGISTRY:
-        raise ValueError(
-            f"Nieznany model: '{name}'. Dostępne: {sorted(MODEL_REGISTRY.keys())}"
-        )
-    return MODEL_REGISTRY[name_lower](**kwargs)
+    """Fabryka — zwraca instancję modelu po nazwie (lub aliasie)."""
+    return MODEL_REGISTRY[resolve_model_name(name)](**kwargs)

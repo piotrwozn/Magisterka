@@ -1,16 +1,23 @@
 """
-Unified training pipeline.
+Trening modeli ESI — jeden punkt wejścia.
 
-Łączy wszystkie modele w jednym CLI:
-    python -m src.models.train --model xgboost --feature-set triage_only --tune
+    python scripts/03_train.py --model all                 # wszystkie modele, zestaw 'triage'
+    python scripts/03_train.py --model lightgbm            # jeden model
+    python scripts/03_train.py --model xgboost --tune -n 50
+    python scripts/03_train.py --model all --feature-set full
+    python scripts/03_train.py --model all --sample 20000  # szybki test pipeline'u
 
-Pełen przebieg:
-    1. Załaduj splity (train/val/test).
-    2. Wybierz feature set (triage_only/full/top).
-    3. Opcjonalnie tuning Optuną.
-    4. Trening + automatyczne logowanie.
-    5. Ewaluacja na zbiorze test.
-    6. Zapis modelu + JSON-a eksperymentu + raportu.
+Przebieg dla każdego modelu:
+    1. Dane: splity z `scripts/02_preprocess.py` (przygotowane automatycznie, jeśli brak).
+    2. Z TRAIN wydzielane 10% na early stopping — `val` zostaje nietknięty.
+    3. (Opcjonalnie) tuning Optuną: CV na części treningowej.
+    4. Trening + predykcje na `val` i `test`.
+    5. Metryki dla dwóch reguł decyzyjnych: argmax i minimalny koszt oczekiwany.
+    6. Zapis do runs/<run>/ + dopisanie wiersza do runs/leaderboard.csv.
+
+Protokół łączenia modeli (ręcznie, zob. src/ensemble):
+    wagi / progi / kalibrację dobieraj na `predictions_val.parquet`,
+    raportuj na `predictions_test.parquet`.
 """
 
 from __future__ import annotations
@@ -20,267 +27,346 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from src.data.preprocessing import build_feature_groups, split_features
-from src.models import MODEL_REGISTRY, get_model
-from src.models.tuning import filter_features_by_importance_1fold, tune_model
+from src.data.dataset import (
+    early_stopping_split,
+    ensure_prepared,
+    get_xy,
+    load_splits,
+    manifest,
+    resolve_feature_set,
+    sample_frame,
+)
+from src.evaluation.metrics import decide, full_evaluation
+from src.models import MODEL_REGISTRY, get_model, resolve_model_name
 from src.utils.config import (
-    DATA_PROCESSED_DIR,
-    EXPERIMENTS_DIR,
-    MODELS_DIR,
+    CLASS_NAMES,
+    DATA_VERSION,
+    DEFAULT_SAMPLE_WEIGHT_STRATEGY,
     OPTUNA_N_TRIALS,
-    REPORTS_DIR,
-    TEST_PARQUET,
-    TRAIN_PARQUET,
-    VAL_PARQUET,
+    OPTUNA_N_TRIALS_PER_MODEL,
+    OPTUNA_STORAGE_DIR,
+    TUNE_CV_FOLDS,
+    TUNE_MAX_ROWS,
+    RUNS_DIR,
 )
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
+DECISION_RULES = ("argmax", "cost")
+PROBA_COLS = [f"p_{name.lower()}" for name in CLASS_NAMES]   # p_esi1 … p_esi5
+LEADERBOARD_CSV = RUNS_DIR / "leaderboard.csv"
 
-# ─────────────────────────────────────────
-# Ładowanie splitów
-# ─────────────────────────────────────────
-def load_splits(
-    train_path: Path = TRAIN_PARQUET,
-    val_path: Path = VAL_PARQUET,
-    test_path: Path = TEST_PARQUET,
-) -> dict[str, pd.DataFrame]:
-    """Ładuje train/val/test z parquet."""
-    paths = {"train": train_path, "val": val_path, "test": test_path}
-    splits = {}
-
-    for name, path in paths.items():
-        if not Path(path).exists():
-            raise FileNotFoundError(
-                f"Brak pliku {path}. "
-                f"Uruchom: `python scripts/02_preprocess.py`"
-            )
-        log.info(f"Ładowanie {name}: {path}")
-        splits[name] = pd.read_parquet(path)
-
-    return splits
+# Metryki trafiające do leaderboardu (dla val i test, obie reguły)
+LEADERBOARD_METRICS = [
+    "quadratic_weighted_kappa", "f1_macro", "auc_macro", "log_loss", "brier",
+    "undertriage_rate", "critical_miss_rate", "overtriage_rate",
+    "mistriage_under", "mistriage_over", "expected_cost",
+]
 
 
 # ─────────────────────────────────────────
-# Główna funkcja treningu
+# Pomocnicze
+# ─────────────────────────────────────────
+def _predictions_frame(meta: pd.DataFrame, proba: np.ndarray) -> pd.DataFrame:
+    out = meta[["row_id", "site", "esi", "target"]].reset_index(drop=True).copy()
+    proba = np.asarray(proba, dtype=np.float32)
+    for i, col in enumerate(PROBA_COLS):
+        out[col] = proba[:, i]
+    for rule in DECISION_RULES:
+        out[f"pred_{rule}"] = decide(proba, rule)
+    return out
+
+
+def _evaluate(y: pd.Series, proba: np.ndarray, split: str, admitted: pd.Series | None = None) -> dict:
+    metrics: dict = {}
+    for rule in DECISION_RULES:
+        y_pred = decide(proba, rule)
+        res = full_evaluation(y, y_pred, proba, prefix=f"{split}_{rule}", print_report=(rule == "argmax"))
+        metrics.update(res)
+    if admitted is not None:
+        metrics.update(_admission_validity(y, proba, admitted, split))
+    return metrics
+
+
+def _admission_validity(y: pd.Series, proba: np.ndarray, admitted: pd.Series, split: str) -> dict:
+    """
+    Trafność kliniczna niezależna od etykiety: czy przewidywana pilność przewiduje
+    przyjęcie do szpitala? Porównanie z ESI nadanym przez pielęgniarkę.
+
+    Wynik modelu = oczekiwany poziom ESI (Σ p·k); niższy = pilniej → większa szansa przyjęcia.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    adm = np.asarray(admitted).astype(int)
+    if adm.min() == adm.max():
+        return {}
+    expected_level = np.asarray(proba) @ np.arange(proba.shape[1])
+    return {
+        f"{split}_admission_auc_model": float(roc_auc_score(adm, -expected_level)),
+        f"{split}_admission_auc_nurse_esi": float(roc_auc_score(adm, -np.asarray(y))),
+    }
+
+
+def _append_leaderboard(row: dict) -> None:
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    df_row = pd.DataFrame([row])
+    if LEADERBOARD_CSV.exists():
+        existing = pd.read_csv(LEADERBOARD_CSV)
+        df_row = pd.concat([existing, df_row], ignore_index=True)
+    df_row.to_csv(LEADERBOARD_CSV, index=False)
+
+
+def _json_default(obj):
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return None if np.isnan(obj) else float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, Path):
+        return str(obj)
+    return str(obj)
+
+
+# ─────────────────────────────────────────
+# Trening jednego modelu
 # ─────────────────────────────────────────
 def run_training(
     model_name: str,
-    feature_set: str = "triage_only",
+    feature_set: str = "triage",
     tune: bool = False,
-    n_trials: int = OPTUNA_N_TRIALS,
-    sample_weight_strategy: str = "custom",
+    n_trials: int | None = None,
+    tune_metric: str = "logloss",
+    tune_rows: int | None = TUNE_MAX_ROWS,
+    cv_folds: int = TUNE_CV_FOLDS,
+    sample_weight_strategy: str = DEFAULT_SAMPLE_WEIGHT_STRATEGY,
     use_mlflow: bool = False,
     save_model: bool = True,
     custom_params: dict | None = None,
-    resume_run_id: str | None = None,
-    do_filter: bool = True,
+    do_filter: bool = False,
+    train_sample: int | None = None,
+    eval_sample: int | None = None,
+    tag: str | None = None,
 ) -> dict:
     """
     Pełen pipeline treningu jednego modelu.
 
-    Parameters
-    ----------
-    model_name : str
-        'xgboost' | 'lightgbm' | 'random_forest' | 'ebm' | 'stacking'
-    feature_set : str
-        'triage_only' | 'full' | 'top'
-    tune : bool
-        Czy uruchomić Optunę przed treningiem finalnym.
-    n_trials : int
-        Liczba prób Optuny.
-    sample_weight_strategy : str
-        'balanced' | 'custom' | 'none'
-    use_mlflow : bool
-    save_model : bool
-
     Returns
     -------
-    dict z metadanymi runa.
+    dict z metrykami i ścieżką katalogu runa.
     """
+    model_name = resolve_model_name(model_name)
+    feature_set = resolve_feature_set(feature_set)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log.info(f"╔════════════════════════════════════════════════════════════╗")
-    log.info(f"║ Run ID: {run_id} | Model: {model_name:14s} | Features: {feature_set:12s} ║")
-    log.info(f"╚════════════════════════════════════════════════════════════╝")
+    run_name = f"{run_id}_{model_name}_{feature_set}" + (f"_{tag}" if tag else "")
+    run_dir = RUNS_DIR / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Załaduj splity
-    splits = load_splits()
-    df_train, df_val, df_test = splits["train"], splits["val"], splits["test"]
+    log.info("═" * 64)
+    log.info(f" Run: {run_name}")
+    log.info("═" * 64)
 
-    # 1b. Feature engineering (dodaje ~43 cechy kliniczne)
-    from src.features.engineering import engineer_features
-    df_train = engineer_features(df_train)
-    df_val = engineer_features(df_val)
-    df_test = engineer_features(df_test)
-    log.info(f"Dodano cechy inżynieryjne: {sum(1 for c in df_train.columns if c.endswith(('_flag','_score','_index','_proxy','_triad','_product','_ratio','_interaction','_instability','_deviation')))} nowych")
+    # 1. Dane
+    ensure_prepared()
+    splits = load_splits(feature_set=feature_set)
+    df_train = sample_frame(splits["train"], train_sample)
+    df_val = sample_frame(splits["val"], eval_sample)
+    df_test = sample_frame(splits["test"], eval_sample)
 
-    # 2. Identyfikuj grupy cech (na pełnym DataFrame, by uniknąć missingu kolumn)
-    groups = build_feature_groups(df_train)
+    X_train, y_train = get_xy(df_train, feature_set)
+    X_val, y_val = get_xy(df_val, feature_set)
+    X_test, y_test = get_xy(df_test, feature_set)
+    X_fit, y_fit, X_es, y_es = early_stopping_split(X_train, y_train)
+    log.info(f"Train {len(X_fit):,} (+{len(X_es):,} early stopping) | val {len(X_val):,} | "
+             f"test {len(X_test):,} | cechy: {X_train.shape[1]} ({feature_set})")
 
-    # 3. Wybierz feature set
-    X_train, y_train, feature_names = split_features(df_train, groups, feature_set=feature_set)
-    X_val, y_val, _ = split_features(df_val, groups, feature_set=feature_set)
-    X_test, y_test, _ = split_features(df_test, groups, feature_set=feature_set)
-
-    # 4. Opcjonalny 1-fold feature importance filter (przed tuningiem)
-    if do_filter and tune and len(feature_names) > 100:
-        log.info(f"Feature filter przed tuningiem ({len(feature_names)} cech → ?)")
-        filtered = filter_features_by_importance_1fold(
-            X_train, y_train, feature_names,
-            model_name=model_name,
-            min_importance=0.0,
-        )
-        dropped = [c for c in feature_names if c not in filtered]
-        if dropped:
-            log.info(f"Feature filter odrzucił {len(dropped)} cech")
-            X_train = X_train[filtered]
-            X_val = X_val[filtered]
-            X_test = X_test[filtered]
-            feature_names = filtered
-
-    # 5. (Opcjonalnie) Tuning
-    best_params = custom_params or {}
+    # 2. (Opcjonalnie) filtr cech + tuning — wyłącznie na części treningowej
+    feature_names = list(X_train.columns)
     tuning_info = None
+    best_params = dict(custom_params or {})
+    class_weights = None
     if tune:
-        log.info(f"Optuna tuning ({n_trials} trials)…")
-        # Per-model SQLite. /tmp/ na serwerze, /tmp/opencode/ w WSL
-        db_dir = Path("/tmp/opencode")
-        db_dir.mkdir(parents=True, exist_ok=True)
-        storage_path = db_dir / f"optuna_studies_{model_name}.db"
-        study_name = f"{model_name}_max_quality"
+        from src.models.tuning import filter_features_by_importance_1fold, tune_model
+
+        if do_filter:
+            kept = filter_features_by_importance_1fold(X_fit, y_fit, feature_names, model_name=model_name)
+            if len(kept) < len(feature_names):
+                log.info(f"Filtr cech: {len(feature_names)} → {len(kept)}")
+                feature_names = kept
+        OPTUNA_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        if n_trials is None:
+            n_trials = OPTUNA_N_TRIALS_PER_MODEL.get(model_name, OPTUNA_N_TRIALS)
         tuning_info = tune_model(
             model_name=model_name,
-            X_train=X_train,
-            y_train=y_train,
-            X_val=X_val,
-            y_val=y_val,
+            X_train=X_fit[feature_names],
+            y_train=y_fit,
             n_trials=n_trials,
+            metric=tune_metric,
+            n_folds=cv_folds,
+            max_rows=tune_rows,
             sample_weight_strategy=sample_weight_strategy,
-            storage_path=storage_path,
-            study_name=study_name,
+            storage_path=OPTUNA_STORAGE_DIR / f"optuna_{model_name}.db",
+            study_name=f"{model_name}_{feature_set}_{DATA_VERSION}"
+                       + (f"_rows{tune_rows}" if tune_rows else ""),
         )
-        # Rozdziel parametry modelu od wag klas
-        best_params = {
-            k: v for k, v in tuning_info["best_params"].items()
-            if not k.startswith("cw_")
-        }
-        class_weight_map = {
-            k: v for k, v in tuning_info["best_params"].items()
-            if k.startswith("cw_")
-        }
-        log.info(f"Best params: {best_params}")
-        log.info(f"Optuna class weights: {class_weight_map}")
+        best_params.update({k: v for k, v in tuning_info["best_params"].items() if not k.startswith("cw_")})
+        cw = {k: v for k, v in tuning_info["best_params"].items() if k.startswith("cw_")}
+        if cw:
+            class_weights = {i: float(cw.get(f"cw_{CLASS_NAMES[i].lower()}", 1.0)) for i in range(len(CLASS_NAMES))}
+            log.info(f"Wagi klas z Optuny: {class_weights}")
 
-    # 5. Trening finalnego modelu
-    model = get_model(model_name, params=best_params if best_params else None)
-
-    # Wstrzyknij wagi klas z Optuny do finalnego treningu
-    if tuning_info and class_weight_map:
-        parsed = {}
-        label_map = {"cw_red": 0, "cw_orange": 1, "cw_yellow": 2, "cw_green": 3, "cw_blue": 4}
-        for k, v in class_weight_map.items():
-            if k in label_map:
-                parsed[label_map[k]] = v
-        for cls_id in range(5):
-            if cls_id not in parsed:
-                parsed[cls_id] = 1.0  # fallback for old trials without cw_yellow
-        model.optuna_class_weights = parsed
-        log.info(f"Używam Optuna class weights w finalnym treningu: {parsed}")
-
+    # 3. Trening
+    model = get_model(model_name, params=best_params or None)
+    model.optuna_class_weights = class_weights
     model.fit(
-        X_train, y_train,
-        X_val=X_val, y_val=y_val,
+        X_fit[feature_names], y_fit,
+        X_val=X_es[feature_names], y_val=y_es,
         sample_weight_strategy=sample_weight_strategy,
         run_id=run_id,
         use_mlflow=use_mlflow,
         feature_set=feature_set,
     )
 
-    # 6. Ewaluacja na test set (lazy import — by uniknąć cyklu)
-    from src.evaluation.metrics import full_evaluation
+    # 4. Predykcje + metryki (val i test)
+    proba_val = model.predict_proba(X_val[feature_names])
+    proba_test = model.predict_proba(X_test[feature_names])
+    log.info("Ewaluacja na VAL…")
+    metrics = _evaluate(y_val, proba_val, "val", df_val["admitted"])
+    log.info("Ewaluacja na TEST…")
+    metrics.update(_evaluate(y_test, proba_test, "test", df_test["admitted"]))
 
-    log.info("Ewaluacja na zbiorze test…")
-    y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)
-    test_metrics = full_evaluation(y_test, y_pred, y_proba, prefix="test")
+    # 5. Zapis artefaktów
+    _predictions_frame(df_val, proba_val).to_parquet(run_dir / "predictions_val.parquet", index=False)
+    _predictions_frame(df_test, proba_test).to_parquet(run_dir / "predictions_test.parquet", index=False)
 
-    if model.tracker is not None:
-        model.tracker.log_metrics(test_metrics, prefix="")
-        model.tracker.save()
-        log.info(f"Pełne metadane runa: {model.tracker.json_path}")
-
-    # 7. Zapis modelu
     model_path = None
     if save_model:
-        model_path = model.save()
+        model_path = model.save(run_dir / "model.joblib")
 
-    # 8. Raport tekstowy
-    report_path = REPORTS_DIR / f"{model_name}_{run_id}_report.txt"
-    _write_report(report_path, model, test_metrics, tuning_info, run_id, feature_set)
+    importances = model.feature_importances()
+    if importances is not None:
+        importances.to_csv(run_dir / "feature_importance.csv", index=False)
+
+    info = {
+        "run_name": run_name,
+        "model": model_name,
+        "feature_set": feature_set,
+        "n_features": len(feature_names),
+        "sample_weight_strategy": sample_weight_strategy,
+        "class_weights": class_weights,
+        "tuned": tune,
+        "tune_metric": tune_metric if tune else None,
+        "params": model.params,
+        "data_version": DATA_VERSION,
+        "split_strategy": manifest().get("split_strategy"),
+        "n_fit": int(len(X_fit)),
+        "n_early_stopping": int(len(X_es)),
+        "n_val": int(len(X_val)),
+        "n_test": int(len(X_test)),
+        "train_sample": train_sample,
+        "eval_sample": eval_sample,
+        "training_duration_s": model.training_duration_s,
+        "tuning": tuning_info,
+        "class_names": CLASS_NAMES,
+        "proba_columns": PROBA_COLS,
+    }
+    (run_dir / "run_info.json").write_text(json.dumps(info, indent=2, default=_json_default))
+    (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=_json_default))
+    _write_report(run_dir / "report.md", info, metrics, importances)
+
+    row = {
+        "run_name": run_name,
+        "model": model_name,
+        "feature_set": feature_set,
+        "weights": sample_weight_strategy,
+        "tuned": tune,
+        "n_fit": len(X_fit),
+        "n_val": len(X_val),
+        "duration_s": round(model.training_duration_s or 0.0, 1),
+    }
+    for split in ("val", "test"):
+        for rule in DECISION_RULES:
+            for m in LEADERBOARD_METRICS:
+                key = f"{split}_{rule}_{m}"
+                if key in metrics:
+                    row[key] = metrics[key]
+        for key in (f"{split}_admission_auc_model", f"{split}_admission_auc_nurse_esi"):
+            if key in metrics:
+                row[key] = metrics[key]
+    _append_leaderboard(row)
+
+    log.info(f"QWK val (argmax/cost): {metrics['val_argmax_quadratic_weighted_kappa']:.4f} / "
+             f"{metrics['val_cost_quadratic_weighted_kappa']:.4f} | "
+             f"undertriage val (argmax/cost): {metrics['val_argmax_undertriage_rate']:.4f} / "
+             f"{metrics['val_cost_undertriage_rate']:.4f}")
+    log.info(f"Artefakty: {run_dir}")
 
     return {
-        "run_id": run_id,
+        "run_name": run_name,
+        "run_dir": str(run_dir),
         "model_name": model_name,
         "feature_set": feature_set,
-        "test_metrics": test_metrics,
-        "tuning": tuning_info,
+        "metrics": metrics,
         "model_path": str(model_path) if model_path else None,
-        "report_path": str(report_path),
-        "experiment_json": str(model.tracker.json_path) if model.tracker else None,
     }
 
 
-def _write_report(
-    path: Path,
-    model,
-    test_metrics: dict,
-    tuning_info: dict | None,
-    run_id: str,
-    feature_set: str,
-) -> None:
-    """Zapisuje czytelny raport tekstowy."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"{'=' * 60}\n")
-        f.write(f"SOR-AI: Raport treningu modelu\n")
-        f.write(f"{'=' * 60}\n\n")
-        f.write(f"Run ID:       {run_id}\n")
-        f.write(f"Model:        {model.name}\n")
-        f.write(f"Feature set:  {feature_set}\n")
-        f.write(f"Czas treningu: {model.training_duration_s:.1f} s\n")
-        f.write(f"Liczba cech:  {len(model.feature_names)}\n\n")
+def _fmt(v) -> str:
+    return f"{v:.4f}" if isinstance(v, float) else str(v)
 
-        f.write("HIPERPARAMETRY:\n")
-        f.write(json.dumps(model.params, indent=2, default=str))
-        f.write("\n\n")
 
-        if tuning_info:
-            f.write("OPTUNA TUNING:\n")
-            f.write(f"  Najlepsza wartość QWK: {tuning_info['best_value']:.4f}\n")
-            f.write(f"  Liczba prób: {tuning_info['n_trials']}\n")
-            f.write(f"  Najlepsze parametry:\n")
-            f.write(json.dumps(tuning_info["best_params"], indent=2))
-            f.write("\n\n")
-
-        f.write("METRYKI (TEST SET):\n")
-        for k, v in test_metrics.items():
-            if isinstance(v, float):
-                f.write(f"  {k:30s}: {v:.4f}\n")
-            else:
-                f.write(f"  {k:30s}: {v}\n")
-        f.write("\n")
-
-        # Top features
-        importances = model.feature_importances()
-        if importances is not None:
-            f.write("TOP 20 NAJWAŻNIEJSZYCH CECH:\n")
-            for _, row in importances.head(20).iterrows():
-                f.write(f"  {row['feature']:35s} {row['importance']:.4f}\n")
-
-    log.info(f"Raport zapisany: {path}")
+def _write_report(path: Path, info: dict, metrics: dict, importances: pd.DataFrame | None) -> None:
+    lines = [
+        f"# {info['run_name']}",
+        "",
+        f"- model: `{info['model']}`, zestaw cech: `{info['feature_set']}` ({info['n_features']} cech)",
+        f"- wagi: `{info['sample_weight_strategy']}`, tuning: {info['tuned']}",
+        f"- dane: `{info['data_version']}`, podział `{info['split_strategy']}`; "
+        f"fit {info['n_fit']:,} + early stopping {info['n_early_stopping']:,}, "
+        f"val {info['n_val']:,}, test {info['n_test']:,}",
+        f"- czas treningu: {info['training_duration_s'] or 0:.1f} s",
+        "",
+        "## Metryki",
+        "",
+        "| metryka | val · argmax | val · koszt | test · argmax | test · koszt |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for m in LEADERBOARD_METRICS + ["accuracy", "within_one_accuracy"]:
+        cells = [_fmt(metrics.get(f"{s}_{r}_{m}", "—")) for s in ("val", "test") for r in DECISION_RULES]
+        lines.append(f"| {m} | " + " | ".join(cells) + " |")
+    if "val_admission_auc_model" in metrics:
+        lines += [
+            "",
+            "Trafność kliniczna (AUC przewidywania przyjęcia do szpitala z pilności):",
+            "",
+            "| | val | test |",
+            "|---|---:|---:|",
+            f"| model (oczekiwany poziom ESI) | {_fmt(metrics.get('val_admission_auc_model'))} "
+            f"| {_fmt(metrics.get('test_admission_auc_model'))} |",
+            f"| ESI pielęgniarki | {_fmt(metrics.get('val_admission_auc_nurse_esi'))} "
+            f"| {_fmt(metrics.get('test_admission_auc_nurse_esi'))} |",
+        ]
+    lines += [
+        "",
+        "Reguła **koszt**: klasa minimalizująca oczekiwany koszt (niedotriażowanie 3× droższe).",
+        "",
+        "## Macierz pomyłek (test, argmax; wiersze = prawda ESI 1–5)",
+        "",
+        "| | " + " | ".join(CLASS_NAMES) + " |",
+        "|---|" + "---:|" * len(CLASS_NAMES),
+    ]
+    cm = metrics.get("test_argmax_confusion_matrix") or []
+    for name, row in zip(CLASS_NAMES, cm):
+        lines.append(f"| {name} | " + " | ".join(str(v) for v in row) + " |")
+    if importances is not None:
+        lines += ["", "## Top 25 cech", "", "| cecha | ważność |", "|---|---:|"]
+        for _, r in importances.head(25).iterrows():
+            lines.append(f"| `{r['feature']}` | {r['importance']:.4f} |")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ─────────────────────────────────────────
@@ -288,93 +374,78 @@ def _write_report(
 # ─────────────────────────────────────────
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Trening modelu triażowego SOR-AI",
+        description="Trening modeli klasyfikacji ESI (SOR-AI)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--model", "-m",
-        choices=sorted(MODEL_REGISTRY.keys()),
-        default="xgboost",
-        help="Który model trenować",
+        "--model", "-m", default="all",
+        help=f"'all', jeden model albo lista po przecinku. Dostępne: {', '.join(MODEL_REGISTRY)}",
+    )
+    parser.add_argument("--feature-set", "-f", default="triage", help="triage | full")
+    parser.add_argument("--tune", "-t", action="store_true", help="Tuning Optuną przed treningiem")
+    parser.add_argument("--n-trials", "-n", type=int, default=None,
+                        help=f"Liczba prób Optuny (domyślnie {OPTUNA_N_TRIALS}; EBM {OPTUNA_N_TRIALS_PER_MODEL.get('ebm')})")
+    parser.add_argument("--tune-metric", choices=["logloss", "qwk"], default="logloss",
+                        help="Cel tuningu: logloss (jakość prawdopodobieństw) albo qwk (+ wagi klas)")
+    parser.add_argument("--tune-rows", type=int, default=TUNE_MAX_ROWS,
+                        help="Próbka TRAIN do tuningu (0 = cały TRAIN); finalny trening zawsze na całości")
+    parser.add_argument("--cv-folds", type=int, default=TUNE_CV_FOLDS, help="Liczba foldów CV w tuningu")
+    parser.add_argument(
+        "--filter", action="store_true",
+        help="Przed tuningiem odrzuć cechy z zerową ważnością (szybki model na połowie danych)",
     )
     parser.add_argument(
-        "--feature-set", "-f",
-        choices=["triage_only", "full", "top"],
-        default="triage_only",
-        help="Zestaw cech",
+        "--weights", "-w", choices=["none", "balanced", "sqrt_balanced", "custom"],
+        default=DEFAULT_SAMPLE_WEIGHT_STRATEGY, help="Wagi klas w treningu",
     )
-    parser.add_argument(
-        "--tune", "-t",
-        action="store_true",
-        help="Uruchom Optuna tuning przed finalnym treningiem",
-    )
-    parser.add_argument(
-        "--filter",
-        action="store_true",
-        default=True,
-        help="1-fold feature importance filter przed tuningiem (usuwa cechy z zerową importance)",
-    )
-    parser.add_argument(
-        "--no-filter",
-        action="store_false",
-        dest="filter",
-        help="Pomiń 1-fold feature importance filter",
-    )
-    parser.add_argument(
-        "--n-trials", "-n",
-        type=int,
-        default=OPTUNA_N_TRIALS,
-        help="Liczba prób Optuny",
-    )
-    parser.add_argument(
-        "--weights", "-w",
-        choices=["balanced", "custom", "none"],
-        default="custom",
-        help="Strategia wag sampli",
-    )
-    parser.add_argument(
-        "--mlflow",
-        action="store_true",
-        help="Loguj równolegle do MLflow",
-    )
-    parser.add_argument(
-        "--no-save",
-        action="store_true",
-        help="Nie zapisuj modelu na dysk",
-    )
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Wznów tuning z podanego run_id (timestamp z nazwy pliku log)",
-    )
+    parser.add_argument("--sample", type=int, default=None,
+                        help="Losowa (stratyfikowana) próbka TRAIN — do szybkich testów")
+    parser.add_argument("--eval-sample", type=int, default=None,
+                        help="Próbka VAL i TEST — do szybkich testów (nie do raportowania!)")
+    parser.add_argument("--tag", default=None, help="Dopisek do nazwy runa")
+    parser.add_argument("--mlflow", action="store_true", help="Loguj równolegle do MLflow")
+    parser.add_argument("--no-save", action="store_true", help="Nie zapisuj pliku modelu")
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
-    result = run_training(
-        model_name=args.model,
-        feature_set=args.feature_set,
-        tune=args.tune,
-        n_trials=args.n_trials,
-        sample_weight_strategy=args.weights,
-        use_mlflow=args.mlflow,
-        save_model=not args.no_save,
-        resume_run_id=args.resume,
-        do_filter=args.filter,
-    )
+    if args.model.lower() == "all":
+        models = list(MODEL_REGISTRY)
+    else:
+        models = [resolve_model_name(m.strip()) for m in args.model.split(",") if m.strip()]
+
+    results = []
+    for name in models:
+        results.append(run_training(
+            model_name=name,
+            feature_set=args.feature_set,
+            tune=args.tune,
+            n_trials=args.n_trials,
+            tune_metric=args.tune_metric,
+            tune_rows=args.tune_rows or None,
+            cv_folds=args.cv_folds,
+            sample_weight_strategy=args.weights,
+            use_mlflow=args.mlflow,
+            save_model=not args.no_save,
+            do_filter=args.filter,
+            train_sample=args.sample,
+            eval_sample=args.eval_sample,
+            tag=args.tag,
+        ))
 
     log.info("╔════════════════════════════════════════════════════════════╗")
     log.info("║                     TRENING ZAKOŃCZONY                     ║")
     log.info("╚════════════════════════════════════════════════════════════╝")
-    log.info(f"Run ID:           {result['run_id']}")
-    log.info(f"Model:            {result['model_name']}")
-    log.info(f"Test QWK:         {result['test_metrics'].get('quadratic_weighted_kappa', 'N/A')}")
-    log.info(f"Test undertriage: {result['test_metrics'].get('undertriage_rate', 'N/A')}")
-    log.info(f"Model:            {result['model_path']}")
-    log.info(f"Raport:           {result['report_path']}")
-    log.info(f"Eksperyment JSON: {result['experiment_json']}")
+    for r in results:
+        m = r["metrics"]
+        log.info(
+            f"{r['model_name']:14s} QWK val {m['val_argmax_quadratic_weighted_kappa']:.4f} "
+            f"| AUC {m.get('val_argmax_auc_macro', float('nan')):.4f} "
+            f"| undertriage {m['val_argmax_undertriage_rate']:.4f} → {r['run_dir']}"
+        )
+    log.info(f"Zestawienie wszystkich runów: {LEADERBOARD_CSV}")
+    log.info("Porównanie i łączenie: python scripts/07_compare_runs.py")
 
 
 if __name__ == "__main__":

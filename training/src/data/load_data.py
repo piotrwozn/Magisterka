@@ -17,7 +17,6 @@ from pathlib import Path
 import pandas as pd
 
 from src.utils.config import (
-    PROCESSED_PARQUET,
     RAW_PARQUET,
     RDATA_FILE,
 )
@@ -133,42 +132,24 @@ def convert_rdata_to_parquet(
 # ─────────────────────────────────────────
 # Główna funkcja ładująca
 # ─────────────────────────────────────────
-def load_dataset(
-    use_processed: bool = False,
-    parquet_path: Path | str | None = None,
-) -> pd.DataFrame:
+def load_dataset(parquet_path: Path | str | None = None) -> pd.DataFrame:
     """
-    Ładuje dataset z najszybszego dostępnego źródła.
+    Ładuje SUROWY dataset Yale z najszybszego dostępnego źródła.
 
     Kolejność preferencji:
-        1. processed parquet (po preprocessing) — jeśli `use_processed=True`
+        1. `parquet_path` (jeśli podany)
         2. raw parquet (po `convert_rdata_to_parquet`)
         3. .RData (najwolniejsze)
 
-    Parameters
-    ----------
-    use_processed : bool
-        Czy preferować przetworzony parquet (po preprocessing).
-    parquet_path : Path | str, optional
-        Niestandardowa ścieżka do parquet.
-
-    Returns
-    -------
-    pd.DataFrame
+    Przygotowane splity ESI wczytuje `src.data.dataset.load_splits()`.
     """
     if parquet_path is not None:
         parquet_path = Path(parquet_path)
         log.info(f"Ładowanie z parquet: {parquet_path}")
         return pd.read_parquet(parquet_path)
 
-    target = PROCESSED_PARQUET if use_processed else RAW_PARQUET
-
-    if target.exists():
-        log.info(f"Ładowanie z parquet: {target}")
-        return pd.read_parquet(target)
-
     if RAW_PARQUET.exists():
-        log.info(f"Brak {target}, używam {RAW_PARQUET}")
+        log.info(f"Ładowanie z parquet: {RAW_PARQUET}")
         return pd.read_parquet(RAW_PARQUET)
 
     log.warning("Brak parquet. Ładowanie z .RData (powolne).")
