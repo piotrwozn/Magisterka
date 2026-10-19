@@ -39,6 +39,7 @@ from src.utils.config import (
     RANDOM_SEED,
     SHAP_BACKGROUND_SIZE,
     SHAP_TOP_FEATURES,
+    TOPSOR_COLORS,
 )
 from src.utils.logger import get_logger
 
@@ -54,6 +55,15 @@ METHOD_OUTPUT_SPACE: dict[str, str] = {
 }
 PERMUTATION_MAX_BACKGROUND: int = 100   # tło metody permutacyjnej (koszt ∝ tło × cechy)
 SKLEARN_TREE_CLASSES = ("RandomForestClassifier", "ExtraTreesClassifier", "DecisionTreeClassifier")
+
+# Kolory TOPSOR (do wykresów; kolejność = config.TOPSOR_COLORS = ESI 1 … ESI 5)
+TOPSOR_HEX: dict[str, str] = {
+    "Red": "#D32F2F",
+    "Orange": "#F57C00",
+    "Yellow": "#FBC02D",
+    "Green": "#388E3C",
+    "Blue": "#1976D2",
+}
 
 
 class ExplainerUnavailable(RuntimeError):
@@ -228,7 +238,8 @@ class SHAPTriageExplainer:
             best = getattr(target, "best_iteration", None) if type(target).__name__ == "XGBClassifier" else None
             if best is not None:
                 # XGBoost po early stopping trzyma też drzewa za best_iteration, a predict_proba
-                # ich nie używa — wyjaśniamy dokładnie ten model, który daje predykcje.
+                # ich nie używa — jawne przycięcie gwarantuje (niezależnie od wersji shap),
+                # że wyjaśniamy dokładnie ten model, który daje predykcje.
                 target = target.get_booster()[: int(best) + 1]
             try:
                 self.explainer = shap.TreeExplainer(target)
@@ -256,7 +267,8 @@ class SHAPTriageExplainer:
                 # Po standaryzacji średnia zbioru treningowego = 0 → tło zerowe
                 log.warning("SHAP (linear): brak tła — przyjmuję średnią treningową (zera po standaryzacji)")
                 bg = np.zeros((1, n_features))
-            self.explainer = shap.LinearExplainer(clf, bg)
+            masker = shap.maskers.Independent(bg, max_samples=len(bg))
+            self.explainer = shap.LinearExplainer(clf, masker)
             self.expected_value = np.asarray(self.explainer.expected_value, dtype=float).reshape(-1)
 
         elif self.method == "ebm":
@@ -326,12 +338,16 @@ class SHAPTriageExplainer:
                 arr = arr[:, :, None] if arr.ndim == 2 else arr
                 return arr.transpose(0, 2, 1), self.expected_value
 
-            if self.method == "tree":
-                raw_values = self.explainer.shap_values(X, check_additivity=False)
-                base = self.expected_value
-            elif self.method == "linear":
-                raw_values = self.explainer.shap_values(self._transform(X))
-                base = self.expected_value
+            if self.method in ("tree", "linear"):
+                data = X if self.method == "tree" else self._transform(X)
+                if self.method == "tree":
+                    raw_values = self.explainer.shap_values(data, check_additivity=False)
+                else:
+                    raw_values = self.explainer.shap_values(data)
+                # shap aktualizuje expected_value przy liczeniu (dla XGBoost wartość z fit()
+                # bywa nieaktualna) — odczytujemy ją ponownie, by zachować addytywność
+                base = np.asarray(self.explainer.expected_value, dtype=float).reshape(-1)
+                self.expected_value = base
             else:  # permutation
                 explanation = self.explainer(X.to_numpy(), max_evals=2 * X.shape[1] + 1, silent=True)
                 raw_values = explanation.values
@@ -518,6 +534,11 @@ def shap_summary_plot(
     class_names = class_names or CLASS_NAMES
     values = shap_values
     title = "SHAP — wszystkie poziomy ESI"
+    extra: dict[str, Any] = {}
+    if class_idx is None and isinstance(shap_values, list) and len(shap_values) == len(TOPSOR_COLORS):
+        # słupki w kolejności ESI 1 → 5 i w kolorach TOPSOR (shap indeksuje kolory pozycją słupka)
+        extra["class_inds"] = "original"
+        extra["color"] = lambda i: TOPSOR_HEX[TOPSOR_COLORS[i]]
     if class_idx is not None:
         values = shap_values[class_idx] if isinstance(shap_values, list) else np.asarray(shap_values)[:, class_idx, :]
         title = f"SHAP — {class_names[class_idx]}"
@@ -530,6 +551,7 @@ def shap_summary_plot(
             class_names=class_names,
             max_display=max_display,
             show=False,
+            **extra,
         )
         plt.title(title)
     except Exception as e:

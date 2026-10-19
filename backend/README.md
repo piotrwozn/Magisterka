@@ -27,8 +27,8 @@ backend/
 ├── app/                                 — FastAPI ML service
 ├── gateway/                             — Spring Boot API gateway (Java 21)
 ├── nginx/nginx.conf                     — Nginx config
-├── models/                              — joblib models + medians
-├── scripts/generate_imputation_medians.py
+├── models/                              — deployed joblib models + optional train medians
+├── scripts/generate_imputation_medians.py — train medians (diagnostics, cc_* vocabulary)
 ├── Dockerfile.fastapi
 ├── Dockerfile.gateway
 ├── docker-compose.yml
@@ -42,7 +42,7 @@ backend/
 ```bash
 cd backend
 pip install -r requirements.txt
-python scripts/generate_imputation_medians.py     # one-off
+python scripts/generate_imputation_medians.py     # optional; after re-preparing data
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -77,21 +77,48 @@ const USE_MOCK = false;
 | Layer | Component                | Status |
 |-------|--------------------------|--------|
 | 0     | Llama 3.2 3B parser      | stub (keyword-based) — swap with Ollama call |
-| 1A    | Ensemble ML (7 models)   | ✓ CatBoost + LightGBM live; XGB+RF+ET+HGB+EBM after training |
+| 1A    | Ensemble ML (6 models)   | ✓ XGBoost, LightGBM, CatBoost, Random Forest, EBM, LogReg (whatever is trained) |
 | 1B    | MedGemma 27B reasoning   | stub (deterministic) — swap with Ollama call |
 | 2     | Qwen3 32B synthesis      | not yet wired (conditional on conflict) |
 | safety| Hardcoded clinical rules | ✓ live |
-| SHAP  | Top-N explainer          | ✓ live (best loaded model) |
+| SHAP  | Top-N explainer          | ✓ live (best loaded tree model) |
 
-## Notes on current behaviour
+## Models and features
 
-The frontend collects only **7 vital signs + a clinical note**, but the trained
-models expect **336 features** (incl. demographics, dep_name, arrival_mode,
-ed_usage, 200 chief-complaint flags). The missing fields are filled with
-training-set medians, which biases the model toward the **majority class
-(Red, 68.6%)** for ambiguous inputs.
+**Label:** native ESI 1–5 (no mapping). Class index 0–4 = ESI 1–5; TOPSOR colours
+ESI 1 red … ESI 5 blue are display only.
 
-Critical cases (chest pain, stroke, sepsis) classify correctly. Mild cases
-tend to **overtriage** — which is the **safer failure mode** for a triage
-support system. Plugging in the real Llama 3.2 3B parser will materially
-improve the cc_* extraction and reduce this bias.
+**Where models come from** (`app/models/registry.py`, first valid artifact wins per model):
+
+1. `backend/models/<model>_*.joblib` — explicit deployment (copied into the Docker image),
+2. `models/<model>_*.joblib` in the repo root,
+3. `training/runs/<run>/model.joblib` — newest complete run (with `run_info.json`) per
+   model for the served feature set; full-data runs win over `--sample` smoke runs
+   (a smoke run is used only as a fallback, with a warning in the log).
+
+Feature names and class names are read from the artifact (`BaseTriageModel.save()`).
+Artifacts without `label="esi"` (pre-ESI, MTS-mapped) are skipped. The backend serves
+the `triage` feature set (276 features, `FEATURE_SET` in `.env`; `triage_only` = alias).
+
+**Per-patient row** (`app/pipeline/feature_engineering.py`) — the same canonical schema
+as training (`training/src/data/prepare.py` → `src/features/engineering.py`):
+
+| feature | source |
+|---|---|
+| `triage_vital_hr/sbp/dbp/rr/o2` | form |
+| `triage_vital_temp` | form, **°C — no conversion** (Yale °F is converted to °C in training) |
+| `age` | form (models are trained on adults ≥ 18 y) |
+| `is_male`, `triage_vital_o2_device` | request if available, else NaN |
+| `arrival_*` (one-hot) | request if available (`ZRM`/`karetka` → ambulance, `własny` → self, `policja` → police); missing → **self** |
+| `arrival_month`, `arrival_weekday` (1–7), `arrival_hour_bin` (0–5) | system clock |
+| `cc_*` (200 chief complaints) | Layer 0 parser — only real model columns |
+| 59 engineered features (NEWS2, qSOFA, shock index, ESI danger zone, …) | `engineer_features()` |
+
+Missing values stay **NaN**, exactly as in training (tree models/EBM handle NaN natively,
+logreg imputes inside its pipeline). Train medians (`models/imputation_medians.json`)
+are **not** imputed by default — they serve as diagnostics and as the cc_* vocabulary.
+
+A missing arrival mode defaults to `self`, not `arrival_unknown`: in Yale the
+"unknown" group is ~90% ESI 4–5, and forcing it on every request raised
+undertriage from 17% to 56% on the validation split. Collecting the real arrival
+mode (ZRM vs. own transport) in the form is the single cheapest accuracy gain.

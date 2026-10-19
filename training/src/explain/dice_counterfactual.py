@@ -2,11 +2,21 @@
 DiCE — Diverse Counterfactual Explanations.
 
 Counterfactuals odpowiadają na pytanie:
-    "Co by się musiało zmienić, żeby pacjent był Orange zamiast Yellow?"
+    "Co musiałoby się zmienić, żeby pacjent był ESI 2 zamiast ESI 3?"
 
 To kluczowa warstwa eksplanacyjna dla decyzji medycznych:
-    - Lekarz widzi nie tylko DLACZEGO model wybrał Yellow,
-      ale też CO musi się zmienić, by uzasadnić upgrade.
+    - Lekarz widzi nie tylko DLACZEGO model wybrał ESI 3,
+      ale też CO musiałoby się zmienić, by uzasadnić podniesienie pilności.
+
+Ograniczenia:
+    - DiCE nie obsługuje NaN — braki w danych tła i w wierszu pacjenta są
+      uzupełniane medianą (informacja o braku zostaje w cechach `*_missing`).
+    - DiCE zmienia cechy niezależnie: cechy pochodne (shock_index, news2_score …)
+      NIE są przeliczane po zmianie parametrów życiowych — interpretuj ostrożnie.
+    - Wszystkie cechy traktowane są jako ciągłe: cechy kategoryczne DiCE zamienia
+      na napisy, czego modele numeryczne (XGBoost, LightGBM …) nie przyjmują.
+      Dlatego domyślnie zmieniane są TYLKO parametry życiowe (`DEFAULT_FEATURES_TO_VARY`);
+      `features_to_vary="all"` pozwala zmieniać wszystko (także flagi 0/1 → wartości ułamkowe).
 """
 
 from __future__ import annotations
@@ -16,10 +26,20 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.utils.config import CLASS_NAMES
+from src.utils.config import CLASS_NAMES, CLASS_NAMES_PL, TARGET_COL
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
+
+# Parametry życiowe z triażu — domyślnie jedyne cechy zmieniane w counterfactuals
+DEFAULT_FEATURES_TO_VARY: list[str] = [
+    "triage_vital_hr",
+    "triage_vital_sbp",
+    "triage_vital_dbp",
+    "triage_vital_rr",
+    "triage_vital_o2",
+    "triage_vital_temp",
+]
 
 
 class DiCEExplainer:
@@ -29,7 +49,7 @@ class DiCEExplainer:
         self,
         model: Any,
         training_data: pd.DataFrame,
-        outcome_name: str = "mts_numeric",
+        outcome_name: str = TARGET_COL,
         continuous_features: list[str] | None = None,
         method: str = "random",
     ):
@@ -38,30 +58,31 @@ class DiCEExplainer:
         ----------
         model : BaseTriageModel | sklearn-like
         training_data : pd.DataFrame
-            Z kolumną outcome (target). Używana do estymacji feasible ranges.
+            Cechy modelu + kolumna outcome (indeks klasy 0–4 = ESI 1–5).
+            Używana do estymacji dopuszczalnych zakresów.
         outcome_name : str
+            Kolumna z klasą (domyślnie config.TARGET_COL = 'target').
         continuous_features : list[str], optional
-            Lista cech ciągłych (np. vital signs). Auto-detekcja jeśli None.
+            Lista cech ciągłych. None = wszystkie cechy modelu (patrz uwagi w nagłówku modułu).
         method : str
             'random' (domyślne, najszybszy) | 'genetic' | 'kdtree'
         """
         self.model = model
-        self.training_data = training_data
         self.outcome_name = outcome_name
         self.method = method
 
-        # Auto-detekcja cech ciągłych
-        if continuous_features is None:
-            continuous_features = []
-            for col in training_data.columns:
-                if col == outcome_name:
-                    continue
-                if pd.api.types.is_numeric_dtype(training_data[col]):
-                    nunique = training_data[col].nunique()
-                    # Heurystyka: jeśli więcej niż 20 unikalnych wartości — ciągłe
-                    if nunique > 20:
-                        continuous_features.append(col)
-        self.continuous_features = continuous_features
+        # Kolejność cech zgodna z modelem; braki → mediana (DiCE nie obsługuje NaN)
+        names = getattr(model, "feature_names", None) or [
+            c for c in training_data.columns if c != outcome_name
+        ]
+        self.feature_names = list(names)
+        features = training_data.reindex(columns=self.feature_names).astype(np.float64)
+        self.fill_values = features.median().fillna(0.0)
+        self.training_data = features.fillna(self.fill_values)
+        self.training_data[outcome_name] = training_data[outcome_name].astype(int).to_numpy()
+
+        # Wszystkie cechy jako ciągłe (kategorie DiCE = napisy, nieakceptowane przez modele)
+        self.continuous_features = list(continuous_features or self.feature_names)
 
         self.dice_data = None
         self.dice_model = None
@@ -116,12 +137,12 @@ class DiCEExplainer:
         patient : pd.DataFrame (1 row)
             Bez kolumny outcome.
         desired_class : int
-            Pożądana klasa (np. 1 = Orange).
+            Pożądany indeks klasy 0–4 (np. 1 = ESI 2).
         total_cfs : int
             Liczba counterfactuals.
-        features_to_vary : list[str], optional
-            Które cechy mogą się zmieniać (None = wszystkie poza target).
-            Dla SOR: vital signs są variable, ale demographics fixed.
+        features_to_vary : list[str] | 'all', optional
+            Które cechy mogą się zmieniać. None = parametry życiowe obecne w modelu
+            (`DEFAULT_FEATURES_TO_VARY`) — demografia, przybycie i skargi stałe.
         permitted_range : dict, optional
             Dozwolone zakresy: {feature: [min, max]}.
 
@@ -137,14 +158,12 @@ class DiCEExplainer:
 
         # DiCE chce features_to_vary jako string "all" lub list
         if features_to_vary is None:
-            features_to_vary_arg = "all"
+            features_to_vary_arg = [c for c in DEFAULT_FEATURES_TO_VARY if c in self.feature_names]
         else:
             features_to_vary_arg = features_to_vary
 
-        # Drop outcome jeśli jest
-        query = patient.copy()
-        if self.outcome_name in query.columns:
-            query = query.drop(columns=[self.outcome_name])
+        # Kolumny modelu (bez outcome), braki → mediana
+        query = patient.reindex(columns=self.feature_names).astype(np.float64).fillna(self.fill_values)
 
         try:
             cfs = self.explainer.generate_counterfactuals(
@@ -205,6 +224,9 @@ class DiCEExplainer:
             "desired_class_name": (
                 CLASS_NAMES[desired_class] if 0 <= desired_class < len(CLASS_NAMES) else str(desired_class)
             ),
+            "desired_class_pl": (
+                CLASS_NAMES_PL[desired_class] if 0 <= desired_class < len(CLASS_NAMES_PL) else str(desired_class)
+            ),
         }
 
     def format_changes_text(
@@ -217,7 +239,8 @@ class DiCEExplainer:
             return "Nie udało się znaleźć counterfactuals."
 
         out = []
-        target_name = cf_result.get("desired_class_name", "?")
+        # Krótka etykieta: "ESI 2 · pomarańczowy" (bez czasu oczekiwania)
+        target_name = str(cf_result.get("desired_class_pl") or cf_result.get("desired_class_name", "?")).split(" (")[0]
         if original_class_name:
             out.append(f"Aby zmienić klasyfikację z {original_class_name} na {target_name}, należałoby:\n")
         else:

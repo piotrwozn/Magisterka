@@ -5,16 +5,13 @@ Sprawdza, że każdy fit() modelu:
     1. Tworzy plik logu w logs/training/<model>/<run_id>.log
     2. Tworzy JSON eksperymentu w logs/experiments/<model>_<run_id>.json
     3. Loguje hiperparametry, statystyki danych, czas treningu
-    4. Zapisuje training_history (dla XGBoost/LightGBM)
+    4. Zapisuje training_history (modele z early stopping: XGBoost / LightGBM / CatBoost)
 """
 
 from __future__ import annotations
 
 import json
-import time
-from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -125,45 +122,83 @@ class TestTrainingLogger:
 
 
 class TestModelLoggingIntegration:
-    """Integracja modelu z trackingiem — full pipeline."""
+    """Integracja modelu z trackingiem — każdy fit() zapisuje log i JSON eksperymentu."""
 
-    def test_xgboost_creates_logs(self, synthetic_X_y, tmp_path, monkeypatch):
-        """Pełen test: XGBoost.fit() musi utworzyć log + JSON eksperymentu."""
-        # Przekierowujemy logi do tmp_path
+    FAST_PARAMS = {
+        "logreg": {"max_iter": 300},
+        "lightgbm": {"n_estimators": 10, "num_leaves": 7, "min_child_samples": 5},
+        "xgboost": {"n_estimators": 10, "max_depth": 3, "early_stopping_rounds": 5},
+        "catboost": {"iterations": 10, "depth": 3, "verbose": 0},
+        "random_forest": {"n_estimators": 10},
+        "ebm": {"max_rounds": 50, "outer_bags": 1, "early_stopping_rounds": 10},
+    }
+    # Fragment komunikatu w logu treningu (logi po polsku)
+    LOG_LABEL = {
+        "logreg": "regresji logistycznej",
+        "lightgbm": "LightGBM",
+        "xgboost": "XGBoost",
+        "catboost": "CatBoost",
+        "random_forest": "Random Forest",
+        "ebm": "EBM",
+    }
+    # Modele z historią iteracji (early stopping na zbiorze ES)
+    WITH_HISTORY = {"lightgbm", "xgboost", "catboost"}
+
+    @pytest.fixture
+    def log_dirs(self, tmp_path, monkeypatch):
         from src.utils import config
 
         monkeypatch.setattr(config, "TRAINING_LOGS_DIR", tmp_path / "training")
         monkeypatch.setattr(config, "EXPERIMENTS_DIR", tmp_path / "experiments")
+        return tmp_path
 
-        from src.models.xgboost_model import XGBoostTriageModel
+    def test_registry_matches_checked_models(self):
+        from src.models import MODEL_REGISTRY
+
+        assert set(MODEL_REGISTRY) == set(self.FAST_PARAMS)
+        assert "extra_trees" not in MODEL_REGISTRY
+        assert "hist_gbt" not in MODEL_REGISTRY
+
+    @pytest.mark.parametrize("name", ["logreg", "lightgbm", "xgboost", "catboost", "random_forest", "ebm"])
+    def test_fit_creates_log_and_experiment_json(self, synthetic_X_y, log_dirs, name):
+        from src.models import get_model
 
         X, y = synthetic_X_y
-        model = XGBoostTriageModel(params={
-            "n_estimators": 5,
-            "max_depth": 3,
-            "early_stopping_rounds": None,
-        })
+        X_fit, y_fit, X_es, y_es = X.iloc[:320], y.iloc[:320], X.iloc[320:], y.iloc[320:]
+        model = get_model(name, params=self.FAST_PARAMS[name])
 
-        run_id = "integration_test"
-        model.fit(X, y, X_val=X, y_val=y, run_id=run_id)
+        run_id = f"integration_{name}"
+        model.fit(X_fit, y_fit, X_val=X_es, y_val=y_es, run_id=run_id, feature_set="triage")
 
-        # Sprawdź log
-        log_path = tmp_path / "training" / "xgboost" / f"{run_id}.log"
+        # Log treningu
+        log_path = log_dirs / "training" / name / f"{run_id}.log"
         assert log_path.exists(), f"Brak logu: {log_path}"
+        assert model.train_log_path == log_path
         log_text = log_path.read_text(encoding="utf-8")
-        assert "Trenowanie XGBoost" in log_text
-        assert "Iter" in log_text
-        assert "Trening XGBoost zakończony" in log_text
+        label = self.LOG_LABEL[name]
+        assert f"Trenowanie {label}" in log_text
+        assert f"Trening {label} zakończony" in log_text
+        assert "Wagi sampli" in log_text
+        assert "Rozkład klas (train)" in log_text
 
-        # Sprawdź JSON
-        json_path = tmp_path / "experiments" / f"xgboost_{run_id}.json"
+        # JSON eksperymentu
+        json_path = log_dirs / "experiments" / f"{name}_{run_id}.json"
         assert json_path.exists(), f"Brak JSON: {json_path}"
-        with open(json_path) as f:
+        assert model.tracker.json_path == json_path
+        with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
 
-        assert data["model_name"] == "xgboost"
+        assert data["model_name"] == name
         assert data["run_id"] == run_id
-        assert len(data["training_history"]) > 0
-        assert "params" in data
-        assert "data" in data
-        assert data["data"]["n_features"] > 0
+        assert data["params"]
+        assert data["data"]["n_features"] == X.shape[1]
+        assert data["data"]["n_train"] == len(X_fit)
+        assert data["data"]["n_val"] == len(X_es)
+        assert data["data"]["feature_set"] == "triage"
+        assert data["duration_seconds"] >= 0
+        assert data["artifacts"]["training_log"] == str(log_path.resolve())
+        if name in self.WITH_HISTORY:
+            assert len(data["training_history"]) > 0
+            assert "Iter" in log_text
+        if model.feature_importances() is not None:
+            assert data["feature_importances"]

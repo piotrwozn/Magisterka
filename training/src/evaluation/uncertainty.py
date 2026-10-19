@@ -241,9 +241,9 @@ def ensemble_report(result: dict[str, Any]) -> str:
     lines.append(f"Modeli w zestawie:   {len(result['per_model'])}")
     lines.append("")
     lines.append("--- Zgodność modeli ---")
-    lines.append(f"Pełna zgodność (unanimity):   {n_unanimous:>6} ({n_unanimous/n*100:>5.1f}%)")
-    lines.append(f"Średnia zgodność:             {result['agreement'].mean()*100:>5.1f}%")
-    lines.append(f"Konflikt (różnica ≥2 poziomy): {n_conflict:>6} ({n_conflict/n*100:>5.1f}%)")
+    lines.append(f"{'Pełna zgodność (unanimity):':<31s}{n_unanimous:>6} ({n_unanimous/n*100:>5.1f}%)")
+    lines.append(f"{'Średnia zgodność:':<31s}{result['agreement'].mean()*100:>6.1f}%")
+    lines.append(f"{'Konflikt (różnica ≥2 poziomy):':<31s}{n_conflict:>6} ({n_conflict/n*100:>5.1f}%)")
     lines.append("")
 
     # Rozkład poziomów zgodności
@@ -486,10 +486,17 @@ def _predict_shap_cb(model: Any, X: pd.DataFrame) -> np.ndarray:
     return sv[:, :-1, np.newaxis]
 
 
-def _predict_shap_rf(model: Any, X: pd.DataFrame, background: pd.DataFrame) -> np.ndarray:
-    """SHAP dla RandomForest — shap.TreeExplainer (interventional) z małym tłem."""
+def _predict_shap_rf(model: Any, X: pd.DataFrame, background: pd.DataFrame | None = None) -> np.ndarray:
+    """SHAP dla RandomForest — shap.TreeExplainer.
+
+    Bez tła: 'tree_path_dependent' (szybki, rozkład z liczności liści drzew).
+    Z tłem: 'interventional' — dokładniejszy, ale wolny (minuty dla 500 drzew).
+    """
     import shap
-    explainer = shap.TreeExplainer(model, data=background, feature_perturbation="interventional")
+    if background is None:
+        explainer = shap.TreeExplainer(model, feature_perturbation="tree_path_dependent")
+    else:
+        explainer = shap.TreeExplainer(model, data=background, feature_perturbation="interventional")
     sv = explainer.shap_values(X, check_additivity=False)
     if isinstance(sv, list):   # starsze wersje shap: lista (n, n_features) per klasa
         sv = np.stack(sv, axis=-1)
@@ -532,10 +539,11 @@ def compute_model_shap(
         elif isinstance(model, CatBoostClassifier):
             shap_values = _predict_shap_cb(model, X_eval_shap)
         else:
-            background = X_background if X_background is not None else X_eval
-            background = background.sample(
-                n=min(SHAP_BACKGROUND_SIZE, len(background)), random_state=RANDOM_SEED
-            )
+            background = None
+            if X_background is not None:
+                background = X_background.sample(
+                    n=min(SHAP_BACKGROUND_SIZE, len(X_background)), random_state=RANDOM_SEED
+                )
             shap_values = _predict_shap_rf(model, X_eval_shap, background)
     except Exception as e:
         log.warning(f"  SHAP {name} nie powiódł się: {e}")

@@ -222,6 +222,10 @@ def _resolve_vital(patient_data: Mapping, canonical: str) -> float | None:
     return None
 
 
+# Publiczny alias (używany np. przy budowie promptu LLM)
+resolve_vital = _resolve_vital
+
+
 def _to_mapping(patient: Any) -> Mapping:
     """dict / pd.Series / 1-wierszowy DataFrame → mapping."""
     if isinstance(patient, Mapping):

@@ -223,7 +223,14 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     c["weekend_arrival"] = _flag(weekday.isin([6, 7]), weekday)
 
     # === Skargi główne ===
-    cc_cols = [col for col in df.columns if col.startswith("cc_")]
+    # Tylko skargi z danych: pomijamy własne cechy cc_count/cc_critical/cc_group_*,
+    # żeby ponowne wywołanie na gotowej ramce dawało ten sam wynik
+    cc_cols = [
+        col for col in df.columns
+        if col.startswith("cc_")
+        and col not in ("cc_count", "cc_critical")
+        and not col.startswith("cc_group_")
+    ]
     if cc_cols:
         cc_frame = df[cc_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
         c["cc_count"] = (cc_frame > 0).sum(axis=1).astype(float)
