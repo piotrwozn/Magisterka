@@ -17,7 +17,12 @@ Tuning jest wznawialny: po awarii lub Ctrl+C uruchom to samo polecenie — Optun
 brakujące próby i brakujący czas.
 
 `--n-jobs N` ustawia SOR_AI_N_JOBS (i domyślnie OMP_NUM_THREADS) PRZED importem pakietu `src`
-(config ustala liczbę wątków przy imporcie).
+(config ustala liczbę wątków przy imporcie). Na Windows proces na starcie wyłącza dławienie
+energii (EcoQoS, `hardware.disable_power_throttling`).
+
+Tag runa (`--tag`, domyślnie): nazwa profilu dla tuningu z budżetem profilu, `<profil>-notune`
+bez `--tune`, `<profil>-custom`, gdy podano nadpisania (--n-trials, --tune-rows, --cv-folds,
+--tune-timeout, --sample, --eval-sample, --weights ≠ none, --tune-metric qwk, --filter, --no-save).
 
 Kody wyjścia: 0 = OK, 1 = co najmniej jeden model nieudany (pozostałe trenowane dalej),
 130 = przerwano (Ctrl+C).
@@ -53,6 +58,10 @@ def apply_n_jobs(argv: list[str]) -> int | None:
 def run(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     apply_n_jobs(argv)
+    # Windows: bez dławienia energii (EcoQoS) przy zminimalizowanej konsoli — lekki import (ctypes)
+    from src.utils.hardware import disable_power_throttling
+
+    disable_power_throttling()
     try:
         from src.models.train import main
     except KeyboardInterrupt:

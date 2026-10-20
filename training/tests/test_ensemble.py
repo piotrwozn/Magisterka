@@ -73,12 +73,13 @@ def write_run(
     done: bool = True,
     with_model: bool = True,
     vitals: bool = True,
+    tuned: bool | None = True,
 ) -> Path:
     """Katalog runa w formacie `run_training` (run_info + predykcje val/test + DONE.json + model)."""
     run_dir = runs_dir / name
     run_dir.mkdir(parents=True)
     info = {
-        "run_name": name, "model": model, "feature_set": feature_set, "tuned": False,
+        "run_name": name, "model": model, "feature_set": feature_set, "tuned": tuned,
         "tag": tag, "profile": tag, "sample_weight_strategy": weights, "weights_strategy": weights,
         "data_version": data_version, "data_fingerprint": "abc123", "n_fit": 1000, "n_val": len(y),
         "train_sample": train_sample, "eval_sample": None, "note": "zażółć gęślą jaźń",
@@ -221,6 +222,21 @@ class TestRuns:
             "20260102_000100_xgboost_triage"
         any_version = latest_runs("triage", runs_dir=runs_dir, data_version=None)
         assert {r.model: r.name for r in any_version}["xgboost"] == "20260108_000000_xgboost_triage"
+
+    def test_latest_runs_excludes_untuned_with_note(self, runs_dir, caplog):
+        """Run bez tuningu (np. '<profil>-notune') jest domyślnie pomijany — także stary bez pola 'tuned'."""
+        y = _true_labels()
+        p = {"val": _make_proba(y, 2.0, 90)}
+        write_run(runs_dir, "20260109_000000_xgboost_triage_standard-notune", "xgboost", p, y,
+                  tag="standard-notune", tuned=False)
+        write_run(runs_dir, "20260109_000100_lightgbm_triage", "lightgbm", p, y, tuned=None)
+        with caplog.at_level("INFO", logger="src.ensemble.runs"):
+            names = {r.model: r.name for r in latest_runs("triage", runs_dir=runs_dir)}
+        assert names == {"lightgbm": "20260102_000000_lightgbm_triage", "xgboost": "20260102_000100_xgboost_triage"}
+        assert "bez tuningu" in caplog.text and "20260109_000000_xgboost_triage_standard-notune" in caplog.text
+        loose = {r.model: r.name for r in latest_runs("triage", runs_dir=runs_dir, require_tuned=False)}
+        assert loose == {"lightgbm": "20260109_000100_lightgbm_triage",
+                         "xgboost": "20260109_000000_xgboost_triage_standard-notune"}
 
     def test_feature_set_alias(self, runs_dir):
         assert {r.model for r in latest_runs("triage_only", runs_dir=runs_dir)} == {"lightgbm", "xgboost"}
@@ -468,6 +484,20 @@ class TestCompareScript:
         text = out.read_text(encoding="utf-8")
         assert "Różnorodność" not in text                     # jeden model — bez tabeli par
         assert "średnia równowagowa" in text
+
+    def test_untuned_runs_need_flag_explicit_runs_do_not(self, isolated_paths):
+        y = _true_labels()
+        root = isolated_paths.RUNS_DIR
+        name = "20260103_000000_logreg_triage_standard-notune"
+        write_run(root, name, "logreg", {"val": _make_proba(y, 2.0, 5)}, y, tag="standard-notune", tuned=False)
+        module = _load_compare_script()
+        assert module.main(["--feature-set", "triage"]) == 1                     # pominięty domyślnie
+        out = root / "untuned.md"
+        assert module.main(["--feature-set", "triage", "--include-untuned", "--out", str(out)]) == 0
+        assert name in out.read_text(encoding="utf-8")
+        out_explicit = root / "explicit.md"
+        assert module.main(["--runs", name, "--out", str(out_explicit)]) == 0   # jawna lista bez filtrów
+        assert name in out_explicit.read_text(encoding="utf-8")
 
     def test_no_runs_exit_1(self, isolated_paths):
         module = _load_compare_script()

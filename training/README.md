@@ -25,6 +25,9 @@ python scripts/run_all.py                # 3. właściwy przebieg na noc (profil
 Po awarii, restarcie albo Ctrl+C uruchom **to samo polecenie** — gotowe modele zostaną pominięte,
 a przerwany tuning dokończy tylko brakujące próby. Stan w dowolnej chwili: `python scripts/run_all.py --status`.
 
+Na noc (Windows): **Tryb zasilania „Najlepsza wydajność”**, okno konsoli otwarte (nie minimalizuj go)
+i nie klikaj w nie — szczegóły w punkcie 5.
+
 ---
 
 ## 1. Wymagania
@@ -62,14 +65,22 @@ Za stary sterownik: zaktualizuj go (NVIDIA App / sterownik Game Ready lub Studio
 
 ```bash
 nvidia-smi                                   # sterownik >= 580 (koło xgboost dla Linuksa też jest CUDA 13)
-python3.13 -m venv ~/venvs/sorai && source ~/venvs/sorai/bin/activate
+sudo apt install git python3.13-venv         # Ubuntu/Debian: moduł venv to osobny pakiet (albo python3.12-venv)
+git clone <adres-repo> ~/Magisterka
+python3.13 -m venv ~/venvs/sorai && source ~/venvs/sorai/bin/activate   # albo python3.12
 python -m pip install -U pip
 cd ~/Magisterka/training
 pip install -r requirements-lock.txt
 ```
 
+Ubuntu 24.04 ma w systemie Pythona 3.12 (`python3.12-venv`, `python3.12 -m venv …`) — to wystarczy;
+3.13 jest m.in. w PPA deadsnakes. Bez pakietu `python3.X-venv` polecenie `python3.X -m venv` kończy
+się błędem „ensurepip is not available”.
+
 WSL2: domyślnie dostaje połowę RAM hosta — ustaw `memory=` w `%UserProfile%\.wslconfig` i trzymaj repo
-w systemie plików Linuksa (`~/…`), nie w `/mnt/c`.
+w systemie plików Linuksa (`~/…`), nie w `/mnt/c`. Blokada uśpienia `run_all.py` działa wtedy tylko
+w maszynie wirtualnej i **nie** powstrzyma Windows przed uśpieniem (orkiestrator ostrzega w logu):
+na Windows ustaw uśpienie przy zasilaniu sieciowym na „Nigdy”.
 
 ### Pliki z zależnościami
 
@@ -92,7 +103,9 @@ też dane Yale, ścieżkę repo (OneDrive, polskie znaki, długość) i kodowani
 trafia na konsolę i do `logs/run_all/<czas>/preflight.json`.
 
 - `[BŁĄD ]` — trzeba poprawić (kod wyjścia 1); `run_all.py` też się wtedy nie uruchomi.
-- `[UWAGA]` — trening ruszy. Przykład: GPU niedostępne → xgboost/catboost na CPU z mniejszym budżetem.
+  Brakujące pakiety (np. świeży venv) skrypt wypisuje razem z poleceniem instalacji.
+- `[UWAGA]` — trening ruszy. Przykłady: GPU niedostępne → xgboost/catboost na CPU z mniejszym
+  budżetem; Windows z planem zasilania innym niż wysoka wydajność.
 - Ostatnia linia mówi, czy `run_all.py` użyje dwóch torów (GPU + CPU równolegle).
 
 ## 4. Test całości: profil `smoke` (5–10 minut)
@@ -130,14 +143,27 @@ tylko ten krok, a nie całą noc):
 ~11–12 h sekwencyjnie. To szacunki ±50%. Każdy model ma limit czasu tuningu, więc górną granicę
 wyznacza suma limitów; `run_all.py` wypisuje ją na starcie (ETA każdego modelu).
 
-**Dwa tory** (`--lanes auto`) włączają się, gdy GPU działa, CPU ma ≥ 16 rdzeni fizycznych i jest
-≥ 32 GB RAM:
+**Dwa tory** (`--lanes auto`) włączają się, gdy co najmniej jeden model idzie na GPU (próba GPU
+w preflight się powiodła), CPU ma ≥ 16 rdzeni fizycznych i jest ≥ 30 GB RAM (komputer z 32 GB
+pokazuje ~31,8 GB):
 
-- tor GPU: xgboost → catboost, 6 wątków CPU;
-- tor CPU: logreg → lightgbm → random_forest → ebm, pozostałe rdzenie fizyczne.
+- tor GPU: tylko modele na GPU (xgboost → catboost), 6 wątków CPU;
+- tor CPU: pozostałe modele (logreg → lightgbm → random_forest → ebm, a także xgboost/catboost,
+  jeśli dla nich GPU nie działa), pozostałe rdzenie fizyczne.
 
 Budżety wątków się nie nakładają (nadsubskrypcja OpenMP potrafi spowolnić trening kilkadziesiąt
 razy). Jeden tor: `--lanes 1`.
+
+### Przed nocnym przebiegiem (Windows)
+
+- **Zasilanie**: Ustawienia → System → Zasilanie (i bateria) → *Tryb zasilania*: **„Najlepsza wydajność”**
+  (przy zasilaniu sieciowym; albo plan „Wysoka wydajność”). Preflight ostrzega, gdy jest inaczej.
+- **Nie minimalizuj okna konsoli** — Windows 11 może zdławić zminimalizowany proces (EcoQoS: rdzenie E,
+  niższe taktowanie). `run_all.py` i `03_train.py` wyłączają to dla siebie, ale zostaw okno otwarte.
+- **Nie klikaj w okno konsoli.** Tryb QuickEdit zaznacza wtedy tekst i wstrzymuje każdy zapis na
+  konsolę — trening staje do naciśnięcia klawisza. `run_all.py` wyłącza QuickEdit na czas przebiegu
+  i przywraca go na końcu; przy ręcznie uruchamianych skryptach naciśnij Esc, jeśli w tytule okna
+  pojawi się „Zaznacz”.
 
 ### Profile
 
@@ -175,9 +201,9 @@ Zbiory `val` i `test` nie biorą udziału w tuningu ani w treningu.
 | `--feature-set triage\|full\|triage,full` | zestaw cech (domyślnie `triage`); `full` ≈ 3–4× dłużej na próbę i ≥ 32 GB RAM — osobna noc |
 | `--models all\|lista` | np. `--models lightgbm,xgboost` (aliasy: lr, lgbm, xgb, cb, rf) |
 | `--split random\|site` | podział danych; `site` = oddział B w całości jako test (walidacja zewnętrzna) |
-| `--no-tune` | bez tuningu, parametry domyślne (tag `<profil>-notune`) |
+| `--no-tune` | bez tuningu, parametry domyślne (tag `<profil>-notune`; takich runów nie biorą domyślnie `latest_runs` / `07_compare_runs.py`) |
 | `--lanes auto\|1\|2` | tory równoległe |
-| `--force` | trenuj ponownie także gotowe modele (ukończone próby Optuny i tak zostaną użyte) |
+| `--force` | trenuj ponownie także gotowe modele (ukończone próby Optuny i tak zostaną użyte); po przerwaniu polecenie wznowienia zachowuje `--force` tylko dla niedokończonych modeli |
 | `--fail-fast` | pierwszy nieudany model zatrzymuje kolejne (domyślnie pozostałe trenują dalej) |
 | `--dry-run` | pokaż plan, ETA i polecenia, nic nie uruchamiaj |
 | `--status` | stan z plików-znaczników, nic nie uruchamiaj |
@@ -189,20 +215,30 @@ Na Linuksie są też skróty z Makefile'a: `make check-env`, `make smoke`, `make
 
 - **Wznowienie = to samo polecenie.** Model jest pominięty, gdy istnieje
   `runs/*_<model>_<zestaw>_<profil>/DONE.json` z tą samą wersją danych (`esi-v2`) i tym samym
-  odciskiem danych (skrót `manifest.json`). Brakująca ewaluacja zostanie dorobiona.
+  odciskiem danych (skrót `manifest.json` bez czasu i ścieżki przygotowania), zwykły run profilu
+  (nie `custom`), z tym samym trybem tuningu. Model zaplanowany na GPU musi mieć run **z GPU** —
+  run, który z powodu błędu karty skończył się na CPU, zostanie powtórzony, gdy GPU znów działa
+  (log mówi dlaczego). Brakująca ewaluacja zostanie dorobiona.
 - **Przerwany tuning** wznawia się od miejsca przerwania. Badanie Optuny (`logs/optuna/optuna_<model>.db`)
   liczy ukończone próby i zużyty czas. Próba przerwana awarią procesu jest oznaczana jako błąd
   i ponawiana raz.
 - **Ctrl+C**: orkiestrator nie uruchamia już nowych kroków i czeka do 2 minut, aż bieżące się
-  zakończą (drugie Ctrl+C = natychmiast). Potem zapisuje podsumowanie i wypisuje polecenie wznowienia.
-  Kod wyjścia to 130.
+  zakończą (drugie Ctrl+C = natychmiast). Potem zapisuje podsumowanie i wypisuje polecenie wznowienia
+  (po `--force`: z `--force` i `--models` zawężonym do niedokończonych). Kod wyjścia to 130.
+- **Twarda awaria kroku** (np. błąd natywny, zabity proces) nie blokuje toru: orkiestrator zabija
+  pozostałości kroku (Linux: całą grupę procesów) i przechodzi do następnego modelu.
 - **Restart / zanik prądu**: po prostu uruchom to samo polecenie.
-- **Co unieważnia gotowe modele**: ponowne przygotowanie danych (nowy odcisk) i zmiana podziału
-  (`--split`). Zmienia je też nowa wersja logiki danych w kodzie. Stare runy zostają w `runs/`.
+- **Co unieważnia gotowe modele**: inne dane (inne wyniki przygotowania → inny odcisk), zmiana
+  podziału (`--split`) i nowa wersja logiki danych w kodzie. Samo ponowne przygotowanie tych samych
+  danych tym samym kodem (np. po `make clean`) niczego nie unieważnia. Stare runy zostają w `runs/`.
 - **Stan**: `python scripts/run_all.py --status` (dla profilu innego niż standard dodaj `--profile …`).
-  Pokazuje gotowe modele z QWK na `val` oraz postęp tuningu (liczbę prób w badaniu) i przerwane runy.
+  Pokazuje gotowe modele z QWK na `val`, postęp tuningu (liczbę prób w badaniu) i przerwane runy.
+  Gdy proces orkiestratora już nie działa (awaria, restart), niedokończone kroki mają stan
+  „przerwany (proces nie działa)” — wznów tym samym poleceniem.
 - xgboost/catboost z **błędem GPU** w logu (CUDA, brak pamięci karty) są automatycznie powtarzane
-  raz na CPU. Podsumowanie pokazuje to jako „powtórka na CPU”.
+  raz na CPU. Podsumowanie pokazuje to jako „powtórka na CPU”. Powtórka dostaje wątki toru CPU,
+  jeśli ten tor skończył już swoje modele; inaczej działa z 6 wątkami toru GPU (log ostrzega, że
+  będzie wolniej).
 
 Kody wyjścia `run_all.py`: 0 = wszystko gotowe, 1 = któryś krok nieudany, 2 = błąd preflight
 albo przygotowania danych, 130 = przerwano.
@@ -252,7 +288,7 @@ Klucze w `metrics.json`: `{split}_{reguła}_{metryka}`, a dla podgrupy vc `{spli
 
 Modele trenują się **bez wag klas**, więc ich prawdopodobieństwa są skalibrowane i nadają się do
 łączenia. Asymetrię kosztów realizuje reguła decyzyjna. Wszystko (wybór modeli, wagi,
-kalibrację, regułę) dobierasz na `val`:
+kalibrację, regułę) dobierasz na `val` — jak w `notebooks/02_model_training.ipynb`:
 
 ```python
 from src.ensemble import latest_runs, aligned_probas, blend, evaluate, optimize_weights
@@ -262,22 +298,22 @@ runs = latest_runs("triage", tag="standard")          # najnowszy ukończony run
 y_val, P_val, vc_val = aligned_probas(runs, "val", return_vc=True)
 
 weights = {"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}   # albo podpowiedź: optimize_weights(P_val, y_val)
-T = fit_temperature(P_val["random_forest"], y_val)        # kalibracja RF — też na val
-p_val = blend(P_val, weights)
+T = fit_temperature(blend(P_val, weights), y_val)         # temperatura POŁĄCZONYCH prawdopodobieństw, na val
+p_val = apply_temperature(blend(P_val, weights), T)       # ta sama receptura, którą ocenisz test
 print(evaluate(y_val, p_val, rule="cost")["quadratic_weighted_kappa"])
 print(evaluate(y_val[vc_val], p_val[vc_val], rule="cost")["undertriage_rate"])   # podgrupa vc
 ```
 
 `latest_runs` domyślnie pomija runy na próbkach, nieukończone, bez pliku modelu, z innej wersji
-danych i z wagami klas (wypisuje notę). `aligned_probas` sprawdza, czy runy mają te same wiersze
-i etykiety.
+danych, z wagami klas i bez tuningu (wypisuje notę; `require_tuned=False` albo
+`07_compare_runs.py --include-untuned` je uwzględni). `aligned_probas` sprawdza, czy runy mają
+te same wiersze i etykiety.
 
-**Test — raz, na końcu**, dla jednej, już wybranej receptury:
+**Test — raz, na końcu**, dokładnie tą samą recepturą (te same wagi i ta sama `T` dopasowana na val):
 
 ```python
 y_test, P_test = aligned_probas(runs, "test")
-P_test["random_forest"] = apply_temperature(P_test["random_forest"], T)
-final = evaluate(y_test, blend(P_test, weights), rule="cost")
+final = evaluate(y_test, apply_temperature(blend(P_test, weights), T), rule="cost")
 ```
 
 Pojedynczy model: `python scripts/04_evaluate.py --run <run> --split test`. Nie wracaj potem do
@@ -287,7 +323,9 @@ strojenia — liczby z testu idą tylko do pracy.
 
 | objaw | co zrobić |
 |---|---|
-| komputer usnął w nocy | `run_all.py` blokuje uśpienie (Windows: `SetThreadExecutionState`; sprawdzisz w `powercfg /requests`, że `python.exe` jest pod SYSTEM). Nie chroni przed zamknięciem pokrywy laptopa ani ręcznym uśpieniem. Laptop: zasilacz podłączony. Wznów tym samym poleceniem |
+| komputer usnął w nocy | `run_all.py` blokuje uśpienie (Windows: `SetThreadExecutionState`; sprawdzisz w PowerShell **uruchomionym jako administrator**: `powercfg /requests` — `python.exe` pod SYSTEM). Nie chroni przed zamknięciem pokrywy laptopa ani ręcznym uśpieniem. Laptop: zasilacz podłączony. **WSL2**: blokada działa tylko w maszynie wirtualnej Linuksa — na Windows ustaw uśpienie na „Nigdy” (Ustawienia → System → Zasilanie (i bateria) → Ekran i uśpienie). Wznów tym samym poleceniem |
+| trening stoi, w tytule okna „Zaznacz” | kliknięcie w konsolę (QuickEdit) wstrzymało wypisywanie — naciśnij Esc. `run_all.py` wyłącza QuickEdit na czas przebiegu |
+| w nocy wyraźnie wolniej niż w dzień | Tryb zasilania „Najlepsza wydajność”, okno konsoli niezminimalizowane (punkt 5); `00_check_env.py` pokazuje plan zasilania |
 | restart po Windows Update | na noc: Ustawienia → Windows Update → *Wstrzymaj aktualizacje* (albo godziny aktywne). Po restarcie uruchom to samo polecenie |
 | repo w OneDrive | przenieś do `C:\dev\Magisterka`: synchronizacja blokuje pliki (SQLite „database is locked”, `PermissionError`) i wysyła gigabajty `runs/` |
 | wolne wczytywanie / zapis | Windows Defender: Zabezpieczenia Windows → Ochrona przed wirusami → Wykluczenia: dodaj folder repo i `C:\venvs\sorai` |
@@ -315,7 +353,7 @@ z liczbami: [`DATA_AUDIT.md`](DATA_AUDIT.md).
 | eGFR (wszystkie warianty) | wzór CKD-EPI 2009 używa współczynnika rasy (osobne kolumny „African American / non-AA”) |
 | oddział Yale (`dep_name` → `site`) | uczyłby się praktyk konkretnego szpitala; zostaje tylko jako metadana (stratyfikacja, metryki per oddział, `--split site`) |
 | `disposition` (przyjęcie / wypis) | to wynik wizyty — przeciek przyszłości; zostaje jako `admitted` wyłącznie do analizy trafności |
-| leki (`meds_*`, zestaw `full`) | lista leków jest dokumentowana głównie przy przyjęciu, więc przecieka bieżąca decyzja (9,1% wypisanych vs 68,7% przyjętych ma wpisane leki) |
+| leki (`meds_*`, zestaw `full`) | lista leków jest dokumentowana głównie przy przyjęciu, więc przecieka bieżąca decyzja (wśród pacjentów ≥ 40 lat z ≥ 2 przyjęciami w ostatnim roku leki ma wpisane 9,1% wypisanych vs 68,7% przyjętych) |
 | `socialadmin` (historia chorób) | wskaźnik socjoekonomiczny (71% Medicaid / bez ubezpieczenia vs 35% w populacji) |
 | administracyjne kody V (badania przesiewowe, szczepienia, opieka po zabiegu) i rzadkie grupy chorób | kody rozliczeniowe, nie stan pacjenta; za mało przypadków na wiarygodny sygnał |
 | `arrival_unknown` (brak sposobu przybycia) | 99,7% braków pochodzi z oddziału A, gdzie oznaczają amerykańską ścieżkę szybkiej obsługi (64% wizyt ESI 5 tego oddziału). W TOPSOR takiej kategorii nie ma — brak kodowany jako „przyszedł sam”, policja jako „inny” |
@@ -352,7 +390,7 @@ za mało, by go tak użyć.
 ## 11. Zastrzeżenia do metodologii
 
 - **Braki parametrów życiowych odzwierciedlają organizację pracy, a nie stan pacjenta.** Yale
-  zapisuje jako „triażowe” pomiary sprzed przyjęcia na salę. 85,6% wizyt ESI 1 nie ma żadnego
+  zapisuje jako „triażowe” pomiary sprzed przyjęcia na salę. 85,2% wizyt ESI 1 nie ma żadnego
   pomiaru, bo pacjenta od razu przeniesiono na salę resuscytacyjną. W TOPSOR pomiar jest
   obowiązkowy, więc metryki na całym `val` przeszacowują wykrywanie ESI 1. Raportuj zawsze także
   **podgrupę vc** (`vitals_complete == 1`: zmierzone HR, SBP i RR) — kolumny `*_vc_*` w metrykach,
@@ -373,14 +411,21 @@ za mało, by go tak użyć.
 
 ```powershell
 python scripts/02_preprocess.py [--split site]                       # dane → splity + DATA_AUDIT.md
-python scripts/03_train.py --model xgboost --tune --profile quick    # jeden model (tag = profil)
-python scripts/03_train.py --model all                               # 6 modeli bez tuningu, jeden proces
+python scripts/03_train.py --model xgboost --tune --profile quick    # jeden model (tag `quick`)
+python scripts/03_train.py --model all                               # 6 modeli bez tuningu (tag `standard-notune`)
 python scripts/04_evaluate.py --run <run>                            # wykresy i metryki na val
 python scripts/05_explain.py --model-name xgboost --n-patients 5     # SHAP + kontrola reguł ESI
 python scripts/06_cross_validate.py --model lightgbm                 # k-fold CV na TRAIN
 python scripts/07_compare_runs.py --tag standard                     # porównanie na val
 streamlit run app/streamlit_app.py                                   # demo (requirements-app.txt)
 ```
+
+Tag runa (dopisek w nazwie katalogu, gdy nie podasz `--tag`): `<profil>` — tuning z budżetem
+profilu bez nadpisań (zwykły run profilu, ten sam, który tworzy `run_all.py`); `<profil>-notune` —
+bez `--tune`; `<profil>-custom` — z nadpisaniami (`--n-trials`, `--tune-rows`, `--cv-folds`,
+`--tune-timeout`, `--sample`, `--eval-sample` inne niż w profilu, `--weights` ≠ none,
+`--tune-metric qwk`, `--filter`, `--no-save`). Run niestandardowy ma w `DONE.json` `"custom": true`
+i nigdy nie zastępuje kroku profilu w `run_all.py` — nawet z ręcznym `--tag <profil>`.
 
 Modele: `logreg` (liniowy punkt odniesienia), `lightgbm`, `xgboost` (GPU), `catboost` (GPU),
 `random_forest` (bagging — dywersyfikacja), `ebm` (Explainable Boosting Machine, interpretowalny

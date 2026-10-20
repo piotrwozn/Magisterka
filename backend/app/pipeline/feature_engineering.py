@@ -4,10 +4,12 @@ Builds one row in the CANONICAL triage schema used in training
 (`src.data.prepare` → `src.features.engineering`) and appends the engineered
 clinical features with `src.features.engineering.engineer_features()`:
 
-    age (years), is_male (0/1, NaN when unknown),
+    age (years), is_male (0/1; unknown → the train mode, see unknown_sex_value — training
+        has no missing sex, so NaN would be an input the models never saw),
     arrival_ambulance / _self / _other (one-hot; missing mode → "self" and
         police → "other", exactly as in training — yale_schema.ARRIVAL_*),
-    arrival_month (1–12), arrival_weekday (1–7, Mon=1), arrival_hour_bin (0–5),
+    arrival_month (1–12), arrival_weekday (1–7, Mon=1), arrival_hour_bin (0–5) —
+        local time of the ED (settings.timezone, default Europe/Warsaw),
     triage_vital_hr / _sbp / _dbp / _rr / _o2 / _o2_device / _temp (°C!;
         SpO2 = 100 passes through — training restores Yale's deleted 100% readings),
     cc_* chief-complaint flags (199 Yale/Epic complaints, sanitized names;
@@ -21,24 +23,22 @@ from __future__ import annotations
 import logging
 import math
 import numbers
-import sys
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from app.config import get_settings
+from app.config import ensure_training_on_path, get_settings
 from app.models.schemas import Vitals
 from app.pipeline.layer0_parser import KNOWN_CC_CODES
 
 log = logging.getLogger(__name__)
 
 # Add training/ source tree so we can import src.features / src.data.yale_schema
-_settings = get_settings()
-_training_root = str(_settings.project_root / "training")
-if _training_root not in sys.path:
-    sys.path.insert(0, _training_root)
+ensure_training_on_path()
 
 from src.data.yale_schema import (  # noqa: E402
     ARRIVAL_CATEGORIES,
@@ -115,7 +115,11 @@ def normalize_arrival_mode(mode: Any) -> str:
 
 
 def encode_sex(value: Any) -> float:
-    """Sex / is_male from the request → 1.0 (male), 0.0 (female), NaN (unknown)."""
+    """Sex / is_male from the request → 1.0 (male), 0.0 (female), NaN (unknown).
+
+    NaN is only the "unknown" marker — build_feature_row replaces it with
+    unknown_sex_value() before the row reaches the models.
+    """
     if value is None:
         return _NAN
     if isinstance(value, bool):
@@ -123,6 +127,50 @@ def encode_sex(value: Any) -> float:
     if isinstance(value, numbers.Real):
         return float(value) if value in (0, 1) else _NAN
     return _SEX_MAP.get(str(value).strip().lower(), _NAN)
+
+
+def unknown_sex_value(medians: Mapping[str, Any] | None = None) -> float:
+    """is_male used when the request has no (valid) sex: the train mode.
+
+    Training has no missing is_male (Yale records sex for every visit), so NaN
+    would be an input the models never saw. imputation_medians.json stores the
+    train median of the 0/1 column, which is its mode (≈ 45% male → 0.0);
+    without the file → 0.0.
+    """
+    value = (medians or {}).get("is_male")
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(value):
+        return 0.0
+    return 1.0 if value > 0.5 else 0.0
+
+
+@lru_cache(maxsize=8)
+def _zone(name: str) -> ZoneInfo:
+    return ZoneInfo(name)
+
+
+def _utcnow() -> datetime:
+    """Current instant (UTC-aware) — a separate function so tests can freeze the clock."""
+    return datetime.now(timezone.utc)
+
+
+def arrival_time(now: datetime | None = None, tz_name: str | None = None) -> datetime:
+    """Arrival time in the ED's local time zone (settings.timezone, default Europe/Warsaw).
+
+    now = None → the current instant; an aware datetime is converted to the local
+    zone; a naive datetime is taken as already local. The models were trained on
+    local arrival hours / weekdays (Yale), so a UTC server clock would shift
+    arrival_hour_bin (and the weekday around midnight).
+    """
+    zone = _zone(tz_name or get_settings().timezone)
+    if now is None:
+        return _utcnow().astimezone(zone)
+    if now.tzinfo is None:
+        return now
+    return now.astimezone(zone)
 
 
 def _binary(value: Any) -> float:
@@ -176,6 +224,7 @@ def build_feature_row(
     arrival_mode: Any = None,
     o2_device: Any = None,
     now: datetime | None = None,
+    medians: Mapping[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Build a single-row DataFrame in the canonical triage schema + engineered features.
 
@@ -188,10 +237,14 @@ def build_feature_row(
                       with 0); defaults to the full 199-column vocabulary
     is_male / arrival_mode / o2_device : optional request data; when not given they
                       are read from `vitals` if such fields exist, otherwise
-                      is_male=NaN, arrival = DEFAULT_ARRIVAL_MODE ("self"), o2_device=NaN
-    now             : arrival time (defaults to the system clock)
+                      is_male = train mode (unknown_sex_value, WARNING in the log),
+                      arrival = DEFAULT_ARRIVAL_MODE ("self"), o2_device = NaN
+    now             : arrival time (default: now); converted to settings.timezone
+                      (see arrival_time)
+    medians         : imputation_medians.json "medians" (registry.medians) — source of
+                      the train mode of is_male for an unknown sex
     """
-    now = now or datetime.now()
+    now = arrival_time(now)
     if is_male is None:
         is_male = _request_value(vitals, "is_male", "sex", "gender")
     if arrival_mode is None:
@@ -208,11 +261,16 @@ def build_feature_row(
         vit["dbp"] = _NAN
 
     mode = normalize_arrival_mode(arrival_mode)
+    sex = encode_sex(is_male)
+    if math.isnan(sex):
+        sex = unknown_sex_value(medians)
+        log.warning("Sex unknown (%r) — is_male = %.0f (train mode; training has no missing "
+                    "sex). Send \"sex\": \"M\" | \"F\" for a reliable prediction.", is_male, sex)
     row: dict[str, Any] = {
         # Demographics
         "age": float(vitals.age),
-        "is_male": encode_sex(is_male),
-        # Arrival (one-hot) + time (system clock)
+        "is_male": sex,
+        # Arrival (one-hot) + local arrival time
         **{f"arrival_{cat}": float(cat == mode) for cat in ARRIVAL_CATEGORIES},
         "arrival_month": float(now.month),
         "arrival_weekday": float(now.isoweekday()),

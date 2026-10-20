@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,15 +12,19 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from app.config import Settings, get_settings
 from app.models.schemas import Vitals
+from app.pipeline import feature_engineering as fe
 from app.pipeline.feature_engineering import (
     ARRIVAL_MODE_ALIASES,
     CHIEF_COMPLAINT_COLUMNS,
     DEFAULT_ARRIVAL_MODE,
     align_features,
+    arrival_time,
     build_feature_row,
     encode_sex,
     normalize_arrival_mode,
+    unknown_sex_value,
 )
 
 # Importable only after app.pipeline.feature_engineering put training/ on sys.path
@@ -249,16 +254,53 @@ class TestBuildFeatureRow:
         assert (row["arrival_weekday"], row["arrival_hour_bin"]) == (1, 3)   # Monday, "11-14"
         assert row["weekend_arrival"] == 0.0
 
-    def test_unknown_request_fields_default(self):
-        df = build_feature_row(_vitals(), {}, {})
+    def test_default_timezone_is_warsaw(self):
+        assert Settings.model_fields["timezone"].default == "Europe/Warsaw"
+
+    def test_clock_uses_ed_timezone_not_utc(self, monkeypatch):
+        monkeypatch.setattr(get_settings(), "timezone", "Europe/Warsaw")
+        # Fixed UTC instant: Sunday 2026-01-04 23:30 UTC = Monday 00:30 in Warsaw (CET, +1)
+        monkeypatch.setattr(fe, "_utcnow", lambda: datetime(2026, 1, 4, 23, 30, tzinfo=timezone.utc))
+        local = arrival_time()
+        assert (local.year, local.month, local.day, local.hour) == (2026, 1, 5, 0)
+        row = build_feature_row(_vitals(), {}, {}).iloc[0]
+        assert (row["arrival_month"], row["arrival_weekday"], row["arrival_hour_bin"]) == (1, 1, 0)
+        assert row["weekend_arrival"] == 0.0             # Monday in Poland, Sunday in UTC
+
+    def test_aware_datetime_converted_naive_taken_as_local(self):
+        summer_utc = datetime(2026, 7, 1, 10, 0, tzinfo=timezone.utc)      # CEST, +2
+        assert arrival_time(summer_utc, "Europe/Warsaw").hour == 12
+        assert arrival_time(summer_utc, "UTC").hour == 10
+        assert arrival_time(datetime(2026, 7, 1, 10, 0)).hour == 10
+
+    def test_unknown_request_fields_default(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=fe.__name__):
+            df = build_feature_row(_vitals(), {}, {})
         row = df.iloc[0]
         # Missing arrival mode → "self", exactly like Yale's missing mode in training
         assert DEFAULT_ARRIVAL_MODE == ys.ARRIVAL_MISSING_AS == "self"
         assert row["arrival_self"] == 1.0
         assert row[["arrival_ambulance", "arrival_other"]].sum() == 0
         assert not {"arrival_unknown", "arrival_police"} & set(row.index)
-        assert math.isnan(row["is_male"])
+        # Unknown sex → train mode (training has no missing is_male), not NaN
+        assert row["is_male"] == 0.0
+        assert "Sex unknown" in caplog.text
         assert math.isnan(row["triage_vital_o2_device"])
+
+    def test_unknown_sex_uses_train_mode_from_medians(self):
+        assert build_feature_row(_vitals(), {}, {}, medians={"is_male": 1.0}).iloc[0]["is_male"] == 1.0
+        assert build_feature_row(_vitals(), {}, {}, is_male="?", medians={"is_male": 0.0}
+                                 ).iloc[0]["is_male"] == 0.0
+        # A known sex is never overridden
+        assert build_feature_row(_vitals(), {}, {}, is_male="M", medians={"is_male": 0.0}
+                                 ).iloc[0]["is_male"] == 1.0
+
+    @pytest.mark.parametrize("medians, expected", [
+        (None, 0.0), ({}, 0.0), ({"is_male": None}, 0.0), ({"is_male": float("nan")}, 0.0),
+        ({"is_male": 0.0}, 0.0), ({"is_male": 1.0}, 1.0), ({"is_male": 0.7}, 1.0),
+    ])
+    def test_unknown_sex_value(self, medians, expected):
+        assert unknown_sex_value(medians) == expected
 
     def test_explicit_request_fields(self):
         df = build_feature_row(_vitals(), {}, {}, is_male="K", arrival_mode="ZRM", o2_device=1)
@@ -341,9 +383,10 @@ class TestAlignFeatures:
         df = build_feature_row(_vitals(), {"cc_chestpain": 1}, {})
         aligned = align_features(df, triage_features, {})
         assert aligned.shape == (1, len(triage_features))
-        # Only request data the frontend does not collect stay missing
+        # Only request data the frontend does not collect stay missing (O2 device is
+        # missing in ~40% of train visits; sex never is → train mode)
         nan_cols = sorted(aligned.columns[aligned.isna().iloc[0]])
-        assert nan_cols == ["is_male", "triage_vital_o2_device"]
+        assert nan_cols == ["triage_vital_o2_device"]
 
 
 class TestTrainingContract:
@@ -366,7 +409,7 @@ class TestTrainingContract:
         df = build_feature_row(_vitals(), {"cc_chestpain": 1}, {})
         aligned = align_features(df, synthetic_prepared.feature_sets["triage"], {})
         nan_cols = sorted(aligned.columns[aligned.isna().iloc[0]])
-        assert nan_cols == ["is_male", "triage_vital_o2_device"]
+        assert nan_cols == ["triage_vital_o2_device"]
 
     def test_meta_columns_never_in_row_features(self, synthetic_prepared):
         assert "vitals_complete" not in synthetic_prepared.feature_sets["triage"]

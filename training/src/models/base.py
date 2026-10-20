@@ -46,6 +46,7 @@ from src.utils.config import (
     N_CLASSES,
 )
 from src.utils.experiment_tracker import ExperimentTracker
+from src.utils.fileio import replace_with_retry
 from src.utils.hardware import is_gpu_error
 from src.utils.logger import close_training_logger, get_logger, get_training_logger
 
@@ -530,7 +531,8 @@ class BaseTriageModel(abc.ABC):
     # ──────── Persystencja ────────
     def save(self, path: Path | str | None = None) -> Path:
         """
-        Zapisuje model na dysk (joblib, kompresja zlib; zapis atomowy przez plik .tmp).
+        Zapisuje model na dysk (joblib, kompresja zlib; zapis atomowy przez plik .tmp
+        + `fileio.replace_with_retry` — ponowienia, gdy Windows chwilowo blokuje plik docelowy).
 
         Artefakt zawiera estymator i metadane: cechy, klasy, wersję danych, faktyczne
         urządzenie, ewentualny powód przejścia GPU → CPU, najlepszą iterację, opis sprzętu.
@@ -574,10 +576,12 @@ class BaseTriageModel(abc.ABC):
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
             joblib.dump(artifact, tmp, compress=JOBLIB_COMPRESS)
-            os.replace(tmp, path)
+            replace_with_retry(tmp, path)          # Windows: antywirus / backend trzyma stary plik
         finally:
-            if tmp.exists():
-                tmp.unlink()
+            try:
+                tmp.unlink(missing_ok=True)        # sprzątanie best-effort — nie przykrywa błędu zapisu
+            except OSError:
+                pass
 
         size_mb = path.stat().st_size / 1e6
         log.info(f"Zapisano model do: {path} ({size_mb:.2f} MB)")

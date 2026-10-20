@@ -50,11 +50,11 @@ from optuna.trial import TrialState
 from sklearn.metrics import cohen_kappa_score, log_loss
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
+from src.data.dataset import data_fingerprint
 from src.models import MODEL_REGISTRY, get_model, resolve_model_name
 from src.models.base import ITERATION_CAP_WARN_FRACTION, compute_sample_weights
 from src.utils.config import (
     CLASS_NAMES,
-    DATA_MANIFEST_JSON,
     EARLY_STOPPING_FRACTION,
     EBM_DEFAULT_PARAMS,
     LGBM_DEFAULT_PARAMS,
@@ -73,6 +73,7 @@ from src.utils.config import (
     TUNE_FIXED_PARAMS,
     TUNE_RF_MAX_MODEL_BYTES,
 )
+from src.utils.fileio import write_json_atomic
 from src.utils.logger import close_training_logger, get_logger, get_training_logger
 
 log = get_logger(__name__)
@@ -308,11 +309,13 @@ def _oof_summary(y_true: np.ndarray, proba: np.ndarray) -> dict[str, float]:
 # ─────────────────────────────────────────
 def _ebm_fold_workers(params: dict[str, Any], n_folds: int) -> tuple[int, int]:
     """
-    (liczba równoległych foldów, wątki EBM na fold).
+    (liczba równoległych foldów, procesy EBM — worki — na fold).
 
     EBM zrównolegla się tylko po workach (outer_bags) — przy 8 workach i 24 rdzeniach
     jeden fold zajmuje 8 rdzeni, więc 3 foldy liczone razem wykorzystują cały CPU.
-    Budżet wątków = n_jobs EBM (config.N_JOBS); < 2 → foldy sekwencyjnie.
+    Budżet = n_jobs EBM (config.N_JOBS); < 2 → foldy sekwencyjnie.
+    Pomiar (10k wierszy, 4 rdzenie): worki < rdzenie — foldy równolegle 7,5 s vs sekwencyjnie
+    12 s; worki ≥ rdzenie — remis (±7%); worki jako wątki (stare zachowanie) — 2× wolniej.
     """
     total = int(params.get("n_jobs") or 1)
     if total < 2 or n_folds < 2:
@@ -339,6 +342,27 @@ def _parallel_infra_errors() -> tuple[type[BaseException], ...]:
     return tuple(errors)
 
 
+def _fit_predict_fold_worker(
+    model_name: str,
+    params: dict[str, Any],
+    X_tr: pd.DataFrame,
+    y_tr: np.ndarray,
+    X_va: pd.DataFrame,
+    sample_weight: np.ndarray | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    fit_predict_fold w procesie roboczym loky z PROCESAMI dla worków EBM.
+
+    joblib w procesie roboczym po cichu zamienia zagnieżdżony Parallel (worki EBM) na wątki;
+    pętla boostingu interpret jest w Pythonie (GIL), więc wątki są wolniejsze niż sekwencyjnie.
+    parallel_config(backend="loky") przywraca procesy także wewnątrz foldu.
+    """
+    from joblib import parallel_config
+
+    with parallel_config(backend="loky"):
+        return fit_predict_fold(model_name, params, X_tr, y_tr, X_va, sample_weight)
+
+
 def _run_folds_parallel(
     model_name: str,
     params: dict[str, Any],
@@ -346,14 +370,13 @@ def _run_folds_parallel(
     n_workers: int,
 ) -> list[tuple[np.ndarray, dict[str, Any]]]:
     """
-    Foldy w osobnych procesach (loky — działa tak samo na Windows i Linux).
-    W procesie roboczym EBM zrównolegla worki wątkami (joblib przełącza zagnieżdżony
-    Parallel na wątki; natywny boosting zwalnia GIL).
+    Foldy w osobnych procesach (loky — działa tak samo na Windows i Linux); worki EBM
+    w każdym foldzie też jako procesy (`_fit_predict_fold_worker`).
     """
     from joblib import Parallel, delayed
 
     return Parallel(n_jobs=n_workers, backend="loky", max_nbytes=None)(
-        delayed(fit_predict_fold)(model_name, params, X_tr, y_tr, X_va, w) for X_tr, y_tr, X_va, w in jobs
+        delayed(_fit_predict_fold_worker)(model_name, params, X_tr, y_tr, X_va, w) for X_tr, y_tr, X_va, w in jobs
     )
 
 
@@ -393,17 +416,8 @@ def filter_features_by_importance_1fold(
 
 
 # ─────────────────────────────────────────
-# Klucz badania, odcisk danych, zapis atomowy
+# Klucz badania (odcisk danych: src.data.dataset.data_fingerprint)
 # ─────────────────────────────────────────
-def data_fingerprint(manifest_path: Path | None = None) -> str:
-    """sha1[:10] pliku manifest.json splitów (zmienia się przy każdym przygotowaniu danych)."""
-    path = Path(manifest_path) if manifest_path is not None else DATA_MANIFEST_JSON
-    try:
-        return hashlib.sha1(path.read_bytes()).hexdigest()[:10]
-    except OSError:
-        return "brak-danych"
-
-
 def _json_ready(value: Any) -> Any:
     """Wartość zgodna z JSON (porównanie konfiguracji po odczycie z bazy Optuny)."""
     return json.loads(json.dumps(value, sort_keys=True, default=str))
@@ -425,29 +439,6 @@ def build_study_name(config: dict[str, Any]) -> str:
 
 def _safe_file_stem(name: str) -> str:
     return re.sub(r"[^\w.-]", "_", name)
-
-
-def write_json_atomic(path: Path, payload: Any, retries: int = 5) -> Path:
-    """
-    JSON przez plik tymczasowy + os.replace (czytelnik nigdy nie widzi połowy pliku).
-
-    Windows: os.replace zawodzi, gdy plik docelowy jest akurat otwarty (antywirus, Excel) —
-    kilka ponowień z krótką przerwą.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    for attempt in range(retries):
-        try:
-            os.replace(tmp, path)
-            return path
-        except PermissionError:
-            if attempt == retries - 1:
-                tmp.unlink(missing_ok=True)
-                raise
-            time.sleep(0.2 * (attempt + 1))
-    return path
 
 
 # ─────────────────────────────────────────
@@ -791,7 +782,8 @@ def tune_model(
     strata : etykiety stratyfikacji foldów (np. ESI × oddział), wyrównane z X_train.
     n_final_fit : liczba wierszy finalnego treningu (strażnik rozmiaru RF; domyślnie len(X_train)).
     fixed_params : parametry stałe dla każdej próby (nadpisują TUNE_FIXED_PARAMS; część klucza).
-    data_fp : odcisk danych (domyślnie sha1 manifest.json).
+    data_fp : odcisk danych (domyślnie `src.data.dataset.data_fingerprint()` — stały przy
+        ponownym przygotowaniu tych samych danych).
 
     Raises
     ------

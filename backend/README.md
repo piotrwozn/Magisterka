@@ -103,13 +103,16 @@ class indexes 0–4 = ESI 1–5; `conflict.message` explains escalations in Poli
 
 ## Ensemble weights (`backend/models/ensemble_weights.json`, optional)
 
-Default: **equal weights** for every loaded model and the **argmax** decision rule.
-To use weights chosen on the VALIDATION split (training: `src.ensemble.optimize_weights`
-or a manual blend), create `backend/models/ensemble_weights.json`:
+Default: **equal weights**, arithmetic **mean**, no temperature and the **argmax**
+decision rule. To serve the blend chosen on the VALIDATION split (training:
+`src.ensemble.optimize_weights`, `fit_temperature` or a manual blend), create
+`backend/models/ensemble_weights.json`:
 
 ```json
 {
   "weights": {"xgboost": 0.35, "lightgbm": 0.25, "catboost": 0.40},
+  "method": "mean",
+  "temperature": 1.12,
   "rule": "cost"
 }
 ```
@@ -118,13 +121,22 @@ or a manual blend), create `backend/models/ensemble_weights.json`:
   listed get weight 0 and are not run (same as `src.ensemble.blend`). Omit the key
   for equal weights. Known models: `xgboost`, `lightgbm`, `catboost`,
   `random_forest`, `ebm`, `logreg`.
+- `method` — `"mean"` (default; weighted arithmetic mean) or `"geometric"` (weighted
+  mean of log-probabilities, renormalised) — the same as
+  `src.ensemble.blend(probas, weights, method)`.
+- `temperature` — optional number > 0: temperature scaling of the **blended**
+  probabilities (`p ∝ exp(log p / T)`, `src.ensemble.apply_temperature`), applied
+  before the decision rule. Fit it on val on the blend itself:
+  `T = fit_temperature(blend(P_val, weights, method), y_val)` (notebook 02).
+  Per-model predictions are shown unscaled. Omit (or `null`) = no scaling.
 - `rule` — `"argmax"` (default) or `"cost"`: Bayes decision with the training cost
   matrix (undertriage 3× more expensive than overtriage), applied to the blended
   probabilities and to each per-model prediction.
 
-An invalid file (bad JSON, negative weight, unknown rule, no known model with a
-weight > 0) stops the backend at startup with a clear error — a typo must not
-silently fall back to defaults. The startup log lists the active ensemble.
+An invalid file (bad JSON, unknown key — e.g. a typo `"temprature"`, negative
+weight, unknown method or rule, temperature ≤ 0, no known model with a weight > 0)
+stops the backend at startup with a clear error — a typo must not silently fall
+back to defaults. The startup log lists the active ensemble.
 
 ## Safety rules (`app/pipeline/safety_rules.py`)
 
@@ -151,13 +163,18 @@ MedGemma confidence or any model predicting ESI 1 alerts the doctor.
 1. `backend/models/<model>_*.joblib` — explicit deployment (copied into the Docker image),
 2. `models/<model>_*.joblib` in the repo root,
 3. `training/runs/<run>/model.joblib` — runs with `run_info.json` for the served
-   feature set: full-data runs before sample runs (`smoke` / `quick` profiles,
-   `--sample`; used only as a fallback, with a warning), finished runs (`DONE.json`)
-   before interrupted ones, then the newest.
+   feature set, best first: full-data runs before sample runs (`smoke` / `quick`
+   profiles, `--sample`; used only as a fallback, with a warning), then tuned before
+   untuned (`<profile>-notune`), plain profile runs before custom ones
+   (`<profile>-custom`), unweighted before class-weighted, finished (`DONE.json`)
+   before interrupted, then the newest. A newer experiment never displaces the
+   tuned profile run.
 
 Feature names, classes and class names are read from the artifact
 (`BaseTriageModel.save()`); a class missing in training gets probability 0.
-Legacy artifacts without `label="esi"` are skipped. The backend serves the `triage`
+Legacy artifacts without `label="esi"` are skipped, and so are runs / artifacts whose
+`data_version` differs from the training code's `DATA_VERSION` (another feature
+schema — re-train them; the log says which). The backend serves the `triage`
 feature set (`FEATURE_SET` in `.env`; `triage_only` = alias).
 
 **Per-patient row** (`app/pipeline/feature_engineering.py`) — the same canonical schema
@@ -168,16 +185,17 @@ as training (`training/src/data/prepare.py` → `src/features/engineering.py`):
 | `triage_vital_hr/sbp/dbp/rr/o2` | form |
 | `triage_vital_temp` | form, **°C — no conversion** (Yale °F is converted to °C in training) |
 | `age` | form (models are trained on adults ≥ 18 y) |
-| `is_male` | request `sex` (`M`/`F`), else NaN |
+| `is_male` | request `sex` (`M`/`F`); unknown → train mode (`is_male` from `imputation_medians.json`, else 0) + a warning — training has no missing sex |
 | `triage_vital_o2_device` | request `o2Device`, else NaN |
 | `arrival_ambulance / _self / _other` (one-hot) | request `arrivalMode` (`ZRM`/`karetka` → ambulance, `własny` → self, `policja` → other); missing → **self** (as in training) |
-| `arrival_month`, `arrival_weekday` (1–7), `arrival_hour_bin` (0–5) | system clock |
-| `cc_*` chief complaints | Layer 0 parser — only real model columns |
+| `arrival_month`, `arrival_weekday` (1–7), `arrival_hour_bin` (0–5) | current time in the ED's time zone (`TIMEZONE`, default `Europe/Warsaw`) — not the server's UTC clock |
+| `cc_*` chief complaints | Layer 0 parser — only real model columns, combinations as in training (one code per keyword rule = the most frequent Yale synonym; a generic complaint such as `cc_trauma` is dropped when a specific one, e.g. `cc_leginjury`, fired) |
 | engineered features (NEWS2, qSOFA, shock index, ESI danger zone, …) | `engineer_features()` |
 
 Missing values stay **NaN**, exactly as in training (tree models/EBM handle NaN natively,
-logreg imputes inside its pipeline). Train medians (`models/imputation_medians.json`)
-are **not** imputed by default — they serve as diagnostics and as the cc_* vocabulary.
+logreg imputes inside its pipeline); absent complaints are `cc_* = 0`. Train medians
+(`models/imputation_medians.json`) are **not** imputed — they serve as diagnostics, as
+the cc_* vocabulary and as the source of the `is_male` mode for an unknown sex.
 
 A missing arrival mode is encoded as `self`, exactly as training encodes Yale's
 missing mode. Collecting the real arrival mode (ZRM vs. own transport) in the form
@@ -187,4 +205,5 @@ is the single cheapest accuracy gain.
 
 `requirements.txt` pins the ML libraries to the training versions (xgboost 3.4,
 lightgbm 4.7, catboost 1.2.10+, scikit-learn 1.9, interpret-core 0.7 for EBM,
-numpy 2.5, pandas 3.0, shap 0.54) — pickled models are version-sensitive.
+numpy 2.5, pandas 3.0, shap 0.54) — pickled models are version-sensitive. `tzdata`
+provides the IANA time zones (`TIMEZONE`) on Windows and slim containers.

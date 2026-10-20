@@ -404,6 +404,26 @@ def test_ebm_parallel_failure_falls_back_to_sequential(isolated_paths, monkeypat
     assert result["n_complete"] == 1
 
 
+def test_ebm_fold_worker_runs_bags_as_processes(monkeypatch):
+    """
+    W procesie roboczym loky joblib ustawia zagnieżdżony backend na wątki — worki EBM (pętla
+    w Pythonie, GIL) byłyby wtedy 2× wolniejsze. Opakowanie foldu przywraca procesy loky.
+    """
+    from joblib import parallel_config
+    from joblib.parallel import get_active_backend
+
+    seen: list[str] = []
+
+    def fake_fold(model_name, params, X_tr, y_tr, X_va, sample_weight):
+        seen.append(type(get_active_backend()[0]).__name__)
+        return np.zeros((1, N_CLASSES)), {}
+
+    monkeypatch.setattr(tuning, "fit_predict_fold", fake_fold)
+    with parallel_config(backend="threading"):          # jak BatchedCalls w procesie roboczym loky
+        tuning._fit_predict_fold_worker("ebm", {}, None, None, None, None)
+    assert seen == ["LokyBackend"]
+
+
 # ─────────────────────────────────────────
 # Blokada badania
 # ─────────────────────────────────────────

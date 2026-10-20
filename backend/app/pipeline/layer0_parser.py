@@ -8,11 +8,15 @@ Both modes emit ONLY real chief-complaint columns of the trained models
 (`cc_*`, 199 Yale/Epic complaints, names after `sanitize_name`). The keyword
 matcher covers the most common PL+EN triage signals; the LLM can pick any of
 the 199 codes (Polish abbreviations, paraphrases, embedded vitals etc.).
+Code combinations follow the training data: one code per keyword rule (the most
+frequent Yale synonym) and a generic complaint is dropped when a specific one
+fired (REDUNDANT_GENERIC) — in both modes.
 """
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 
 from app.inference.ollama_client import OllamaClient, OllamaError
 
@@ -108,250 +112,296 @@ _SUICIDE = r"samobój|suicid|celow\w* przedawk|intentional"
 # because Polish stems (drgawk-, gorączk-, samobójcz-) need to match across
 # different word endings (drgawki, gorączki, samobójcza).
 # Every target MUST be a real chief-complaint column (see KNOWN_CC_CODES).
-KEYWORD_MAP: dict[str, list[str]] = {
+# ONE code per rule: Yale codes a visit with one of several synonymous complaints,
+# practically never with two of them (e.g. Shortness of Breath + Dyspnea: 39 of
+# 446k train visits) — the rule emits the synonym most frequent in train.parquet,
+# so the models see a combination they were trained on.
+KEYWORD_MAP: dict[str, str] = {
     # ── Critical (ESI 1 signals) ──
     r"\b(zatrzymani\w* krążenia|nzk\b|cardiac arrest|resuscytac|reanimac|rko\b|cpr\b)":
-        ["cc_cardiacarrest"],
+        "cc_cardiacarrest",
     # Trauma-team activation / pre-notification ("powiadomienie o pacjencie urazowym")
     (r"\b(politraum|polytrauma|uraz\w* wielonarządow|uraz\w* wielomiejscow|major trauma"
      r"|zespół urazow|zespołu urazow|centrum urazow|trauma team|trauma activation)"):
-        ["cc_trauma_activation"],
+        "cc_trauma_activation",
     r"\b(nieprzytomn|unresponsive|unconscious|nie reaguje)":
-        ["cc_unresponsive"],
+        "cc_unresponsive",
     r"\b(niewydoln\w* oddechow|respiratory distress|ciężk\w* duszno|skrajn\w* duszno)":
-        ["cc_respiratorydistress"],
+        "cc_respiratorydistress",
 
     # ── Cardiovascular ──
     r"\b(ból w klatce|bólu w klatce|ból klatki|bólu klatki|ból zamostkow|chest pain|zawał|heart attack|stemi|nstemi)":
-        ["cc_chestpain"],
+        "cc_chestpain",
     r"\b(ucisk w klatce|ucisk za mostkiem|ściskani\w* w klatce|gniecenie w klatce|chest tightness|chest pressure)":
-        ["cc_chesttightness"],
+        "cc_chesttightness",
     r"\b(kołatani|palpitation)":
-        ["cc_palpitations"],
+        "cc_palpitations",
     r"\b(arytmi|niemiarow|migotani\w* przedsionk|irregular heart|atrial fibrillation)":
-        ["cc_irregularheartbeat"],
+        "cc_irregularheartbeat",
     r"\b(tachykardi|tachycardi)":
-        ["cc_tachycardia"],
+        "cc_tachycardia",
     r"\b(szybkie bicie serca|serce wali|rapid heart)":
-        ["cc_rapidheartrate"],
+        "cc_rapidheartrate",
     r"\b(omdleni|omdlał|zasłab|syncope|fainted)":
-        ["cc_syncope"],
+        "cc_syncope",
     r"\b(przedomdl|presyncope|near.syncope)":
-        ["cc_nearsyncope"],
+        "cc_nearsyncope",
     r"\b(utrat\w* przytomności|stracił\w* przytomność|loss of consciousness)":
-        ["cc_lossofconsciousness"],
+        "cc_lossofconsciousness",
 
     # ── Respiratory ──
+    # Yale synonyms: Shortness of Breath 19 702 train visits vs Dyspnea 2 479 (together: 39)
     r"\b(duszn|dyspn|brak tchu|krótki oddech|shortness of breath|short of breath)":
-        ["cc_dyspnea", "cc_shortnessofbreath"],
+        "cc_shortnessofbreath",
     r"\b(trudnoś\w* w oddychaniu|breathing difficult|difficulty breathing)":
-        ["cc_breathingdifficulty"],
+        "cc_breathingdifficulty",
     r"\b(kaszel|kaszl|cough)":
-        ["cc_cough"],
+        "cc_cough",
     r"\b(krwioplu|hemoptysis)":
-        ["cc_hemoptysis"],
+        "cc_hemoptysis",
     r"\b(astm|asthma)":
-        ["cc_asthma"],
+        "cc_asthma",
     r"\b(świsty|świszcz|wheez)":
-        ["cc_wheezing"],
+        "cc_wheezing",
 
     # ── Neurological ──
     r"\b(udar|stroke|porażeni\w* połowicz|opadnięt\w* kącik|asymetri\w* twarzy|afazj|bełkotliw|facial droop|slurred speech)":
-        ["cc_strokealert"],
+        "cc_strokealert",
     r"\b(niedowład|paraliż|hemipare|hemipleg)":
-        ["cc_extremityweakness"],
+        "cc_extremityweakness",
+    # Yale synonyms: Altered Mental Status 6 859 train visits vs Confusion 640 (together: 6)
     r"\b(splątan|zdezorientowan|dezorientac|confus|altered mental)":
-        ["cc_alteredmentalstatus", "cc_confusion"],
+        "cc_alteredmentalstatus",
     r"\b(drgaw|konwulsj|padaczk|epilep|seizure)":
-        ["cc_seizures"],
+        "cc_seizures",
     r"\b(ból głowy|bólu głowy|bóle głowy|headache)":
-        ["cc_headache"],
+        "cc_headache",
     r"\b(migren|migraine)":
-        ["cc_migraine"],
+        "cc_migraine",
     r"\b(najsilniejszy ból głowy|najgorszy ból głowy|piorunujący ból głowy|thunderclap|worst headache)":
-        ["cc_headache_newonsetornewsymptoms"],
+        "cc_headache_newonsetornewsymptoms",
     r"\b(zawroty głowy|zawrotów głowy|dizz|vertigo)":
-        ["cc_dizziness"],
+        "cc_dizziness",
     r"\b(drętwieni|mrowieni|numbness|tingling)":
-        ["cc_numbness"],
+        "cc_numbness",
     r"\b(osłabieni|weakness)":
-        ["cc_weakness"],
+        "cc_weakness",
     r"\b(zmęczeni|wyczerpani|fatigue)":
-        ["cc_fatigue"],
+        "cc_fatigue",
 
     # ── Abdominal / GI ──
     r"\b(ból brzucha|bólu brzucha|bóle brzucha|brzuch|abdominal pain)":
-        ["cc_abdominalpain"],
+        "cc_abdominalpain",
     _cooccur(r"ciąż|pregnan", r"brzuch|podbrzusz|abdominal"):
-        ["cc_abdominalpainpregnant"],
+        "cc_abdominalpainpregnant",
     r"\b(nadbrzusz|epigastr|zgag|heartburn)":
-        ["cc_epigastricpain"],
+        "cc_epigastricpain",
     r"\b(kolk\w* nerkow|okolicy lędźwiowej|flank pain|renal colic)":
-        ["cc_flankpain"],
+        "cc_flankpain",
     r"\b(wymiot|vomit|emesis)":
-        ["cc_emesis"],
+        "cc_emesis",
     r"\b(nudno|mdłoś|nausea)":
-        ["cc_nausea"],
+        "cc_nausea",
     r"\b(biegunk|diarrh)":
-        ["cc_diarrhea"],
+        "cc_diarrhea",
     r"\b(zaparci|constipat)":
-        ["cc_constipation"],
+        "cc_constipation",
     r"\b(krwawieni\w* z przewodu|krwotok\w* z przewodu|krew w stolcu|fusowat|smolist|hematemesis|melena|gi bleed)":
-        ["cc_gibleeding"],
+        "cc_gibleeding",
     r"\b(krwawieni\w* z odbytu|rectal bleed|hematochez)":
-        ["cc_rectalbleeding"],
+        "cc_rectalbleeding",
 
     # ── Trauma ──
-    # Generic injury / fracture → "Trauma" (no generic fracture complaint in Yale)
+    # Generic injury / fracture → "Trauma" (no generic fracture complaint in Yale);
+    # dropped when a specific injury / fall / crash code fired (REDUNDANT_GENERIC)
     r"\b(uraz|trauma|wypadek|wypadku|accident|złama|fractur)":
-        ["cc_trauma"],
+        "cc_trauma",
     r"\b(upad|przewróci|fall)":
-        ["cc_fall"],
+        "cc_fall",
     r"\b(wielokrotne upadki|częste upadki|multiple falls|recurrent falls)":
-        ["cc_multiplefalls"],
+        "cc_multiplefalls",
     r"\b(wypad\w* komunikacyjn|wypad\w* samochodow|kolizj|potrąc|motor vehicle|car accident|car crash|mvc\b|mva\b)":
-        ["cc_motorvehiclecrash"],
+        "cc_motorvehiclecrash",
     r"\b(motocykl|motorcycle)":
-        ["cc_motorcyclecrash"],
+        "cc_motorcyclecrash",
     r"\b(pobic|pobit|napaś|assault)":
-        ["cc_assaultvictim"],
-    _near(_INJURY + r"|uderz", r"głow|head\b"):            ["cc_headinjury"],
-    _near(_INJURY, r"nog|nodz|nóg|podudzi|goleni|leg\b"):   ["cc_leginjury"],
-    _near(_INJURY, r"ręk|ręce|ramieni|przedrami|arm\b|forearm"): ["cc_arminjury"],
-    _near(_INJURY, r"nadgarst|wrist"):                      ["cc_wristinjury"],
-    _near(_INJURY, r"kostk|staw\w* skokow|ankle"):          ["cc_ankleinjury"],
-    _near(_INJURY, r"kolan|knee"):                          ["cc_kneeinjury"],
-    _near(_INJURY, r"bark|obojczyk|shoulder|clavic"):       ["cc_shoulderinjury"],
-    _near(_INJURY, r"dłoń|dłoni|hand\b"):                   ["cc_handinjury"],
-    _near(_INJURY, r"palc|finger"):                         ["cc_fingerinjury"],
-    _near(_INJURY, r"stop(?:a|y|ie|ę)\b|foot"):             ["cc_footinjury"],
-    _near(_INJURY, r"żeb(?:r|er)|ribs?\b"):                 ["cc_ribinjury"],
-    _near(_INJURY, r"twarz|face|facial"):                   ["cc_facialinjury"],
-    _near(_INJURY, r"ok[aou]\b|oczu|eye"):                  ["cc_eyeinjury"],
+        "cc_assaultvictim",
+    _near(_INJURY + r"|uderz", r"głow|head\b"):            "cc_headinjury",
+    _near(_INJURY, r"nog|nodz|nóg|podudzi|goleni|leg\b"):   "cc_leginjury",
+    _near(_INJURY, r"ręk|ręce|ramieni|przedrami|arm\b|forearm"): "cc_arminjury",
+    _near(_INJURY, r"nadgarst|wrist"):                      "cc_wristinjury",
+    _near(_INJURY, r"kostk|staw\w* skokow|ankle"):          "cc_ankleinjury",
+    _near(_INJURY, r"kolan|knee"):                          "cc_kneeinjury",
+    _near(_INJURY, r"bark|obojczyk|shoulder|clavic"):       "cc_shoulderinjury",
+    _near(_INJURY, r"dłoń|dłoni|hand\b"):                   "cc_handinjury",
+    _near(_INJURY, r"palc|finger"):                         "cc_fingerinjury",
+    _near(_INJURY, r"stop(?:a|y|ie|ę)\b|foot"):             "cc_footinjury",
+    _near(_INJURY, r"żeb(?:r|er)|ribs?\b"):                 "cc_ribinjury",
+    _near(_INJURY, r"twarz|face|facial"):                   "cc_facialinjury",
+    _near(_INJURY, r"ok[aou]\b|oczu|eye"):                  "cc_eyeinjury",
     # "od rana" / "do rana" / "z rana" = "since/until/in the morning", not a wound
     r"\b((?<!od )(?<!do )(?<!z )rana\b|ran[ęy]\b|skaleczeni|rozcięci|laceration|cut\b)":
-        ["cc_laceration"],
+        "cc_laceration",
     r"\b(oparzeni|burn)":
-        ["cc_burn"],
+        "cc_burn",
     r"\b(pogryzi|ugryzi|pogryzł|ugryzł|animal bite|dog bite|bitten)":
-        ["cc_animalbite"],
+        "cc_animalbite",
     r"\b(użądl|ukąszeni\w* owad|insect bite|bee sting)":
-        ["cc_insectbite"],
+        "cc_insectbite",
     r"\b(kleszcz|tick\b)":
-        ["cc_tickremoval"],
+        "cc_tickremoval",
 
     # ── Bleeding ──
     (r"\b(krwawieni\w*\b(?!\s+z\s+(?:przewodu|odbytu|nosa|dróg rodnych|pochwy))"
      r"|krwiak|siniak|zasinieni|bruis|(?<!rectal )(?<!vaginal )(?<!gi )(?<!nose )bleeding)"):
-        ["cc_bleeding_bruising"],
+        "cc_bleeding_bruising",
     r"\b(krwawieni\w* z nosa|krwotok\w* z nosa|epistaxis|nosebleed|nose bleed)":
-        ["cc_epistaxis"],
+        "cc_epistaxis",
     r"\b(krwawieni\w* z dróg rodnych|krwawieni\w* z pochwy|plamieni|vaginal bleed)":
-        ["cc_vaginalbleeding"],
+        "cc_vaginalbleeding",
     r"\b(krwiomocz|krew w moczu|hematuria)":
-        ["cc_hematuria"],
+        "cc_hematuria",
 
     # ── Infection / general ──
     # Sepsis has no own complaint in Yale — closest real code is "Fever"
     rf"\b({_FEVER}|wysoka temperatura|stan podgorączk)":
-        ["cc_fever"],
+        "cc_fever",
     _cooccur(_FEVER, r"immunosupres|chemioterapi|neutropeni|immunocompromis|przeszczep|transplant"):
-        ["cc_feverimmunocompromised"],
+        "cc_feverimmunocompromised",
     r"\b(dreszcz|chills|rigors)":
-        ["cc_chills"],
+        "cc_chills",
     r"\b(odwodni|dehydrat)":
-        ["cc_dehydration"],
+        "cc_dehydration",
     r"\b(gryp|influenza)":
-        ["cc_influenza"],
+        "cc_influenza",
     r"\b(przeziębi|common cold|cold symptoms)":
-        ["cc_coldlikesymptoms"],
+        "cc_coldlikesymptoms",
     r"\b(ból gardła|bólu gardła|sore throat)":
-        ["cc_sorethroat"],
+        "cc_sorethroat",
     r"\b(ból ucha|bólu ucha|ear pain|earache)":
-        ["cc_earpain"],
+        "cc_earpain",
     r"\b(ból zęba|bólu zęba|ból zębów|toothache|dental pain)":
-        ["cc_dentalpain"],
+        "cc_dentalpain",
     r"\b(ropień|ropnia|abscess)":
-        ["cc_abscess"],
+        "cc_abscess",
     r"\b(zapaleni\w* tkanki łącznej|cellulitis)":
-        ["cc_cellulitis"],
+        "cc_cellulitis",
 
     # ── Psychiatric / toxicology ──
     r"\b(samobój|suicid)":
-        ["cc_suicidal"],
+        "cc_suicidal",
     r"\b(homicid|chce zabić|grozi zabiciem|myśli zabójcz)":
-        ["cc_homicidal"],
+        "cc_homicidal",
     r"\b(psychoz|psychotyczn|psychosis|psychotic)":
-        ["cc_psychoticsymptoms"],
+        "cc_psychoticsymptoms",
     r"\b(halucynac|omam|hallucinat)":
-        ["cc_hallucinations"],
+        "cc_hallucinations",
     r"\b(psychiatr)":
-        ["cc_psychiatricevaluation"],
+        "cc_psychiatricevaluation",
     r"\b(pobudzon|pobudzeni|agresywn|agresj|agitat)":
-        ["cc_agitation"],
+        "cc_agitation",
     r"\b(lęk|niepokój|anxiety|anxious)":
-        ["cc_anxiety"],
+        "cc_anxiety",
     r"\b(atak paniki|napad paniki|panic attack)":
-        ["cc_panicattack"],
+        "cc_panicattack",
     r"\b(depresj|depress)":
-        ["cc_depression"],
+        "cc_depression",
     r"\b(nietrzeźw|upojeni|pijan|alkohol|alcohol|etanol|drunk)":
-        ["cc_alcoholintoxication"],
+        "cc_alcoholintoxication",
     r"\b(odstawieni\w* alkohol|zespół abstynencyjn|zespołu abstynencyjn|delirium tremens|alcohol withdrawal)":
-        ["cc_withdrawal_alcohol"],
+        "cc_withdrawal_alcohol",
     _cooccur(_OVERDOSE, _SUICIDE):
-        ["cc_overdose_intentional"],
+        "cc_overdose_intentional",
     _without(_OVERDOSE, _SUICIDE):
-        ["cc_overdose_accidental"],
+        "cc_overdose_accidental",
     r"\b(narkoty|dopalacz|amfetamin|metamfetamin|kokain|heroin|substancj\w* psychoaktywn)":
-        ["cc_drugproblem"],
+        "cc_drugproblem",
     r"\b(zatruci|zatrut|poison|tlenek węgla|czad)":
-        ["cc_poisoning"],
+        "cc_poisoning",
 
     # ── Skin / allergy ──
     r"\b(wysypk|pokrzywk|rash|hives|urticari)":
-        ["cc_rash"],
+        "cc_rash",
     r"\b(reakcj\w* alergiczn|odczyn\w* alergiczn|allergic reaction|anafilak|anaphyla|obrzęk\w* naczynioruchow|angioedema)":
-        ["cc_allergicreaction"],
+        "cc_allergicreaction",
     rf"\b({_SWELLING})":
-        ["cc_edema"],
-    _near(_SWELLING, r"nog|nóg|podudzi|goleni|kończyn\w* doln|leg"):  ["cc_legswelling"],
-    _near(_SWELLING, r"twarz|powiek|face|facial"):                      ["cc_facialswelling"],
-    _near(_SWELLING, r"język|warg|gardł|tongue|lip|throat"):            ["cc_oralswelling"],
+        "cc_edema",
+    _near(_SWELLING, r"nog|nóg|podudzi|goleni|kończyn\w* doln|leg"):  "cc_legswelling",
+    _near(_SWELLING, r"twarz|powiek|face|facial"):                      "cc_facialswelling",
+    _near(_SWELLING, r"język|warg|gardł|tongue|lip|throat"):            "cc_oralswelling",
 
     # ── Metabolic ──
     r"\b(hipoglikemi|niski cukier|hypoglyc)":
-        ["cc_decreasedbloodsugar_symptomatic"],
+        "cc_decreasedbloodsugar_symptomatic",
     r"\b(hiperglikemi|wysoki cukier|hyperglyc|kwasic\w* ketonow|ketoacidosis|dka\b)":
-        ["cc_hyperglycemia"],
+        "cc_hyperglycemia",
 
     # ── Genitourinary ──
     r"\b(infekcj\w* (?:dróg|układu) moczow|zakażeni\w* (?:dróg|układu) moczow|zum\b|uti\b|urinary tract infection)":
-        ["cc_urinarytractinfection"],
+        "cc_urinarytractinfection",
     r"\b(pieczeni\w* przy (?:oddawaniu|mikcji)|bolesne oddawanie moczu|dyzuri|dysuri)":
-        ["cc_dysuria"],
+        "cc_dysuria",
     r"\b(zatrzymani\w* moczu|urinary retention)":
-        ["cc_urinaryretention"],
+        "cc_urinaryretention",
     r"\b(ból jąd|bólu jąd|testicular pain|testicle pain)":
-        ["cc_testiclepain"],
+        "cc_testiclepain",
 
     # ── Pain by location ──
     r"\b(ból plec|bólu plec|ból kręgosłup|bólu kręgosłup|ból lędźw|rwa kulszow|back pain|lumbago)":
-        ["cc_backpain"],
+        "cc_backpain",
     r"\b(ból szyi|bólu szyi|ból karku|bólu karku|neck pain)":
-        ["cc_neckpain"],
+        "cc_neckpain",
 
     # ── Low-acuity visits (ESI 4–5) ──
     r"\b(zdjęci\w* szwów|usunięci\w* szwów|suture removal|staple removal)":
-        ["cc_suture_stapleremoval"],
+        "cc_suture_stapleremoval",
     r"\b(kontrol\w* rany|zmian\w* opatrunku|wound check)":
-        ["cc_woundcheck"],
+        "cc_woundcheck",
 }
 
 _FLAGS = re.IGNORECASE | re.UNICODE
-_COMPILED_KEYWORDS: list[tuple[re.Pattern[str], list[str]]] = [
-    (re.compile(pattern, _FLAGS), cc_list) for pattern, cc_list in KEYWORD_MAP.items()
+_COMPILED_KEYWORDS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(pattern, _FLAGS), cc) for pattern, cc in KEYWORD_MAP.items()
 ]
+
+
+# ── Generic complaint dropped when a specific one fired ──────────────
+# "złamanie nogi" matches the generic Trauma rule AND Leg Injury; "obrzęk nóg"
+# Edema AND Leg Swelling, "wielokrotne upadki" Fall AND Multiple Falls. In Yale a
+# visit with the specific complaint practically never also carries the generic
+# one (< 1% of the rarer code in train.parquet — checked by
+# tests/test_layer0_parser.py), so emitting both would feed the models a
+# combination they never saw. generic → codes that make it redundant; applied to
+# the keyword AND the LLM output (the LLM may also return both synonyms).
+_TRAUMA_SPECIFIC: frozenset[str] = frozenset(
+    f"cc_{c}" for c in KNOWN_CC_CODES
+    if c.endswith(("injury", "laceration"))
+    or c in {"fall", "fall_65", "multiplefalls", "motorvehiclecrash", "motorcyclecrash",
+             "assaultvictim", "trauma_activation"}
+)
+REDUNDANT_GENERIC: dict[str, frozenset[str]] = {
+    "cc_trauma": _TRAUMA_SPECIFIC,
+    "cc_fall": frozenset({"cc_fall_65", "cc_multiplefalls"}),
+    "cc_edema": frozenset(f"cc_{c}" for c in KNOWN_CC_CODES if c.endswith("swelling")),
+    "cc_fever": frozenset(f"cc_{c}" for c in KNOWN_CC_CODES
+                          if c.startswith("fever") and c != "fever"),
+    "cc_headache": frozenset(f"cc_{c}" for c in KNOWN_CC_CODES
+                             if c.startswith("headache") and c != "headache") | {"cc_migraine"},
+    "cc_abdominalpain": frozenset({"cc_abdominalpainpregnant"}),
+    "cc_bleeding_bruising": frozenset({"cc_epistaxis", "cc_gibleeding", "cc_rectalbleeding",
+                                       "cc_vaginalbleeding"}),
+    "cc_poisoning": frozenset({"cc_overdose_accidental", "cc_overdose_intentional"}),
+    "cc_seizures": frozenset({"cc_seizure_newonset", "cc_seizure_priorhxof"}),
+    # Synonyms (the keyword rules emit only the more frequent one; the LLM may return both)
+    "cc_dyspnea": frozenset({"cc_shortnessofbreath"}),
+    "cc_confusion": frozenset({"cc_alteredmentalstatus"}),
+}
+
+
+def drop_redundant_generic(codes: Iterable[str]) -> set[str]:
+    """Remove generic complaints made redundant by a specific one (REDUNDANT_GENERIC)."""
+    found = set(codes)
+    return {c for c in found if not (REDUNDANT_GENERIC.get(c, frozenset()) & found)}
 
 
 # Pain score: extract first 0-10 number near "ból" or "pain"
@@ -409,14 +459,14 @@ def parse_with_keywords(note: str) -> dict:
     if note and note.strip():
         note_lc = note.lower()
         matched: set[str] = set()
-        for pattern, cc_list in _COMPILED_KEYWORDS:
+        for pattern, cc in _COMPILED_KEYWORDS:
             hit = pattern.search(note_lc)
             if hit:
-                matched.update(cc_list)
-                # Zero-width rules (co-occurrence) have no matched text → use the codes
+                matched.add(cc)
+                # Zero-width rules (co-occurrence) have no matched text → use the code
                 text = hit.group(0).strip()
-                keywords.append(text if text else "+".join(c[3:] for c in cc_list))
-        cc_features = {cc: 1 for cc in sorted(matched)}
+                keywords.append(text if text else cc[3:])
+        cc_features = {cc: 1 for cc in sorted(drop_redundant_generic(matched))}
 
         pain_match = _PAIN_RE.search(note_lc)
         if pain_match:
@@ -450,13 +500,14 @@ async def parse_with_llm(
         complaints.append("alteredmentalstatus")
 
     # The LLM may ignore the enum — keep only real model features
-    cc_features: dict[str, int] = {}
+    codes: set[str] = set()
     for raw in complaints:
         code = normalize_cc_code(raw)
         if code is None:
             log.debug("[llm] dropping unknown chief complaint %r", raw)
             continue
-        cc_features[code] = 1
+        codes.add(code)
+    cc_features = {cc: 1 for cc in sorted(drop_redundant_generic(codes))}
 
     extra: dict[str, float] = {}
     pain = parsed.get("pain_score")

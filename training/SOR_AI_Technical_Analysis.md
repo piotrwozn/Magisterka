@@ -131,7 +131,7 @@ class TabularFeatures(BaseModel):
     triage_vital_o2: Optional[float] = None
     cc_chestpain: Optional[int] = None
     cc_respiratorydistress: Optional[int] = None
-    # ... pozostałe 220 cech
+    # ... pozostałe cechy (razem 271 w zestawie triage, 903 w full — training/DATA_AUDIT.md)
 
 class TriagePayload(BaseModel):
     tabular: TabularFeatures

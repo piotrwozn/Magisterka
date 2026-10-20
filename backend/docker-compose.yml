@@ -25,6 +25,7 @@ services:
       - OLLAMA_NLP_MODEL=medgemma:27b
       - OLLAMA_SYNTHESIS_MODEL=qwen3.6
       - ALLOWED_ORIGINS=https://sorai-triage.com,http://localhost:5173
+      - TIMEZONE=${TIMEZONE:-Europe/Warsaw}    # ED local time (arrival hour / weekday features)
     expose:
       - "8000"
     restart: unless-stopped

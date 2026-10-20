@@ -62,6 +62,7 @@ async def predict(request: PredictRequest, registry: ModelRegistry) -> PredictRe
     df_row = build_feature_row(
         request.vitals, cc_features, extra, all_cc_columns=all_cc,
         is_male=request.sex, arrival_mode=request.arrival_mode, o2_device=request.o2_device,
+        medians=registry.medians,          # train mode of is_male for an unknown sex
     )
 
     # ── Layer 1A: ensemble ML inference ─────────────────────────────

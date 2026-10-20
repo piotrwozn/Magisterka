@@ -256,3 +256,53 @@ class TestSampling:
     def test_feature_sets_cache_cleared_between_tests(self, isolated_paths):
         """Bezpiecznik dla innych testów: cache list cech nie przecieka między katalogami."""
         assert dataset._feature_sets_payload.cache_info().currsize == 0
+
+
+# ─────────────────────────────────────────
+# Odcisk danych
+# ─────────────────────────────────────────
+class TestDataFingerprint:
+    BASE = {"data_version": DATA_VERSION, "created": "2026-10-19T19:31:16", "source": "/a/raw.parquet",
+            "split_strategy": "random", "n_rows": {"train": 800, "val": 100, "test": 100},
+            "audit": {"written_at_counts": {"Admit": 3}}}
+
+    def test_volatile_keys_do_not_change_fingerprint(self):
+        other = {**self.BASE, "created": "2026-10-20T08:00:00", "source": r"C:\inna\ścieżka\raw.parquet",
+                 "prepared_at": "teraz", "created_by_host": "pc", "timestamp": 1.0}
+        fp = dataset.data_fingerprint(self.BASE)
+        assert fp == dataset.data_fingerprint(other)
+        assert len(fp) == 10 and fp != dataset.NO_DATA_FINGERPRINT
+
+    def test_content_changes_fingerprint(self):
+        fp = dataset.data_fingerprint(self.BASE)
+        assert dataset.data_fingerprint({**self.BASE, "n_rows": {"train": 801, "val": 100, "test": 100}}) != fp
+        assert dataset.data_fingerprint({**self.BASE, "split_strategy": "site"}) != fp
+        assert dataset.data_fingerprint({**self.BASE, "data_version": "esi-v0"}) != fp
+        # Zagnieżdżone klucze (audyt) są danymi — nawet gdy nazwa przypomina znacznik czasu
+        assert dataset.data_fingerprint({**self.BASE, "audit": {"written_at_counts": {"Admit": 4}}}) != fp
+
+    def test_path_and_missing_file(self, tmp_path):
+        path = tmp_path / "manifest.json"
+        path.write_text(json.dumps(self.BASE, ensure_ascii=False), encoding="utf-8")
+        assert dataset.data_fingerprint(path) == dataset.data_fingerprint(str(path)) == \
+            dataset.data_fingerprint(self.BASE)
+        assert dataset.data_fingerprint(tmp_path / "brak.json") == dataset.NO_DATA_FINGERPRINT
+        (tmp_path / "zly.json").write_text("{nie json", encoding="utf-8")
+        assert dataset.data_fingerprint(tmp_path / "zly.json") == dataset.NO_DATA_FINGERPRINT
+
+    def test_reprepare_identical_data_keeps_fingerprint(self, isolated_paths, make_raw):
+        """Ponowne przygotowanie tych samych danych (inny czas, inna ścieżka) → ten sam odcisk."""
+        from src.data.prepare import prepare_dataset
+        from src.models import tuning
+
+        raw = make_raw(n=600, seed=21)
+        prepare_dataset(strategy="random", raw=raw)
+        first = dataset.data_fingerprint()
+        assert first != dataset.NO_DATA_FINGERPRINT
+        assert tuning.data_fingerprint is dataset.data_fingerprint          # jeden algorytm w całym kodzie
+        _set_manifest(isolated_paths, created="2000-01-01T00:00:00", source="/gdzie/indziej.parquet")
+        assert dataset.data_fingerprint() == first
+        prepare_dataset(strategy="random", raw=raw)
+        assert dataset.data_fingerprint() == first
+        prepare_dataset(strategy="site", raw=raw)                            # inny podział = inne dane
+        assert dataset.data_fingerprint() != first

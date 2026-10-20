@@ -12,10 +12,11 @@ import pandas as pd
 import pytest
 from sklearn.linear_model import LogisticRegression
 
-from app.models.registry import TARGET_MODELS, ModelRegistry
+from app.models.registry import TARGET_MODELS, ModelRegistry, training_data_version
 
 CLASS_NAMES = ["ESI1", "ESI2", "ESI3", "ESI4", "ESI5"]
 FEATURES = ["age", "triage_vital_hr", "cc_chestpain"]
+DATA_VERSION = training_data_version()          # training src.utils.config.DATA_VERSION
 
 
 def _artifact(name: str = "logreg", **overrides) -> dict:
@@ -33,7 +34,7 @@ def _artifact(name: str = "logreg", **overrides) -> dict:
         "classes_": np.arange(5),
         "class_names": CLASS_NAMES,
         "label": "esi",
-        "data_version": "esi-v1",
+        "data_version": DATA_VERSION,
         "training_duration_s": 0.1,
     }
     artifact.update(overrides)
@@ -48,18 +49,24 @@ def _dump(path: Path, artifact: dict) -> Path:
 
 def _make_run(runs_dir: Path, run_name: str, model: str = "logreg",
               train_sample: int | None = None, feature_set: str = "triage",
-              with_info: bool = True, done: bool = True) -> Path:
+              with_info: bool = True, done: bool = True, *, tuned: bool = True,
+              data_version: str | None = DATA_VERSION, info_extra: dict | None = None,
+              done_extra: dict | None = None) -> Path:
     """training/runs/<run_name>/{model.joblib, run_info.json, DONE.json}."""
     run_dir = runs_dir / run_name
-    _dump(run_dir / "model.joblib", _artifact(model, run_id=run_name[:15], feature_set=feature_set))
+    _dump(run_dir / "model.joblib", _artifact(model, run_id=run_name[:15], feature_set=feature_set,
+                                              data_version=data_version))
     if with_info:
         (run_dir / "run_info.json").write_text(json.dumps({
             "run_name": run_name, "model": model, "feature_set": feature_set,
-            "train_sample": train_sample, "eval_sample": None,
+            "train_sample": train_sample, "eval_sample": None, "tuned": tuned,
+            "weights_strategy": "none", "data_version": data_version, **(info_extra or {}),
         }), encoding="utf-8")
     if done:
-        (run_dir / "DONE.json").write_text(json.dumps({"run_name": run_name, "model": model}),
-                                           encoding="utf-8")
+        (run_dir / "DONE.json").write_text(json.dumps({
+            "run_name": run_name, "model": model, "tuned": tuned, "data_version": data_version,
+            **(done_extra or {}),
+        }), encoding="utf-8")
     return run_dir
 
 
@@ -260,6 +267,95 @@ class TestLoadArtifacts:
         reg = ModelRegistry()
         reg.load_from_dir(models_dir, runs_dir=runs_dir)
         assert reg.models == {}
+
+    def test_other_data_version_run_skipped(self, dirs):
+        models_dir, runs_dir = dirs
+        current = _make_run(runs_dir, "20260101_100000_logreg_triage_standard")
+        _make_run(runs_dir, "20260105_100000_logreg_triage_standard", data_version="esi-v1")
+
+        reg = ModelRegistry()
+        reg.load_from_dir(models_dir, runs_dir=runs_dir)
+        assert reg.data_version == DATA_VERSION
+        assert reg.models["logreg"]["path"] == str(current / "model.joblib")
+
+    def test_other_data_version_artifact_skipped(self, dirs, caplog):
+        models_dir, runs_dir = dirs
+        _dump(models_dir / "xgboost_old.joblib", _artifact("xgboost", data_version="esi-v1"))
+        _dump(models_dir / "lightgbm_unknown.joblib", _artifact("lightgbm", data_version=None))
+
+        reg = ModelRegistry()
+        reg.load_from_dir(models_dir, runs_dir=runs_dir)
+        assert reg.models == {}
+        assert "esi-v1" in caplog.text
+
+    def test_data_version_check_can_be_disabled(self, dirs):
+        models_dir, runs_dir = dirs
+        _dump(models_dir / "xgboost_old.joblib", _artifact("xgboost", data_version="esi-v1"))
+        reg = ModelRegistry()
+        reg.load_from_dir(models_dir, runs_dir=runs_dir, data_version=None)
+        assert "xgboost" in reg.models
+
+    def test_tuned_run_preferred_over_newer_untuned_run(self, dirs):
+        models_dir, runs_dir = dirs
+        tuned = _make_run(runs_dir, "20260101_100000_logreg_triage_standard")
+        _make_run(runs_dir, "20260105_100000_logreg_triage_standard-notune", tuned=False)
+
+        reg = ModelRegistry()
+        reg.load_from_dir(models_dir, runs_dir=runs_dir)
+        assert reg.models["logreg"]["path"] == str(tuned / "model.joblib")
+        assert reg.models["logreg"]["tuned"] is True
+
+    @pytest.mark.parametrize("info_extra, done_extra", [
+        ({}, {"custom": True}),                                  # DONE.json flag (current training)
+        ({"tag": "standard-custom"}, {}),                       # older runs: tag
+        ({"custom_params": {"max_depth": 3}}, {}),
+        ({"feature_filter": True}, {}),
+    ])
+    def test_plain_run_preferred_over_newer_custom_run(self, dirs, info_extra, done_extra):
+        models_dir, runs_dir = dirs
+        plain = _make_run(runs_dir, "20260101_100000_logreg_triage_standard", done_extra={"custom": False})
+        _make_run(runs_dir, "20260105_100000_logreg_triage_standard-custom",
+                  info_extra=info_extra, done_extra=done_extra)
+
+        reg = ModelRegistry()
+        reg.load_from_dir(models_dir, runs_dir=runs_dir)
+        assert reg.models["logreg"]["path"] == str(plain / "model.joblib")
+
+    @pytest.mark.parametrize("info_extra", [
+        {"weights_strategy": "balanced"},
+        {"weights_strategy": "optuna_qwk", "class_weights": {"0": 3.0}},
+    ])
+    def test_unweighted_run_preferred_over_newer_weighted_run(self, dirs, info_extra):
+        models_dir, runs_dir = dirs
+        plain = _make_run(runs_dir, "20260101_100000_logreg_triage_standard")
+        _make_run(runs_dir, "20260105_100000_logreg_triage_w", info_extra=info_extra)
+
+        reg = ModelRegistry()
+        reg.load_from_dir(models_dir, runs_dir=runs_dir)
+        assert reg.models["logreg"]["path"] == str(plain / "model.joblib")
+
+    def test_preference_order(self, dirs):
+        """tuned > plain > unweighted > finished > newest (all full-data runs)."""
+        models_dir, runs_dir = dirs
+        _make_run(runs_dir, "20260109_000000_logreg_untuned", tuned=False)
+        _make_run(runs_dir, "20260108_000000_logreg_custom", done_extra={"custom": True})
+        _make_run(runs_dir, "20260107_000000_logreg_weighted", info_extra={"weights_strategy": "balanced"})
+        _make_run(runs_dir, "20260106_000000_logreg_interrupted", done=False)
+        best = _make_run(runs_dir, "20260105_000000_logreg_standard")
+        _make_run(runs_dir, "20260104_000000_logreg_standard_older")
+
+        reg = ModelRegistry()
+        reg.load_from_dir(models_dir, runs_dir=runs_dir)
+        assert reg.models["logreg"]["path"] == str(best / "model.joblib")
+
+    def test_untuned_full_run_beats_tuned_sample_run(self, dirs):
+        # A smoke/quick profile run is tuned on a few thousand rows — only a fallback
+        full = _make_run(dirs[1], "20260101_100000_logreg_triage_standard-notune", tuned=False)
+        _make_run(dirs[1], "20260105_100000_logreg_triage_smoke", train_sample=6000)
+
+        reg = ModelRegistry()
+        reg.load_from_dir(dirs[0], runs_dir=dirs[1])
+        assert reg.models["logreg"]["path"] == str(full / "model.joblib")
 
     def test_corrupted_file_falls_back(self, dirs):
         models_dir, runs_dir = dirs

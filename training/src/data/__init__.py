@@ -1,6 +1,7 @@
 """Warstwa danych: ładowanie Yale, przygotowanie zbioru ESI, dostęp do splitów."""
 
 from src.data.dataset import (
+    data_fingerprint,
     early_stopping_split,
     ensure_prepared,
     feature_groups,
@@ -21,6 +22,7 @@ __all__ = [
     "META_COLS",
     "VITALS_COMPLETE_COL",
     "convert_rdata_to_parquet",
+    "data_fingerprint",
     "early_stopping_split",
     "ensure_prepared",
     "feature_groups",

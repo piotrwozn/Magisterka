@@ -32,7 +32,8 @@ class PredictRequest(CamelModel):
     vitals: Vitals
     clinical_note: str = Field("", max_length=2000)
     # Optional patient context (features of the trained models; missing → as in
-    # app/pipeline/feature_engineering.build_feature_row: sex / O2 = NaN, arrival = "self")
+    # app/pipeline/feature_engineering.build_feature_row: sex = train mode (+ warning),
+    # O2 device = NaN, arrival = "self")
     sex: Literal["M", "F"] | None = Field(None, description="M = male, F = female")
     arrival_mode: str | None = Field(
         None, max_length=40,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +26,13 @@ async def lifespan(_app: FastAPI):
     log.info("SOR-AI Backend starting")
     log.info("  models_dir : %s", settings.models_dir)
     log.info("  feature_set: %s", settings.feature_set)
+    log.info("  timezone   : %s", settings.timezone)
     log.info("=" * 60)
+    try:   # arrival_* features use the ED's local time — fail at startup, not per request
+        ZoneInfo(settings.timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise RuntimeError(f"TIMEZONE={settings.timezone!r} is not a known IANA time zone "
+                           f"(Windows: pip install tzdata) — {exc}") from exc
 
     registry.load_from_dir(settings.models_dir)
 

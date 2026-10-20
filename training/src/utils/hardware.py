@@ -13,7 +13,8 @@ Wartości: auto | cpu | gpu.
 Samo `nvidia-smi` nie wystarcza: koło xgboost 3.4 jest zbudowane z CUDA 13 i przy sterowniku
 starszym niż 580 po cichu trenuje na CPU, a CatBoost rzuca `CUDA error 35`.
 
-Wątki CPU: `n_jobs()` = SOR_AI_N_JOBS (> 0) albo liczba FIZYCZNYCH rdzeni.
+Wątki CPU: `n_jobs()` = SOR_AI_N_JOBS (> 0) albo liczba FIZYCZNYCH rdzeni (przycięta do maski
+affinity procesu).
 
 Moduł nie importuje `src.utils.config` na poziomie modułu (config importuje `n_jobs` stąd).
 """
@@ -35,6 +36,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from src.utils.fileio import write_text_atomic
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -268,10 +270,7 @@ def _write_probe_cache(library: str, key: str, ok: bool, reason: str) -> None:
         "checked_ts": time.time(),
     }
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
+        write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
     except OSError:
         pass
 
@@ -394,12 +393,31 @@ def is_gpu_error(exc: BaseException) -> bool:
 # ─────────────────────────────────────────
 # Wątki CPU
 # ─────────────────────────────────────────
+def usable_cpus() -> int | None:
+    """
+    Liczba CPU (logicznych), na których proces może działać — maska affinity
+    (os.sched_getaffinity; Windows/macOS: psutil cpu_affinity). None = nie da się ustalić.
+    """
+    try:
+        return len(os.sched_getaffinity(0)) or None
+    except (AttributeError, OSError):
+        pass
+    try:
+        import psutil  # opcjonalny
+
+        return len(psutil.Process().cpu_affinity()) or None
+    except Exception:  # noqa: BLE001 — brak psutil / brak cpu_affinity na tej platformie
+        return None
+
+
 @lru_cache(maxsize=1)
 def physical_cores() -> int:
     """
-    Liczba fizycznych rdzeni (psutil → joblib/loky → os.cpu_count()).
+    Liczba fizycznych rdzeni dostępnych dla procesu.
 
-    joblib uwzględnia też ograniczenia procesu (affinity, cgroups), więc nie zawyża wyniku.
+    Źródło: psutil → joblib (only_physical_cores) → os.cpu_count(); wynik przycięty do liczby
+    CPU z maski affinity procesu (`usable_cpus`), np. `taskset`, `start /affinity`, kontener —
+    inaczej modele dostałyby więcej wątków niż rdzeni, na których mogą działać.
     """
     count: int | None = None
     try:
@@ -417,7 +435,11 @@ def physical_cores() -> int:
             count = None
     if not count:
         count = os.cpu_count()
-    return max(1, int(count or 1))
+    count = max(1, int(count or 1))
+    usable = usable_cpus()
+    if usable:
+        count = min(count, usable)
+    return count
 
 
 def n_jobs() -> int:
@@ -437,6 +459,51 @@ def n_jobs() -> int:
             return value
         log.warning(f"SOR_AI_N_JOBS={raw!r} zignorowane (oczekiwano liczby > 0) — używam fizycznych rdzeni")
     return physical_cores()
+
+
+# ─────────────────────────────────────────
+# Windows: bez dławienia energii (EcoQoS)
+# ─────────────────────────────────────────
+_PROCESS_POWER_THROTTLING = 4                    # PROCESS_INFORMATION_CLASS.ProcessPowerThrottling
+_POWER_THROTTLING_CURRENT_VERSION = 1
+_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+
+
+def disable_power_throttling() -> bool:
+    """
+    Windows 10/11: wyłącza dławienie energii (EcoQoS) bieżącego procesu —
+    SetProcessInformation(ProcessPowerThrottling, ControlMask=EXECUTION_SPEED, StateMask=0).
+
+    Bez tego Windows może przenieść proces z zminimalizowaną konsolą na wolne rdzenie E
+    z obniżonym taktowaniem (nocny trening kilka razy wolniej). Na innych systemach no-op.
+
+    Returns
+    -------
+    True — ustawienie przyjęte; False — inny system albo błąd (nigdy nie rzuca wyjątku).
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PowerThrottlingState(ctypes.Structure):     # PROCESS_POWER_THROTTLING_STATE: 3 × ULONG (32 bity)
+            _fields_ = [("Version", ctypes.c_uint32), ("ControlMask", ctypes.c_uint32),
+                        ("StateMask", ctypes.c_uint32)]
+
+        state = _PowerThrottlingState(_POWER_THROTTLING_CURRENT_VERSION, _POWER_THROTTLING_EXECUTION_SPEED, 0)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.SetProcessInformation.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+        kernel32.SetProcessInformation.restype = wintypes.BOOL
+        ok = bool(kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), _PROCESS_POWER_THROTTLING,
+                                                 ctypes.byref(state), ctypes.sizeof(state)))
+        if not ok:
+            log.debug(f"SetProcessInformation(ProcessPowerThrottling): błąd {ctypes.get_last_error()}")
+        return ok
+    except Exception as exc:  # noqa: BLE001 — starszy Windows / brak funkcji: tylko wolniej
+        log.debug(f"Nie wyłączono dławienia energii: {type(exc).__name__}: {exc}")
+        return False
 
 
 # ─────────────────────────────────────────
@@ -569,10 +636,12 @@ __all__ = [
     "GPU_LIBRARIES",
     "device_for",
     "device_preference",
+    "disable_power_throttling",
     "hardware_summary",
     "is_gpu_error",
     "n_jobs",
     "nvidia_smi_info",
     "physical_cores",
     "probe_gpu",
+    "usable_cpus",
 ]

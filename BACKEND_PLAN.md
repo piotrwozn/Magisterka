@@ -144,8 +144,8 @@ backend/
 │   ├── catboost_*.joblib
 │   ├── lightgbm_*.joblib
 │   ├── xgboost_*.joblib
-│   ├── imputation_medians.json  # Mediany cech z train setu (diagnostyka, słownik cc_*)
-│   └── ensemble_weights.json    # (opcjonalnie) wagi modeli + reguła decyzyjna
+│   ├── imputation_medians.json  # Mediany cech z train setu (diagnostyka, słownik cc_*, moda is_male)
+│   └── ensemble_weights.json    # (opcjonalnie) wagi, metoda łączenia, temperatura, reguła decyzyjna
 │
 ├── tests/
 │   ├── test_predict.py
@@ -166,7 +166,7 @@ backend/
 
 ### Cel
 Zamiana surowej notatki klinicznej pielęgniarki na **strukturyzowany JSON**
-z flagami `cc_*` (200 binarnych chief complaint features) potrzebnymi przez modele ML.
+z flagami `cc_*` (199 binarnych chief complaint features) potrzebnymi przez modele ML.
 
 ### Prompt (structured output)
 
@@ -215,22 +215,15 @@ async def parse_clinical_note(note: str, client: OllamaClient) -> dict:
 ### Mapowanie na cc_* features
 
 ```python
-# Lista 200 kodów cc_* pochodzi z train set (data/processed/train.parquet)
-CC_CODES = [
-    "chest_pain", "dyspnea", "abdominal_pain", "syncope",
-    "headache", "altered_mental_status", ...  # 200 total
-]
+# 199 kodów = groups.chief_complaints w training/data/processed/esi/feature_sets.json
+# (nazwy po sanitize_name; fulltrauma/modifiedtrauma scalone w trauma_activation)
+KNOWN_CC_CODES = ["abdominalpain", "chestpain", "shortnessofbreath", "syncope", ...]
 
-def map_cc_to_features(parsed: dict) -> dict[str, int]:
-    """Zwraca {cc_chest_pain: 1, cc_dyspnea: 0, ...} — 200 binarnych cech."""
-    result = {f"cc_{code}": 0 for code in CC_CODES}
-    for complaint in parsed.get("chief_complaints", []):
-        key = f"cc_{complaint.lower().replace(' ', '')}"
-        if key in result:
-            result[key] = 1
-    if parsed.get("altered_mental_status"):
-        result["cc_alteredmentalstatus"] = 1
-    return result
+def normalize_cc_code(code: str) -> str | None:
+    """'Chest Pain' / 'cc_chestpain' → 'cc_chestpain'; None, gdy to nie cecha modeli."""
+
+# Wynik LLM i dopasowania słów kluczowych: tylko kody z KNOWN_CC_CODES,
+# potem drop_redundant_generic() (kod ogólny znika przy szczegółowym, synonimy → jeden)
 ```
 
 ### Latency
@@ -282,13 +275,18 @@ zaszytych w kodzie metryk z testu. Własne wagi (dobrane na zbiorze WALIDACYJNYM
 ```json
 {
   "weights": {"xgboost": 0.35, "lightgbm": 0.25, "catboost": 0.40},
+  "method": "mean",
+  "temperature": 1.12,
   "rule": "cost"
 }
 ```
 
-Modele spoza `weights` mają wagę 0 (nie są uruchamiane). `"rule": "cost"` = decyzja
-Bayesa z macierzą kosztów z treningu (niedotriażowanie 3× droższe). Błędny plik
-zatrzymuje start backendu z czytelnym komunikatem.
+Modele spoza `weights` mają wagę 0 (nie są uruchamiane). `"method"`: `"mean"` (domyślnie)
+albo `"geometric"` — jak `src.ensemble.blend`. `"temperature"` (opcjonalnie, > 0):
+skalowanie temperaturą połączonych prawdopodobieństw przed regułą decyzyjną (dopasowane
+na val: `fit_temperature(blend(P_val, …), y_val)`). `"rule": "cost"` = decyzja Bayesa z
+macierzą kosztów z treningu (niedotriażowanie 3× droższe). Błędny plik (także nieznany
+klucz) zatrzymuje start backendu z czytelnym komunikatem (szczegóły: `backend/README.md`).
 
 ### Latency
 - 6 modeli (CPU): **~100–200ms**
@@ -438,7 +436,8 @@ zwróciła własne podsumowanie).
 
 `sex` (`"M"` | `"F"`), `arrivalMode` (`"ambulance"` | `"self"` | `"other"`, akceptowane
 też np. `"ZRM"`, `"własny"`) i `o2Device` są opcjonalne — brak = jak w treningu
-(płeć / tlen nieznane = NaN, sposób przybycia = `self`).
+(tlen nieznany = NaN, sposób przybycia = `self`); nieznana płeć = moda z treningu
+(`is_male = 0`, ostrzeżenie w logu — w danych Yale płeć nigdy nie jest pusta).
 
 **Response** (`category` = indeks 0–4 = ESI 1–5; tu ESI 2):
 ```json
@@ -488,96 +487,80 @@ też np. `"ZRM"`, `"własny"`) i `o2Device` są opcjonalne — brak = jak w tren
 
 ## 10. Feature engineering w runtime
 
-Istniejący kod `src/features/engineering.py` musi działać na **pojedynczym wierszu** (1 pacjent),
-nie na całym DataFrame. Wrapper:
+Jeden pacjent → jeden wiersz w **kanonicznym schemacie triażu z treningu**
+(`training/src/data/prepare.py` → `src/features/engineering.py`, `DATA_VERSION = "esi-v2"`).
+Modele zestawu `triage` oczekują **271 cech** (lista z artefaktu: `feature_names`):
+demografia 2, przyjazd 3, czas 3, parametry życiowe 7, skargi `cc_*` 199, cechy
+inżynierskie 57 (NEWS2, qSOFA, shock index, strefa zagrożenia ESI, grupy skarg…).
 
 ```python
-# app/pipeline/feature_engineering.py
+# app/pipeline/feature_engineering.py (skrót)
+from src.data.yale_schema import ARRIVAL_CATEGORIES, VITAL_BOUNDS, hour_to_bin
+from src.features.engineering import VITALS, engineer_features
 
-import sys
-sys.path.insert(0, "/path/to/Magisterka")  # lub jako pip package
-
-from src.features.engineering import engineer_features
-import pandas as pd
-
-def build_feature_row(vitals: Vitals, cc_features: dict, extra: dict = {}) -> pd.DataFrame:
-    """
-    Buduje pojedynczy wiersz DataFrame z 336 featurami dla modelu.
-
-    vitals      : dane z formularza
-    cc_features : {cc_chest_pain: 1, cc_dyspnea: 0, ...} z Layer 0
-    extra       : opcjonalne cechy (arrival_hour, arrival_mode, etc.)
-    """
+def build_feature_row(vitals, cc_features, extra=None, all_cc_columns=None, *,
+                      is_male=None, arrival_mode=None, o2_device=None,
+                      now=None, medians=None) -> pd.DataFrame:
+    now = arrival_time(now)              # czas lokalny SOR: settings.timezone (Europe/Warsaw)
+    sex = encode_sex(is_male)            # M/K/F → 1/0
+    if math.isnan(sex):                  # brak płci: w treningu nie występuje →
+        sex = unknown_sex_value(medians) # moda z train (is_male z imputation_medians.json, inaczej 0) + WARNING
+    mode = normalize_arrival_mode(arrival_mode)   # ZRM → ambulance, własny → self, policja → other; brak → self
     row = {
-        # Vitals
-        "triage_vital_hr":   vitals.hr,
-        "triage_vital_sbp":  vitals.sbp,
-        "triage_vital_dbp":  vitals.dbp,
-        "triage_vital_rr":   vitals.rr,
-        "triage_vital_o2":   vitals.o2,
-        "triage_vital_temp": vitals.temp,
-        # Demographics
-        "age": vitals.age,
-        # Czas przybycia (auto)
-        "arrival_hour":      pd.Timestamp.now().hour,
-        "arrival_dayofweek": pd.Timestamp.now().dayofweek,
-        # CC features z LLM parser
-        **cc_features,
-        # Opcjonalne dodatkowe
-        **extra,
+        "age": vitals.age, "is_male": sex,
+        **{f"arrival_{c}": float(c == mode) for c in ARRIVAL_CATEGORIES},
+        "arrival_month": now.month,
+        "arrival_weekday": now.isoweekday(),        # 1–7, pon. = 1
+        "arrival_hour_bin": hour_to_bin(now.hour),  # przedziały Yale 0–5
+        # parametry życiowe w jednostkach kanonicznych (°C!), poza VITAL_BOUNDS → NaN
+        **{VITALS[k]: _vital(getattr(vitals, k), k) for k in VITALS},
+        "triage_vital_o2_device": _binary(o2_device),   # brak → NaN (jak w ~40% wizyt Yale)
     }
-
-    df = pd.DataFrame([row])
-    df = engineer_features(df)   # dodaje shock_index, MEWS, SIRS, qSOFA, etc.
-    return df
+    row |= dict.fromkeys(CHIEF_COMPLAINT_COLUMNS, 0.0)  # 199 skarg: brak = 0
+    row |= cc_features                                  # flagi 0/1 z warstwy 0
+    return engineer_features(pd.DataFrame([row]))
 ```
+
+- **Czas przybycia** to czas lokalny SOR (`TIMEZONE`, domyślnie `Europe/Warsaw`;
+  `tzdata` w requirements dla Windows) — nie zegar serwera w UTC; modele uczono na
+  lokalnych godzinach i dniach tygodnia Yale.
+- **Skargi** (`cc_*`): tylko prawdziwe kolumny modeli; jedna reguła słów kluczowych =
+  jeden kod (najczęstszy synonim Yale, np. duszność → `cc_shortnessofbreath`), a kod
+  ogólny (`cc_trauma`, `cc_edema`, `cc_fever`…) jest pomijany, gdy zadziałał kod
+  szczegółowy (`cc_leginjury`, `cc_legswelling`, `cc_feverimmunocompromised`…) —
+  takie pary prawie nie występują razem w danych treningowych.
+- Kolumny `meta` z treningu (`row_id`, `site`, `esi`, `target`, `admitted`,
+  `vitals_complete`) nigdy nie są cechami.
 
 ---
 
-## 11. Imputation brakujących cech
+## 11. Brakujące cechy (bez imputacji medianą)
 
-Modele oczekują 336 cech. Przy wejściu z formularza część będzie brakować
-(np. demographics, ed_usage). Uzupełniamy **medianą z train setu**.
+Brakujące wartości zostają **NaN** — dokładnie jak w treningu (XGBoost / LightGBM /
+CatBoost / RF / EBM obsługują NaN natywnie, logreg imputuje w swoim `Pipeline`).
+Wyjątki: brakująca skarga `cc_*` = **0** (skarga nieobecna) oraz nieznana płeć =
+moda z treningu (patrz §10).
 
-### Generowanie pliku medián (jednorazowo)
+```python
+# app/pipeline/feature_engineering.py
+def align_features(df, expected, medians=None, *, use_medians=False) -> pd.DataFrame:
+    """Kolumny w kolejności modelu; brakujące: cc_* → 0.0, reszta → NaN.
+    `medians` tylko przy jawnym use_medians=True (domyślnie nic nie jest imputowane)."""
+```
+
+### Plik medián (`backend/models/imputation_medians.json`, opcjonalny)
 
 ```bash
-# Uruchom raz lokalnie, zapisz do backend/models/
-python scripts/generate_imputation_medians.py
+# po każdym przygotowaniu danych (zmiana DATA_VERSION)
+python backend/scripts/generate_imputation_medians.py [--feature-set triage]
 ```
 
-```python
-# scripts/generate_imputation_medians.py
-import json, pandas as pd
-from src.models.train import load_splits
-from src.data.preprocessing import build_feature_groups, split_features
-from src.features.engineering import engineer_features
+Mediany cech zbioru TRAIN (zapis UTF-8, temperatura w °C) służą wyłącznie do:
+- **diagnostyki** (typowe wartości pacjenta, kontrola jednostek),
+- **słownika skarg** — klucze `cc_*` = kolumny skarg modeli,
+- **mody `is_male`** dla nieznanej płci (mediana kolumny 0/1 = jej moda).
 
-splits = load_splits()
-df = engineer_features(splits["train"])
-groups = build_feature_groups(df)
-X, _, _ = split_features(df, groups)
-
-medians = X.median().to_dict()
-with open("backend/models/imputation_medians.json", "w") as f:
-    json.dump(medians, f)
-
-print(f"Saved {len(medians)} feature medians")
-```
-
-### Użycie w pipeline
-
-```python
-def align_features(
-    df: pd.DataFrame,
-    expected_features: list[str],
-    medians: dict[str, float],
-) -> pd.DataFrame:
-    for feat in expected_features:
-        if feat not in df.columns:
-            df[feat] = medians.get(feat, 0.0)
-    return df[expected_features]
-```
+Rejestr ostrzega, gdy `data_version` pliku różni się od `DATA_VERSION` treningu.
 
 ---
 
@@ -732,40 +715,45 @@ server {
 
 ## 16. Zmienne środowiskowe
 
+Nazwy = pola `app/config.py` (`Settings`, wielkość liter bez znaczenia); `backend/.env`
+czyta FastAPI lokalnie, w Dockerze zmienne przekazuje `docker-compose.yml`.
+
 ```bash
 # backend/.env
 
 # API
 API_HOST=0.0.0.0
 API_PORT=8000
-API_WORKERS=2
 
 # Modele
-MODELS_DIR=/app/models
-FEATURE_SET=triage
+MODELS_DIR=/app/models          # artefakty *.joblib, imputation_medians.json, ensemble_weights.json
+FEATURE_SET=triage              # zestaw cech serwowanych modeli (triage_only = alias)
+TIMEZONE=Europe/Warsaw          # czas lokalny SOR dla cech arrival_* (IANA; tzdata na Windows)
 
 # Ollama
 OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_PARSER_MODEL=llama3.2:3b
+OLLAMA_PARSER_MODEL=llama3
 OLLAMA_NLP_MODEL=medgemma:27b
-OLLAMA_SYNTHESIS_MODEL=qwen3:32b
+OLLAMA_SYNTHESIS_MODEL=qwen3.6
 OLLAMA_TIMEOUT_S=30
+OLLAMA_ENABLED=true
 
-# Kafka (opcjonalne)
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-KAFKA_TOPIC=triage-predictions
-
-# CORS
-ALLOWED_ORIGINS=https://sorai-triage.com,http://localhost:5173
+# CORS (lista JSON)
+ALLOWED_ORIGINS='["https://sorai-triage.com","http://localhost:5173"]'
 
 # SHAP
-SHAP_TOP_N=5
 SHAP_ENABLED=true
+SHAP_TOP_N=5
 
-# Safety
+# Bezpieczeństwo
 CONFLICT_THRESHOLD=2       # rozbieżność poziomów ESI między modelami → alert
 CONFIDENCE_THRESHOLD=0.6   # min confidence MedGemma
 ```
+
+Kafka (`KAFKA_BOOTSTRAP_SERVERS`, `AUDIT_ENABLED`) konfiguruje bramka Spring Boot,
+nie serwis FastAPI (zob. `backend/docker-compose.yml`). Bazy badań Optuny z treningu:
+`training/logs/optuna/optuna_<model>.db` (+ `<badanie>.best.json`) — kopia zapasowa
+po każdym tuningu (`backend/DEPLOYMENT.md`).
 
 ---
 

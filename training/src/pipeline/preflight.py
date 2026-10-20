@@ -11,9 +11,13 @@ Błąd krytyczny (exit 1 w 00_check_env.py, run_all.py przerywa przed treningiem
     - RAM < 16 GB, wolne miejsce < 10 GB,
     - brak danych (ani surowego Yale, ani przygotowanych splitów),
     - wymuszone GPU (SOR_AI_DEVICE*=gpu), a próba GPU się nie powiodła.
-Ostrzeżenia (trening ruszy): wersje inne niż requirements-lock.txt, RAM < 32 GB, GPU niedostępne
-dla xgboost/catboost (→ CPU z budżetem zastępczym), stary sterownik NVIDIA, ścieżka w OneDrive /
-ze znakami spoza ASCII / bardzo długa na Windows, kodowanie konsoli inne niż UTF-8.
+Ostrzeżenia (trening ruszy): wersje inne niż requirements-lock.txt, RAM < 30 GB (komputer z 32 GB
+raportuje ~31,8 GB), GPU niedostępne dla xgboost/catboost (→ CPU z budżetem zastępczym), stary
+sterownik NVIDIA, ścieżka w OneDrive / ze znakami spoza ASCII / bardzo długa na Windows, kodowanie
+konsoli inne niż UTF-8, Windows: plan zasilania inny niż wysoka wydajność.
+
+Kontrola, która sama się wywróci (np. brak pandas w świeżym venv), daje wpis w raporcie zamiast
+tracebacku — brak pakietu to błąd krytyczny z poleceniem instalacji.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -43,7 +48,7 @@ log = get_logger(__name__)
 MIN_PYTHON: tuple[int, int] = (3, 12)
 TESTED_PYTHON_MAX: tuple[int, int] = (3, 13)
 RAM_FAIL_GB: float = 15.0            # nominalne 16 GB system raportuje jako ~15,6–15,9 GB
-RAM_WARN_GB: float = 32.0
+RAM_WARN_GB: float = 30.0            # nominalne 32 GB system raportuje jako ~31,7–31,9 GB
 DISK_FAIL_GB: float = 10.0
 DISK_WARN_GB: float = 20.0
 MIN_NVIDIA_DRIVER: int = 580          # koło xgboost 3.4 = CUDA 13 → sterownik R580+
@@ -52,6 +57,17 @@ RAW_MIN_BYTES: int = 1_000_000        # mniejszy "parquet" to raczej wskaźnik G
 
 REQUIREMENTS_TXT: Path = config.PROJECT_ROOT / "requirements.txt"
 REQUIREMENTS_LOCK: Path = config.PROJECT_ROOT / "requirements-lock.txt"
+INSTALL_ADVICE: str = "python -m pip install -r requirements-lock.txt   (w aktywnym venv, z katalogu training/)"
+
+# Windows: plany zasilania uznawane za wydajne (GUID wbudowanych planów) i nakładka „Najlepsza wydajność”
+PERFORMANCE_SCHEMES: dict[str, str] = {
+    "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c": "Wysoka wydajność",
+    "e9a42b02-d5df-448d-aa00-03f14749eb61": "Najwyższa wydajność (Ultimate Performance)",
+}
+BEST_PERFORMANCE_OVERLAY: str = "ded574b5-45a0-4f42-8737-46345c09c238"
+_PERFORMANCE_NAME = re.compile(r"high performance|ultimate|wysoka wydajno|najwyższa wydajno|najlepsza wydajno",
+                               re.IGNORECASE)
+_GUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 
 # Pakiety wymagane do treningu (nazwa dystrybucji → alternatywy)
 REQUIRED_PACKAGES: dict[str, tuple[str, ...]] = {
@@ -146,12 +162,9 @@ class PreflightReport:
         return "\n".join(lines)
 
     def write_json(self, path: Path) -> Path:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-        os.replace(tmp, path)
-        return path
+        from src.utils.fileio import write_text_atomic
+
+        return write_text_atomic(Path(path), json.dumps(self.to_dict(), indent=2, ensure_ascii=False, default=str))
 
 
 # ─────────────────────────────────────────
@@ -261,8 +274,7 @@ def check_packages(
             parts.append("brak: " + ", ".join(missing))
         if out_of_range:
             parts.append("poza zakresem: " + "; ".join(out_of_range))
-        report.add("Pakiety", STATUS_FAIL, " | ".join(parts),
-                   "pip install -r requirements-lock.txt (w aktywnym venv)")
+        report.add("Pakiety", STATUS_FAIL, " | ".join(parts), INSTALL_ADVICE)
     else:
         report.add("Pakiety", STATUS_OK, f"{len(REQUIRED_PACKAGES)} wymaganych pakietów "
                    f"(xgboost {installed['xgboost']}, catboost {installed['catboost']}, "
@@ -308,7 +320,7 @@ def check_resources(report: PreflightReport, hardware: dict[str, Any], disk_free
                    "Przygotowanie danych potrzebuje ~11 GB, trening RF/EBM na pełnych danych kolejne GB.")
     elif ram < RAM_WARN_GB:
         report.add("RAM", STATUS_WARN, f"{ram:.1f} GB < {RAM_WARN_GB:.0f} GB — jeden tor (bez równoległego GPU)",
-                   "Zamknij inne programy na noc; zestaw 'full' wymaga >= 32 GB.")
+                   "Zamknij inne programy na noc; zestaw 'full' wymaga 32 GB.")
     else:
         report.add("RAM", STATUS_OK, f"{ram:.1f} GB")
 
@@ -409,7 +421,8 @@ def check_data(report: PreflightReport) -> None:
             manifest = json.loads(Path(config.DATA_MANIFEST_JSON).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             manifest = {}
-        info.update({k: manifest.get(k) for k in ("data_version", "split_strategy", "created_at")})
+        info.update({k: manifest.get(k) for k in ("data_version", "split_strategy")})
+        info["created"] = manifest.get("created") or manifest.get("created_at")
     report.facts["data"] = info
 
     small = [p for p in (raw_parquet, rdata) if p.exists() and p.stat().st_size < RAW_MIN_BYTES]
@@ -433,7 +446,7 @@ def check_data(report: PreflightReport) -> None:
         return
     if prepared:
         report.add("Dane", STATUS_OK, f"{raw_msg}; splity gotowe ({info.get('data_version')}, podział "
-                   f"'{info.get('split_strategy')}', {info.get('created_at')})")
+                   f"'{info.get('split_strategy')}', {info.get('created')})")
     else:
         report.add("Dane", STATUS_OK, f"{raw_msg}; splity zostaną przygotowane (~3–5 min, szczyt ~11 GB RAM)")
 
@@ -475,6 +488,58 @@ def check_encoding(report: PreflightReport, system: str = platform.system()) -> 
                    "setx PYTHONUTF8 1   (nowe okno PowerShell) — dotyczy ręcznie uruchamianych skryptów")
 
 
+def _active_power_scheme() -> str | None:
+    """Wyjście `powercfg /getactivescheme` (Windows) albo None — best-effort, 10 s limitu."""
+    try:
+        out = subprocess.run(["powercfg", "/getactivescheme"], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, errors="replace", timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (out.stdout or "").strip() or None if out.returncode == 0 else None
+
+
+def _power_overlay() -> str | None:
+    """Windows 10/11: GUID nakładki „Tryb zasilania” przy zasilaniu sieciowym (rejestr) albo None."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes") as key:
+            value, _ = winreg.QueryValueEx(key, "ActiveOverlayAcPowerScheme")
+        return str(value).strip().lower() or None
+    except Exception:  # noqa: BLE001 — brak klucza / nie Windows
+        return None
+
+
+def check_power(report: PreflightReport, system: str, scheme_output: str | None,
+                overlay: str | None = None) -> None:
+    """
+    Windows: plan zasilania. Plan „Zrównoważony” z trybem innym niż „Najlepsza wydajność” pozwala
+    systemowi dławić rdzenie (zwłaszcza przy zminimalizowanej konsoli i w nocy) — tylko ostrzeżenie,
+    nigdy błąd krytyczny. Inne systemy: brak wpisu.
+    """
+    if system != "Windows":
+        return
+    report.facts["power"] = {"scheme": scheme_output, "overlay_ac": overlay}
+    advice = ("Ustawienia → System → Zasilanie (i bateria) → Tryb zasilania: „Najlepsza wydajność” (przy zasilaniu "
+              "sieciowym) albo plan „Wysoka wydajność” (Panel sterowania → Opcje zasilania); "
+              "na noc nie minimalizuj okna konsoli.")
+    if not scheme_output:
+        report.add("Zasilanie", STATUS_INFO, "nie odczytano planu zasilania (powercfg /getactivescheme)", advice)
+        return
+    guid_match = _GUID.search(scheme_output)
+    guid = guid_match.group(0).lower() if guid_match else None
+    name_match = re.search(r"\(([^)]*)\)\s*$", scheme_output)
+    name = name_match.group(1).strip() if name_match else (PERFORMANCE_SCHEMES.get(guid or "") or scheme_output)
+    if guid in PERFORMANCE_SCHEMES or _PERFORMANCE_NAME.search(name):
+        report.add("Zasilanie", STATUS_OK, f"plan: {name}")
+    elif overlay and overlay.lower() == BEST_PERFORMANCE_OVERLAY:
+        report.add("Zasilanie", STATUS_OK, f"plan: {name}, tryb zasilania: Najlepsza wydajność")
+    else:
+        report.add("Zasilanie", STATUS_WARN, f"plan: {name} — nie „Wysoka / Najwyższa wydajność” ani tryb "
+                   f"„Najlepsza wydajność” (Windows może dławić CPU w nocy)", advice)
+
+
 def _disk_free_gb(path: Path) -> float | None:
     probe = Path(path)
     while not probe.exists() and probe.parent != probe:
@@ -488,6 +553,21 @@ def _disk_free_gb(path: Path) -> float | None:
 # ─────────────────────────────────────────
 # Całość
 # ─────────────────────────────────────────
+def _safe_check(report: PreflightReport, name: str, check: Callable[..., Any], *args: Any) -> Any:
+    """
+    Kontrola, która się wywróci, daje wpis w raporcie zamiast tracebacku: brak pakietu (ImportError)
+    → błąd krytyczny z poleceniem instalacji, inny wyjątek → ostrzeżenie.
+    """
+    try:
+        return check(report, *args)
+    except ImportError as exc:
+        report.add(name, STATUS_FAIL, f"nie sprawdzono — brak pakietu ({type(exc).__name__}: {exc})",
+                   INSTALL_ADVICE)
+    except Exception as exc:  # noqa: BLE001 — błąd jednej kontroli nie przerywa pozostałych
+        report.add(name, STATUS_WARN, f"nie sprawdzono — {type(exc).__name__}: {exc}")
+    return None
+
+
 def run_preflight(probe_gpus: bool = True, out_dir: Path | None = None) -> PreflightReport:
     """
     Wszystkie kontrole. `out_dir` → zapis `preflight.json` (UTF-8).
@@ -499,19 +579,22 @@ def run_preflight(probe_gpus: bool = True, out_dir: Path | None = None) -> Prefl
     from src.utils import hardware
 
     report = PreflightReport()
-    check_python(report)
-    check_packages(report)
+    system = platform.system()
+    _safe_check(report, "Python", check_python)
+    _safe_check(report, "Pakiety", check_packages)
     try:
         hw = hardware.hardware_summary()
     except Exception as exc:  # noqa: BLE001 — opis sprzętu nie może przerwać kontroli
         hw = {"error": f"{type(exc).__name__}: {exc}"}
     report.facts["hardware"] = hw
-    check_resources(report, hw, _disk_free_gb(config.RUNS_DIR))
-    check_gpu(report, hw.get("nvidia_smi"), hardware.probe_gpu if probe_gpus else None,
-              hardware.device_preference, hw.get("xgboost_cuda_build"))
-    check_data(report)
-    check_paths(report, config.PROJECT_ROOT, platform.system())
-    check_encoding(report)
+    _safe_check(report, "Zasoby", check_resources, hw, _disk_free_gb(config.RUNS_DIR))
+    _safe_check(report, "GPU", check_gpu, hw.get("nvidia_smi"), hardware.probe_gpu if probe_gpus else None,
+                hardware.device_preference, hw.get("xgboost_cuda_build"))
+    _safe_check(report, "Dane", check_data)
+    _safe_check(report, "Ścieżki", check_paths, config.PROJECT_ROOT, system)
+    _safe_check(report, "Kodowanie", check_encoding)
+    if system == "Windows":
+        _safe_check(report, "Zasilanie", check_power, system, _active_power_scheme(), _power_overlay())
     report.facts["platform"] = {"system": platform.system(), "release": platform.release(),
                                 "machine": platform.machine()}
     if out_dir is not None:
@@ -528,6 +611,7 @@ __all__ = [
     "check_gpu",
     "check_packages",
     "check_paths",
+    "check_power",
     "check_python",
     "check_resources",
     "run_preflight",

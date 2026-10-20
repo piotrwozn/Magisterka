@@ -3,7 +3,7 @@
   "data_version": "esi-v2",
   "n_rows": 446421,
   "n_features": 271,
-  "note": "Train-set medians (diagnostics + cc_* vocabulary). Not used for imputation by default — missing features stay NaN. Temperature in °C.",
+  "note": "Train-set medians (diagnostics + cc_* vocabulary; is_male = train mode for an unknown sex). Not used for imputation otherwise — missing features stay NaN. Temperature in °C.",
   "medians": {
     "age": 49.0,
     "is_male": 0.0,

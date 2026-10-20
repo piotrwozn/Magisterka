@@ -586,6 +586,68 @@ class TestDeviceParams:
         model.fit(X, y, X_val=X_es, y_val=y_es, verbose=5, run_id="cb_verbose")
         assert "learn:" in capfd.readouterr().out               # fit() = postęp co 5 iteracji
 
+    def test_catboost_thread_budget_in_pools_and_predict(self, data, monkeypatch):
+        """Pool (trening i ES) i predict_proba dostają budżet wątków modelu, nie domyślne -1 (wszystkie)."""
+        import catboost
+        from catboost import CatBoostClassifier
+
+        X, y, X_es, y_es, X_te = data
+        pools: list = []
+        real_pool = catboost.Pool
+
+        def spy_pool(*args, **kwargs):
+            pools.append(kwargs.get("thread_count"))
+            return real_pool(*args, **kwargs)
+
+        predict_threads: list = []
+        real_predict = CatBoostClassifier.predict_proba
+
+        def spy_predict(self, X, *args, **kwargs):
+            predict_threads.append(kwargs.get("thread_count"))
+            return real_predict(self, X, *args, **kwargs)
+
+        monkeypatch.setattr(catboost, "Pool", spy_pool)
+        monkeypatch.setattr(CatBoostClassifier, "predict_proba", spy_predict)
+        model = get_model("catboost", params={**FAST_PARAMS["catboost"], "thread_count": 2})
+        model.fit_estimator(X, y, X_es, y_es)
+        model.predict_proba(X_te)
+        expected = min(2, os.cpu_count() or 2)
+        assert pools == [expected, expected]                     # trening + early stopping
+        assert predict_threads == [expected]
+        model.params["thread_count"] = None                      # brak budżetu → -1 (CatBoost: wszystkie)
+        assert model._thread_count() == -1
+
+    def test_save_retries_locked_target(self, fitted, tmp_path, monkeypatch):
+        """Windows: stary model.joblib chwilowo zablokowany (backend / antywirus) — zapis ponawiany."""
+        from src.utils import fileio
+
+        real_replace = os.replace
+        attempts: list = []
+
+        def flaky(src, dst):
+            attempts.append(dst)
+            if len(attempts) < 3:
+                raise PermissionError(13, "plik używany przez inny proces")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(fileio.os, "replace", flaky)
+        monkeypatch.setattr(fileio.time, "sleep", lambda s: None)
+        path = fitted["logreg"].save(tmp_path / "model.joblib")
+        assert len(attempts) == 3 and joblib.load(path)["name"] == "logreg"
+        assert [p.name for p in tmp_path.iterdir()] == ["model.joblib"]
+
+    def test_save_failure_cleans_tmp(self, fitted, tmp_path, monkeypatch):
+        from src.utils import fileio
+
+        def locked(src, dst):
+            raise PermissionError(13, "zablokowany")
+
+        monkeypatch.setattr(fileio.os, "replace", locked)
+        monkeypatch.setattr(fileio.time, "sleep", lambda s: None)
+        with pytest.raises(PermissionError):
+            fitted["logreg"].save(tmp_path / "model.joblib")
+        assert list(tmp_path.iterdir()) == []
+
     def test_lightgbm_no_deprecation_warning(self, data):
         import lightgbm as lgb
 

@@ -10,32 +10,47 @@ Kroki (każdy w OSOBNYM procesie — awaria natywna/CUDA/OOM zabija jeden krok, 
     2. prepare    — scripts/02_preprocess.py --split S, gdy splity nie są gotowe albo mają inny podział,
     3. dla każdego zestawu cech × modelu:
          trening  — scripts/03_train.py --model M --feature-set FS --tune --profile P --tag P
-                    (pomijany, gdy istnieje runs/*_M_FS_P/DONE.json z tą samą wersją i odciskiem danych;
-                    przerwany tuning wznawia Optuna — ponowne uruchomienie kosztuje tylko brakujące próby),
+                    (pomijany, gdy istnieje runs/*_M_FS_P/DONE.json z tą samą wersją i odciskiem danych,
+                    zwykły run profilu — nie `custom` — z tym samym trybem tuningu, a dla modelu
+                    zaplanowanego na GPU: faktycznie trenowany na GPU (run po fallbacku GPU → CPU jest
+                    powtarzany, gdy GPU działa); przerwany tuning wznawia Optuna — ponowne
+                    uruchomienie kosztuje tylko brakujące próby),
          ewaluacja — scripts/04_evaluate.py --run <run> --split val (wykresy; pomijana, gdy jest
                     runs/<run>/figures/metrics_val.json),
     4. compare    — scripts/07_compare_runs.py --feature-set FS --runs <runy tego przebiegu>,
     5. podsumowanie — runs/run_all_summary__<fs>__<profil>__<czas>.md (TYLKO metryki VAL)
-                    + logs/run_all/<czas>/status.json.
+                    + logs/run_all/<czas>/status.json (PID orkiestratora → `--status` wie, czy żyje).
 
-Tory (`--lanes auto`): 2, gdy próba GPU się powiodła, ≥ 16 rdzeni fizycznych i ≥ 32 GB RAM —
-tor GPU (xgboost → catboost, SOR_AI_N_JOBS=6) i tor CPU (logreg → lightgbm → random_forest → ebm,
-pozostałe rdzenie fizyczne). Budżety wątków się nie nakładają (nadsubskrypcja OpenMP = ~70× wolniej).
+Tory (`--lanes auto`): 2, gdy co najmniej jeden model idzie na GPU (urządzenie 'gpu' z próby GPU
+w preflight), ≥ 16 rdzeni fizycznych i ≥ 30 GB RAM (komputer z 32 GB raportuje ~31,8 GB) —
+tor GPU (tylko modele na GPU: xgboost → catboost, SOR_AI_N_JOBS=6) i tor CPU (pozostałe modele,
+także xgboost/catboost na CPU; pozostałe rdzenie fizyczne). Budżety wątków się nie nakładają
+(nadsubskrypcja OpenMP = ~70× wolniej).
 
-Ctrl+C: żadnych nowych kroków, do 120 s na zakończenie bieżących (potem terminate/kill; drugie
-Ctrl+C = natychmiast), podsumowanie i polecenie wznowienia. xgboost/catboost z błędem GPU w logu
-są powtarzane raz na CPU (SOR_AI_DEVICE_<MODEL>=cpu).
+Procesy kroków: wyjście czyta osobny wątek, a tor czeka na zakończenie procesu — twarda awaria
+kroku nie blokuje toru, nawet gdy proces-wnuk (loky/joblib) trzyma otwarty potok. POSIX: każdy
+krok we własnej grupie procesów (po błędzie / przy przerwaniu zabijana cała grupa; Ctrl+C
+przekazywany krokom jawnie). Windows: kroki dzielą konsolę, więc Ctrl+C dociera do nich samo;
+zabicie obejmuje drzewo procesów (taskkill /T).
+
+Ctrl+C (także SIGTERM / SIGHUP): żadnych nowych kroków, do 120 s na zakończenie bieżących (potem
+terminate/kill; drugie Ctrl+C = natychmiast), podsumowanie i polecenie wznowienia (po `--force`:
+z `--force` i tylko niedokończonymi modelami). xgboost/catboost z błędem GPU w logu są powtarzane
+raz na CPU (SOR_AI_DEVICE_<MODEL>=cpu) — z budżetem wątków toru CPU, gdy ten tor już skończył.
+
+Windows: na czas przebiegu wyłączone dławienie energii procesu (EcoQoS) i tryb QuickEdit konsoli
+(kliknięcie w okno zatrzymywałoby wypisywanie, a przez potoki — trening).
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
 import re
 import shlex
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -65,17 +80,18 @@ MODEL_ALIASES: dict[str, str] = {"lr": "logreg", "lgbm": "lightgbm", "xgb": "xgb
 FEATURE_SETS: tuple[str, ...] = ("triage", "full")
 FEATURE_SET_ALIASES: dict[str, str] = {"triage_only": "triage", "top": "triage"}
 GPU_MODELS: tuple[str, ...] = ("xgboost", "catboost")
-CPU_LANE_ORDER: tuple[str, ...] = ("logreg", "lightgbm", "random_forest", "ebm")
 SPLITS: tuple[str, ...] = ("random", "site")
 
 GPU_LANE_THREADS: int = 6             # wątki CPU toru GPU (przygotowanie danych, ES, predykcja)
 LANES_MIN_PHYSICAL_CORES: int = 16
-LANES_MIN_RAM_GB: float = 32.0
+LANES_MIN_RAM_GB: float = 30.0        # nominalne 32 GB system raportuje jako ~31,7–31,9 GB
 
 DONE_JSON: str = "DONE.json"          # = src.models.train.DONE_JSON (ostatni artefakt runa)
 EVAL_MARKER: tuple[str, str] = ("figures", "metrics_val.json")
 CHILD_GRACE_S: float = 120.0          # Ctrl+C: tyle czekamy na samodzielne zakończenie kroków
 CHILD_KILL_S: float = 10.0            # po terminate() — tyle do kill()
+READER_JOIN_S: float = 10.0           # po końcu procesu kroku: tyle czekamy na domknięcie jego wyjścia
+BOOT_TIME_TOLERANCE_S: float = 120.0  # --status: inny czas startu systemu = był restart
 LOG_TAIL_LINES: int = 40
 
 # Zapas na trening finalny + ewaluację ponad limit czasu tuningu (pełne dane; szacunek ±50%)
@@ -144,6 +160,7 @@ class ModelTask:
     run_dir: str | None = None
     rc: int | None = None
     retried_on_cpu: bool = False
+    retry_n_jobs: int | None = None    # wątki powtórki na CPU (budżet toru CPU albo GPU)
     started_at: str | None = None
     finished_at: str | None = None
     duration_s: float | None = None
@@ -193,17 +210,22 @@ def parse_feature_sets(spec: str) -> list[str]:
 
 
 def run_tag(profile: str, tune: bool) -> str:
-    """Tag runów: nazwa profilu (tuning) albo '<profil>-notune' (parametry domyślne)."""
+    """
+    Tag runów: nazwa profilu (tuning) albo '<profil>-notune' (parametry domyślne) — jak
+    `src.models.train.default_run_tag` dla runu bez nadpisań ('<profil>-custom' orkiestrator nie tworzy).
+    """
     return profile if tune else f"{profile}-notune"
 
 
-def data_fingerprint(manifest_path: Path | None = None) -> str:
-    """sha1[:10] manifest.json splitów — ten sam algorytm co src.models.tuning.data_fingerprint."""
-    path = Path(manifest_path) if manifest_path is not None else Path(config.DATA_MANIFEST_JSON)
-    try:
-        return hashlib.sha1(path.read_bytes()).hexdigest()[:10]
-    except OSError:
-        return "brak-danych"
+def data_fingerprint(manifest: Path | dict | None = None) -> str:
+    """
+    Odcisk przygotowanych danych = `src.data.dataset.data_fingerprint` (bez kluczy zmiennych przy
+    każdym przygotowaniu, np. `created`) — ten sam w DONE.json, nazwach badań Optuny i tutaj.
+    Import leniwy: moduł orkiestratora (i 00_check_env.py) nie ładuje pandas przy starcie.
+    """
+    from src.data.dataset import data_fingerprint as _fingerprint
+
+    return _fingerprint(manifest)
 
 
 def read_json(path: Path) -> dict | None:
@@ -214,6 +236,18 @@ def read_json(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def is_gpu_device(device: Any) -> bool:
+    """'gpu' (catboost) albo 'cuda' / 'cuda:0' (xgboost) = trening na karcie."""
+    text = str(device or "").strip().lower()
+    return text == "gpu" or text.startswith("cuda")
+
+
+def done_device(done: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """(faktyczne urządzenie, powód fallbacku) z DONE.json — nowy format `device`, stary `actual_device`."""
+    device = done.get("device") if isinstance(done.get("device"), dict) else {}
+    return device.get("actual") or done.get("actual_device"), device.get("fallback_reason")
+
+
 def find_done_run(
     runs_dir: Path,
     model: str,
@@ -222,22 +256,59 @@ def find_done_run(
     data_version: str,
     fingerprint: str,
     tuned: bool | None = None,
+    require_gpu: bool = False,
+    since: float | None = None,
+    notes: list[str] | None = None,
 ) -> Path | None:
     """
-    Najnowszy UKOŃCZONY run `runs/*_<model>_<fs>_<tag>/DONE.json` zgodny z bieżącymi danymi
-    (wersja + odcisk manifestu) i trybem tuningu. None = trzeba trenować.
+    Najnowszy UKOŃCZONY run profilu `runs/*_<model>_<fs>_<tag>/DONE.json` zgodny z bieżącymi
+    danymi (wersja + odcisk `data_fingerprint`). None = trzeba trenować.
+
+    Odrzuca też runy:
+        - niestandardowe (`custom` w DONE.json: nadpisane budżety, próbki, wagi, cel, filtr …)
+          — nawet z tym samym tagiem nie zastępują zwykłego runa profilu,
+        - z innym trybem tuningu niż `tuned` (None = dowolny),
+        - require_gpu=True (model zaplanowany na GPU): wytrenowane na CPU (fallback GPU → CPU) —
+          gdy GPU działa, krok jest powtarzany na GPU,
+        - since (time.time()): z DONE.json starszym niż ta chwila (szukanie runa właśnie
+          zakończonego kroku, nie wcześniejszego).
+    notes : lista, do której trafia opis odrzuconych, poza tym zgodnych runów (do logu).
     """
     candidates = sorted(Path(runs_dir).glob(f"*_{model}_{feature_set}_{tag}/{DONE_JSON}"), reverse=True)
     for done_path in candidates:
         done = read_json(done_path)
         if not done:
             continue
-        if (done.get("model") == model and done.get("feature_set") == feature_set
+        if not (done.get("model") == model and done.get("feature_set") == feature_set
                 and (done.get("tag") or "") == tag
                 and done.get("data_version") == data_version
-                and done.get("data_fingerprint") == fingerprint
-                and (tuned is None or done.get("tuned") is None or bool(done.get("tuned")) == tuned)):
-            return done_path.parent
+                and done.get("data_fingerprint") == fingerprint):
+            continue
+        name = done_path.parent.name
+        if since is not None:
+            try:
+                if done_path.stat().st_mtime < since:
+                    continue
+            except OSError:
+                continue
+        if done.get("custom"):
+            if notes is not None:
+                overrides = ", ".join(done.get("overrides") or []) or "?"
+                notes.append(f"{name}: run niestandardowy (nadpisania: {overrides}) — nie zastępuje runa profilu")
+            continue
+        if tuned is not None and bool(done.get("tuned")) != tuned:
+            if notes is not None:
+                notes.append(f"{name}: " + ("bez tuningu" if tuned else "z tuningiem") + " — inny tryb niż ten przebieg")
+            continue
+        if require_gpu:
+            actual, reason = done_device(done)
+            if not is_gpu_device(actual):
+                if notes is not None:
+                    notes.append(f"{name}: wytrenowany na {actual or '?'}"
+                                 + (f" (fallback GPU → CPU: {reason})" if reason else "")
+                                 + " — GPU teraz działa, trenuję ponownie na GPU")
+                continue
+        return done_path.parent
     return None
 
 
@@ -245,37 +316,54 @@ def eval_done(run_dir: Path) -> bool:
     return (Path(run_dir) / EVAL_MARKER[0] / EVAL_MARKER[1]).exists()
 
 
+def gpu_planned_models(models: Sequence[str], devices: Mapping[str, str], gpu_ok: bool) -> list[str]:
+    """
+    Modele, które trafią na GPU: xgboost/catboost z urządzeniem 'gpu' (udana próba GPU w preflight
+    albo SOR_AI_DEVICE_*=gpu) lub 'auto' (bez preflight — decyzja procesu treningu), gdy GPU
+    wygląda na dostępne. Pozostałe (także xgboost/catboost na 'cpu') idą na CPU.
+    """
+    return [m for m in models if m in GPU_MODELS
+            and (devices.get(m) == "gpu" or (devices.get(m) == "auto" and gpu_ok))]
+
+
 def decide_lanes(
     requested: str,
-    gpu_ok: bool,
+    gpu_models: Sequence[str],
     physical_cores: int | None,
     ram_gb: float | None,
     models: Sequence[str],
 ) -> int:
     """
-    Liczba torów: '1' / '2' wprost; 'auto' → 2, gdy działa GPU (xgboost lub catboost),
-    ≥ 16 rdzeni fizycznych i ≥ 32 GB RAM. Zawsze 1, gdy jeden z torów byłby pusty.
+    Liczba torów. 2 tylko wtedy, gdy co najmniej jeden model idzie na GPU (`gpu_models`)
+    i co najmniej jeden na CPU — inaczej jeden z torów byłby pusty. Wtedy '1' / '2' wprost,
+    a 'auto' → 2 przy ≥ 16 rdzeniach fizycznych i ≥ 30 GB RAM.
     """
-    has_gpu_models = any(m in GPU_MODELS for m in models)
-    has_cpu_models = any(m not in GPU_MODELS for m in models)
-    if not (has_gpu_models and has_cpu_models):
+    on_gpu = [m for m in models if m in gpu_models]
+    on_cpu = [m for m in models if m not in gpu_models]
+    if not (on_gpu and on_cpu):
         return 1
     if requested in ("1", "2"):
         return int(requested)
     enough = (physical_cores or 0) >= LANES_MIN_PHYSICAL_CORES and (ram_gb or 0) >= LANES_MIN_RAM_GB
-    return 2 if gpu_ok and enough else 1
+    return 2 if enough else 1
 
 
-def assign_lanes(models: Sequence[str], n_lanes: int, total_threads: int) -> list[Lane]:
+def assign_lanes(
+    models: Sequence[str],
+    n_lanes: int,
+    total_threads: int,
+    gpu_models: Sequence[str] = GPU_MODELS,
+) -> list[Lane]:
     """
     1 tor: wszystkie modele w kolejności MODEL_ORDER, wszystkie wątki.
-    2 tory: GPU (xgboost → catboost, min(6, połowa) wątków) i CPU (logreg → lightgbm →
-    random_forest → ebm, reszta wątków) — budżety rozłączne.
+    2 tory: GPU (tylko modele z `gpu_models`, xgboost → catboost, min(6, połowa) wątków) i CPU
+    (pozostałe w kolejności MODEL_ORDER — także xgboost/catboost na CPU; reszta wątków).
+    Budżety rozłączne.
     """
     total = max(1, int(total_threads))
     ordered = [m for m in MODEL_ORDER if m in models]
-    gpu = [m for m in GPU_MODELS if m in models]
-    cpu = [m for m in CPU_LANE_ORDER if m in models]
+    gpu = [m for m in GPU_MODELS if m in models and m in gpu_models]
+    cpu = [m for m in ordered if m not in gpu]
     if n_lanes < 2 or not gpu or not cpu:
         return [Lane("main", ordered, total)]
     gpu_threads = max(1, min(GPU_LANE_THREADS, total // 2))
@@ -381,10 +469,144 @@ def format_duration(seconds: float | None) -> str:
     return f"{secs} s"
 
 
-def resume_command(argv: Sequence[str]) -> str:
-    """To samo polecenie bez jednorazowych flag (--force, --dry-run, --status)."""
-    keep = [a for a in argv if a not in ("--force", "--dry-run", "--status")]
-    return " ".join(["python", "scripts/run_all.py", *(shlex.quote(a) for a in keep)])
+def resume_command(argv: Sequence[str], redo_models: Sequence[str] | None = None) -> str:
+    """
+    Polecenie wznowienia: to samo bez jednorazowych flag (--dry-run, --status).
+
+    Przebieg z `--force` (redo_models = modele, których trening NIE został ukończony w tym
+    przebiegu): `--force` zostaje — wznowienie ma dalej trenować od nowa, a nie przyjąć stare runy —
+    ale `--models` zawęża się do redo_models, żeby nie trenować drugi raz modeli już gotowych.
+    Pusta lista → bez `--force` (zostały tylko ewaluacje / porównanie, które dokończy zwykłe
+    wznowienie). redo_models=None → `--force` bez zmian (np. przerwanie przed planem).
+    """
+    args = [a for a in argv if a not in ("--dry-run", "--status")]
+    if "--force" in args and redo_models is not None:
+        if not redo_models:
+            args = [a for a in args if a != "--force"]
+        else:
+            out: list[str] = []
+            skip_value = False
+            for a in args:
+                if skip_value:
+                    skip_value = False
+                    continue
+                if a == "--models":
+                    skip_value = True
+                    continue
+                if a.startswith("--models="):
+                    continue
+                out.append(a)
+            args = [*out, "--models", ",".join(redo_models)]
+    return " ".join(["python", "scripts/run_all.py", *(shlex.quote(a) for a in args)])
+
+
+# ─────────────────────────────────────────
+# Procesy: grupy, zabijanie drzewa, czy orkiestrator żyje
+# ─────────────────────────────────────────
+def popen_group_kwargs() -> dict[str, Any]:
+    """
+    POSIX: krok we własnej sesji / grupie procesów — zabijany w całości (z procesami loky/joblib),
+    a Ctrl+C z terminala do niego nie dociera (orkiestrator przekazuje SIGINT jawnie).
+    Windows: wspólna konsola i grupa — CTRL_C_EVENT dociera do kroków sam (bez
+    CREATE_NEW_PROCESS_GROUP, który by go wyłączył).
+    """
+    return {"start_new_session": True} if os.name == "posix" else {}
+
+
+def kill_process_tree(proc: subprocess.Popen, sig: int | None = None) -> None:
+    """
+    Zabija proces kroku RAZEM z potomkami (best-effort, nigdy nie rzuca).
+
+    POSIX: sygnał (domyślnie SIGKILL) do całej grupy procesów — działa także po śmierci samego
+    kroku, gdy w grupie zostały procesy-wnuki trzymające potok. Windows: `taskkill /T /F`
+    (drzewo; tylko gdy proces kroku jeszcze żyje), potem kill().
+    """
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL if sig is None else sig)
+        except OSError:                 # grupa już pusta / brak uprawnień
+            pass
+        return
+    if proc.poll() is None:
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=15, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _boot_time() -> float | None:
+    try:
+        import psutil
+
+        return float(psutil.boot_time())
+    except Exception:  # noqa: BLE001 — brak psutil / platforma bez boot_time
+        return None
+
+
+def _process_create_time(pid: int) -> float | None:
+    try:
+        import psutil
+
+        return float(psutil.Process(pid).create_time())
+    except Exception:  # noqa: BLE001 — proces nie istnieje / brak psutil
+        return None
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        import psutil
+
+        return bool(psutil.pid_exists(pid))
+    except ImportError:
+        pass
+    if os.name == "nt":                  # os.kill(pid, 0) na Windows ZABIJA proces — tylko WinAPI
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong(0)
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return bool(ok) and code.value == 259                  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def orchestrator_alive(status: Mapping[str, Any]) -> bool | None:
+    """
+    Czy orkiestrator ze status.json nadal działa. None = brak danych (status.json bez PID).
+
+    False, gdy: od zapisu był restart (inny czas startu systemu), PID nie istnieje albo należy
+    już do innego procesu (inny czas utworzenia procesu).
+    """
+    pid = status.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return None
+    boot, boot_now = status.get("boot_time"), _boot_time()
+    if isinstance(boot, (int, float)) and boot_now is not None and abs(float(boot) - boot_now) > BOOT_TIME_TOLERANCE_S:
+        return False
+    if not _pid_exists(pid):
+        return False
+    created, created_now = status.get("pid_create_time"), _process_create_time(pid)
+    if isinstance(created, (int, float)) and created_now is not None and abs(float(created) - created_now) > 2.0:
+        return False
+    return True
 
 
 def _tail(path: Path, n: int = LOG_TAIL_LINES) -> str:
@@ -487,12 +709,18 @@ class Orchestrator:
         self.tasks: list[ModelTask] = []
         self.lanes: list[Lane] = []
         self.devices: dict[str, str] = {}
+        self.gpu_models: list[str] = []
         self.preflight: dict[str, Any] = {}
         self.fingerprint = "brak-danych"
         self.prepare_status = PENDING
         self.compare: dict[str, dict[str, Any]] = {}
         self.summaries: list[Path] = []
+        self.run_state = "running"         # running | finished | interrupted | failed (status.json)
+        self.exit_status: int | None = None
+        self._pid_create_time = _process_create_time(os.getpid())
+        self._boot_time = _boot_time()
         self._children: set[subprocess.Popen] = set()
+        self._lane_busy: dict[str, bool] = {}
         self._lock = threading.Lock()
         self._print_lock = threading.Lock()
         self._file_handler: logging.Handler | None = None
@@ -511,38 +739,143 @@ class Orchestrator:
 
     # ── procesy ──
     def _run_child(self, cmd: list[str], env: Mapping[str, str], log_path: Path, prefix: str) -> int:
-        """Uruchamia krok: wyjście do pliku logu (UTF-8) i na konsolę z prefiksem."""
+        """
+        Uruchamia krok: wyjście do pliku logu (UTF-8) i na konsolę z prefiksem.
+
+        Wyjście czyta osobny wątek (`_pump`), a ten wątek czeka na zakończenie PROCESU — nie na
+        koniec potoku. Po twardej awarii kroku potok może trzymać proces-wnuk (loky/joblib);
+        wtedy (POSIX) zabijamy całą grupę procesów kroku, a gdy wyjście nadal się nie domyka,
+        porzucamy czytnik po READER_JOIN_S (wątek demoniczny) — tor idzie dalej.
+        """
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as fh:
+        fh = open(log_path, "a", encoding="utf-8")   # zamyka go wątek czytający (_pump)
+        try:
             fh.write(f"# {datetime.now().isoformat(timespec='seconds')} $ {subprocess.list2cmdline(cmd)}\n")
             fh.flush()
             proc = subprocess.Popen(
                 cmd, cwd=PROJECT_ROOT, env=dict(env), stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", bufsize=1,
+                **popen_group_kwargs(),
             )
-            with self._lock:
-                self._children.add(proc)
+        except BaseException:
+            fh.close()
+            raise
+        with self._lock:                # przed startem czytnika: Ctrl+C od tej chwili dotrze do kroku
+            self._children.add(proc)
+        if self.interrupted and os.name == "posix":     # Ctrl+C w trakcie Popen — przekaż od razu
             try:
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    fh.write(line)
-                    fh.flush()
-                    self._echo(prefix, line)
-                return proc.wait()
-            finally:
-                with self._lock:
-                    self._children.discard(proc)
-
-    def _signal_children(self, kill: bool) -> None:
-        with self._lock:
-            children = list(self._children)
-        for proc in children:
-            try:
-                if proc.poll() is None:
-                    proc.kill() if kill else proc.terminate()
+                os.killpg(proc.pid, signal.SIGINT)
             except OSError:
                 pass
+        reader = threading.Thread(target=self._pump, args=(proc, fh, prefix), daemon=True,
+                                  name=f"wyjście {prefix}")
+        reader.start()
+        try:
+            try:
+                rc = proc.wait()
+            except BaseException:       # Ctrl+C w wątku głównym (np. preflight) — bez sierot
+                kill_process_tree(proc)
+                raise
+            if rc != 0:
+                kill_process_tree(proc)         # POSIX: resztki grupy po awarii / przerwaniu
+            reader.join(READER_JOIN_S)
+            if reader.is_alive():               # potok trzyma proces potomny, który przeżył krok
+                kill_process_tree(proc)
+                reader.join(READER_JOIN_S / 2)
+            if reader.is_alive():
+                # Zamknięcie potoku teraz zablokowałoby się na wątku czytającym — porzucamy go
+                self.say(f"[{prefix}] wyjście kroku nadal otwarte {READER_JOIN_S:.0f} s po zakończeniu procesu "
+                         f"(trzyma je proces potomny) — pomijam resztę logu i idę dalej", logging.WARNING)
+            return rc
+        finally:
+            with self._lock:
+                self._children.discard(proc)
+
+    def _pump(self, proc: subprocess.Popen, fh: Any, prefix: str) -> None:
+        """Wątek czytający: wyjście kroku → plik logu + konsola; na końcu zamyka potok i plik."""
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                try:
+                    fh.write(line)
+                    fh.flush()
+                except (OSError, ValueError):
+                    pass
+                self._echo(prefix, line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            for stream in (proc.stdout, fh):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except (OSError, ValueError):
+                    pass
+
+    def _live_children(self) -> list[subprocess.Popen]:
+        with self._lock:
+            return [p for p in self._children if p.poll() is None]
+
+    def _forward_interrupt(self) -> None:
+        """
+        POSIX: kroki są we własnych grupach procesów, więc Ctrl+C z terminala do nich nie dociera —
+        przekaż SIGINT całym grupom (03_train.py kończy się wtedy kodem 130). Windows: kroki
+        dzielą konsolę i dostały CTRL_C_EVENT same.
+        """
+        if os.name != "posix":
+            return
+        for proc in self._live_children():
+            try:
+                os.killpg(proc.pid, signal.SIGINT)
+            except OSError:
+                pass
+
+    def _signal_children(self, kill: bool) -> None:
+        for proc in self._live_children():
+            if os.name == "posix":
+                kill_process_tree(proc, signal.SIGKILL if kill else signal.SIGTERM)
+            elif kill:
+                kill_process_tree(proc)
+            else:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+
+    def _install_signal_handlers(self) -> Callable[[], None]:
+        """
+        SIGTERM / SIGHUP (kill, zamknięcie terminala) → jak Ctrl+C. Kroki we własnych grupach
+        procesów nie dostaną tych sygnałów same, więc orkiestrator kończy je łagodnie i zapisuje
+        stan. Sygnał ignorowany (np. SIGHUP pod `nohup`) zostaje ignorowany. Zwraca funkcję
+        przywracającą poprzednie obsługi (tylko w wątku głównym).
+        """
+        if threading.current_thread() is not threading.main_thread():
+            return lambda: None
+
+        def handler(signum: int, frame: Any) -> None:
+            raise KeyboardInterrupt
+
+        previous: dict[int, Any] = {}
+        for name in ("SIGTERM", "SIGHUP"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                if signal.getsignal(sig) is signal.SIG_IGN:     # np. `nohup run_all.py &` — zostaw
+                    continue
+                previous[sig] = signal.signal(sig, handler)
+            except (OSError, ValueError):
+                pass
+
+        def restore() -> None:
+            for sig, old in previous.items():
+                try:
+                    signal.signal(sig, old)
+                except (OSError, ValueError, TypeError):
+                    pass
+
+        return restore
 
     def _wait(self, threads: list[threading.Thread]) -> None:
         """Czeka na wątki; Ctrl+C → łagodne zatrzymanie (patrz _handle_interrupt)."""
@@ -556,6 +889,7 @@ class Orchestrator:
     def _handle_interrupt(self, threads: list[threading.Thread]) -> None:
         self.interrupted = True
         self.stop.set()
+        self._forward_interrupt()
         self.say(f"Ctrl+C — nie uruchamiam nowych kroków; czekam do {CHILD_GRACE_S:.0f} s na zakończenie "
                  f"bieżących (ponowne Ctrl+C = natychmiast).", logging.WARNING)
         deadline = time.monotonic() + CHILD_GRACE_S
@@ -643,38 +977,49 @@ class Orchestrator:
         return summary.get("physical_cores"), summary.get("ram_gb")
 
     def plan(self) -> None:
-        """Urządzenia, tory, wątki i zadania (z oznaczeniem już ukończonych)."""
+        """Urządzenia, tory (wg urządzeń modeli), wątki i zadania (z oznaczeniem już ukończonych)."""
         gpu_ok, detected = self._gpu_hint()
         self.devices = resolve_devices(os.environ, detected)
+        self.gpu_models = gpu_planned_models(self.opts.models, self.devices, gpu_ok)
         physical, ram = self._resources()
-        n_lanes = decide_lanes(self.opts.lanes, gpu_ok, physical, ram, self.opts.models)
-        self.lanes = assign_lanes(self.opts.models, n_lanes, self._total_threads())
+        n_lanes = decide_lanes(self.opts.lanes, self.gpu_models, physical, ram, self.opts.models)
+        if self.opts.lanes == "2" and n_lanes < 2:
+            self.say("--lanes 2: żaden model nie idzie na GPU (albo wszystkie) — jeden tor", logging.WARNING)
+        self.lanes = assign_lanes(self.opts.models, n_lanes, self._total_threads(), self.gpu_models)
         self.tasks = []
         for lane in self.lanes:
             for fs in self.opts.feature_sets:
                 for model in lane.models:
-                    device = self.devices.get(model, "cpu")
+                    device = "gpu" if model in self.gpu_models else "cpu"
                     task = ModelTask(fs=fs, model=model, lane=lane.name, n_jobs=lane.n_jobs,
-                                     eta_s=model_eta_s(model, self.opts.profile,
-                                                       "cpu" if device == "cpu" else "gpu", self.opts.tune))
+                                     eta_s=model_eta_s(model, self.opts.profile, device, self.opts.tune))
                     self.tasks.append(task)
         self.refresh_done()
 
+    def _requires_gpu(self, model: str) -> bool:
+        """Model zaplanowany na GPU (próba GPU udana / wymuszone GPU) — run z CPU nie wystarczy."""
+        return self.devices.get(model) == "gpu"
+
     def refresh_done(self) -> None:
-        """Zadania z pasującym DONE.json → SKIPPED (chyba że --force)."""
+        """Zadania z pasującym DONE.json → SKIPPED (chyba że --force); powód ponownego treningu w logu."""
         from src.utils.config import DATA_VERSION
 
         self.fingerprint = data_fingerprint()
         for task in self.tasks:
             if task.status not in (PENDING, SKIPPED):
                 continue
+            notes: list[str] = []
             run_dir = find_done_run(self.runs_dir, task.model, task.fs, self.opts.tag, DATA_VERSION,
-                                    self.fingerprint, tuned=self.opts.tune)
+                                    self.fingerprint, tuned=self.opts.tune,
+                                    require_gpu=self._requires_gpu(task.model), notes=notes)
             if run_dir is not None and not self.opts.force:
                 task.status, task.run_dir, task.run_name = SKIPPED, str(run_dir), run_dir.name
                 task.eval_status = SKIPPED if eval_done(run_dir) else PENDING
             else:
                 task.status, task.run_dir, task.run_name = PENDING, None, None
+                if not self.opts.force and run_dir is None:
+                    for note in notes[:3]:
+                        self.say(f"{task.key}: {note}", logging.WARNING)
 
     def print_plan(self) -> None:
         o = self.opts
@@ -762,10 +1107,12 @@ class Orchestrator:
             if (rc != 0 and not self.stop.is_set() and task.model in GPU_MODELS
                     and env.get(f"SOR_AI_DEVICE_{task.model.upper()}") != "cpu"
                     and log_has_gpu_error(_tail(log_path, 400))):
+                threads = self._cpu_retry_threads(task)
                 self.say(f"{task.key}: błąd GPU w logu — ponawiam RAZ na CPU "
-                         f"(SOR_AI_DEVICE_{task.model.upper()}=cpu, budżet zastępczy)", logging.WARNING)
-                task.retried_on_cpu = True
-                env = {**env, f"SOR_AI_DEVICE_{task.model.upper()}": "cpu"}
+                         f"(SOR_AI_DEVICE_{task.model.upper()}=cpu, budżet zastępczy, wątki: {threads})",
+                         logging.WARNING)
+                task.retried_on_cpu, task.retry_n_jobs = True, threads
+                env = {**self._base_env(threads), f"SOR_AI_DEVICE_{task.model.upper()}": "cpu"}
                 log_path = self._step_log(task, "train_cpu")
                 rc = self.runner(cmd, env, log_path, self._prefix(task) + "·cpu")
             task.rc = rc
@@ -773,11 +1120,15 @@ class Orchestrator:
                 self.interrupted = True
                 self.stop.set()
             run_dir = None
-            if rc == 0:
+            if rc == 0:                     # run tego kroku (także po fallbacku na CPU), nie starszy
                 run_dir = find_done_run(self.runs_dir, task.model, task.fs, self.opts.tag, DATA_VERSION,
-                                        self.fingerprint, tuned=self.opts.tune)
+                                        self.fingerprint, tuned=self.opts.tune, since=t0 - 2.0)
             if run_dir is not None:
                 task.status, task.run_dir, task.run_name = DONE, str(run_dir), run_dir.name
+                actual, _ = done_device(read_json(run_dir / DONE_JSON) or {})
+                if self._requires_gpu(task.model) and not is_gpu_device(actual):
+                    self.say(f"{task.key}: wytrenowany na CPU mimo planu GPU — następne uruchomienie powtórzy "
+                             f"go na GPU, jeśli karta będzie działać", logging.WARNING)
             elif self.interrupted:
                 task.status = INTERRUPTED
             else:
@@ -805,23 +1156,49 @@ class Orchestrator:
             self.say(f"✓ {task.key}: gotowe w {format_duration(task.duration_s)} → {task.run_name}")
         self._write_status()
 
+    def _cpu_retry_threads(self, task: ModelTask) -> int:
+        """
+        Wątki powtórki na CPU po błędzie GPU (zadanie z toru GPU): budżet toru CPU, gdy ten tor już
+        skończył swoje modele; gdy jest zajęty — budżet toru GPU (inaczej wątki by się nakładały),
+        z wyraźnym ostrzeżeniem. Jeden tor: bez zmian (wszystkie wątki).
+        """
+        cpu_lane = next((lane for lane in self.lanes if lane.name == "cpu"), None)
+        if task.lane != "gpu" or cpu_lane is None:
+            return task.n_jobs
+        with self._lock:
+            busy = self._lane_busy.get("cpu", True)
+        if not busy:
+            self.say(f"{task.key}: tor CPU skończył pracę — powtórka na CPU dostaje jego budżet "
+                     f"({cpu_lane.n_jobs} wątków)")
+            return cpu_lane.n_jobs
+        self.say(f"{task.key}: tor CPU jest zajęty — powtórka na CPU działa z budżetem toru GPU "
+                 f"({task.n_jobs} wątków zamiast {cpu_lane.n_jobs}), więc będzie wyraźnie wolniejsza; "
+                 f"limit czasu tuningu (budżet zastępczy CPU) i tak ją ogranicza", logging.WARNING)
+        return task.n_jobs
+
     def _lane_worker(self, lane: Lane) -> None:
-        for task in [t for t in self.tasks if t.lane == lane.name]:
-            if self.stop.is_set():
-                if task.status == PENDING:
-                    task.status, task.eval_status = NOT_STARTED, NOT_STARTED
-                continue
-            try:
-                self.run_task(task)
-            except Exception as exc:  # noqa: BLE001 — błąd orkiestratora przy jednym modelu nie zatrzymuje toru
-                log.exception(f"{task.key}: błąd wewnętrzny orkiestratora: {type(exc).__name__}: {exc}")
-                task.status, task.error = FAILED, f"błąd orkiestratora: {type(exc).__name__}: {exc}"
-                if task.eval_status == PENDING:
-                    task.eval_status = NOT_STARTED
-                self._write_status()
-            if task.status == FAILED and self.opts.fail_fast:
-                self.say("--fail-fast: zatrzymuję dalsze kroki", logging.WARNING)
-                self.stop.set()
+        with self._lock:
+            self._lane_busy[lane.name] = True
+        try:
+            for task in [t for t in self.tasks if t.lane == lane.name]:
+                if self.stop.is_set():
+                    if task.status == PENDING:
+                        task.status, task.eval_status = NOT_STARTED, NOT_STARTED
+                    continue
+                try:
+                    self.run_task(task)
+                except Exception as exc:  # noqa: BLE001 — błąd orkiestratora przy jednym modelu nie zatrzymuje toru
+                    log.exception(f"{task.key}: błąd wewnętrzny orkiestratora: {type(exc).__name__}: {exc}")
+                    task.status, task.error = FAILED, f"błąd orkiestratora: {type(exc).__name__}: {exc}"
+                    if task.eval_status == PENDING:
+                        task.eval_status = NOT_STARTED
+                    self._write_status()
+                if task.status == FAILED and self.opts.fail_fast:
+                    self.say("--fail-fast: zatrzymuję dalsze kroki", logging.WARNING)
+                    self.stop.set()
+        finally:
+            with self._lock:
+                self._lane_busy[lane.name] = False
 
     def run_compare(self) -> None:
         for fs in self.opts.feature_sets:
@@ -849,6 +1226,12 @@ class Orchestrator:
         return {
             "started_at": self.started.isoformat(timespec="seconds"),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "state": self.run_state,
+            "exit_code": self.exit_status,
+            # --status: czy ten orkiestrator jeszcze działa (PID + czas jego utworzenia + start systemu)
+            "pid": os.getpid(),
+            "pid_create_time": self._pid_create_time,
+            "boot_time": self._boot_time,
             "options": {k: v for k, v in asdict(self.opts).items() if k != "argv"},
             "tag": self.opts.tag,
             "data_version": config.DATA_VERSION,
@@ -864,14 +1247,12 @@ class Orchestrator:
         }
 
     def _write_status(self) -> None:
+        from src.utils.fileio import write_text_atomic
+
         with self._lock:
             payload = json.dumps(self._status_payload(), indent=2, ensure_ascii=False, default=str)
-            path = self.log_dir / "status.json"
             try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_name(f"status.json.{threading.get_ident()}.tmp")
-                tmp.write_text(payload, encoding="utf-8")
-                os.replace(tmp, path)
+                write_text_atomic(self.log_dir / "status.json", payload)
             except OSError as exc:
                 log.warning(f"Nie zapisano status.json: {exc}")
 
@@ -917,7 +1298,7 @@ class Orchestrator:
             if m.get("device_fallback") or m.get("fallback_reason"):
                 device += " (fallback GPU→CPU)"
             if t.retried_on_cpu:
-                device += " (powtórka na CPU)"
+                device += " (powtórka na CPU" + (f", {t.retry_n_jobs} wątków" if t.retry_n_jobs else "") + ")"
             trials = "—" if m.get("n_complete") is None else f"{m['n_complete']}/{m['n_pruned']}/{m['n_fail']}"
             cv = "—" if m.get("cv_score") is None else (
                 f"{m.get('cv_metric')} {_fmt_metric(m['cv_score'])}"
@@ -969,8 +1350,10 @@ class Orchestrator:
         unfinished = [t for t in tasks if t.status not in _OK_STATES or t.eval_status in (FAILED, NOT_STARTED,
                                                                                             INTERRUPTED)]
         if unfinished:
-            lines.append(f"- wznowienie (gotowe modele zostaną pominięte, Optuna dokończy brakujące próby): "
-                         f"`{resume_command(o.argv)}`")
+            lines.append(("- wznowienie (tylko modele niewytrenowane w tym przebiegu --force; Optuna dokończy "
+                          "brakujące próby): " if o.force else
+                          "- wznowienie (gotowe modele zostaną pominięte, Optuna dokończy brakujące próby): ")
+                         + f"`{self._resume()}`")
         lines += [f"- stan bez uruchamiania: `python scripts/run_all.py --status --profile {o.profile}"
                   + (f" --feature-set {fs}" if fs != "triage" else "") + "`"]
         if o.profile in ("smoke", "quick"):
@@ -990,48 +1373,83 @@ class Orchestrator:
         bad = bad or any(c.get("status") == FAILED for c in self.compare.values())
         return 1 if bad else 0
 
-    def run(self) -> int:
-        from src.pipeline.keepawake import KeepAwake
+    def _resume(self) -> str:
+        """Polecenie wznowienia; po --force — z --force i tylko modelami bez ukończonego treningu."""
+        redo = None
+        if self.opts.force and self.tasks:
+            redo = [m for m in self.opts.models
+                    if any(t.model == m and t.status not in _OK_STATES for t in self.tasks)]
+        return resume_command(self.opts.argv, redo)
 
+    def run(self) -> int:
+        """Cały przebieg; status.json zawsze kończy się stanem (finished / interrupted / failed) i kodem."""
         o = self.opts
         if not o.dry_run:
             self._setup_logging()
+        restore_signals = self._install_signal_handlers()
+        state, code = "failed", 1
         try:
-            with KeepAwake(enabled=o.keep_awake and not o.dry_run) as awake:
-                if not o.dry_run:
-                    self.say(f"run_all {self.ts} — blokada uśpienia: {awake.description}",
-                             logging.INFO if awake.active or not o.keep_awake else logging.WARNING)
-                if not o.skip_preflight and not o.dry_run:
-                    self.log_dir.mkdir(parents=True, exist_ok=True)
-                    if not self.run_preflight():
-                        return 2
-                if not self.prepare():
-                    self._write_status()
-                    self.say(f"Wznowienie: {resume_command(o.argv)}", logging.WARNING)
-                    return 130 if self.interrupted else 2
-                self.plan()
-                self.print_plan()
-                if o.dry_run:
-                    for task in self.tasks:
-                        if task.status == PENDING:
-                            self.say(f"  $ {subprocess.list2cmdline(train_command(task.model, task.fs, o.profile, o.tag, o.tune))}")
-                    return 0
-                self._write_status()
-                self._run_jobs([lambda lane=lane: self._lane_worker(lane) for lane in self.lanes])
-                for task in self.tasks:     # przerwanie w trakcie: oznacz, co nie ruszyło
-                    if task.status == PENDING:
-                        task.status, task.eval_status = NOT_STARTED, NOT_STARTED
-                    elif task.status == RUNNING:
-                        task.status = INTERRUPTED
-                if not self.interrupted:
-                    self.run_compare()
-                for fs in o.feature_sets:
-                    self.summaries.append(self.write_summary(fs))
-                self._write_status()
-                self._print_final()
-                return self.exit_code()
+            code = self._run()
+            state = "interrupted" if self.interrupted else "finished"
+            return code
+        except KeyboardInterrupt:
+            state, code, self.interrupted = "interrupted", 130, True
+            raise
         finally:
+            restore_signals()
+            for proc in self._live_children():      # nic nie może przeżyć orkiestratora
+                kill_process_tree(proc)
+            if not o.dry_run:
+                self.run_state, self.exit_status = state, code
+                self._write_status()
             self._teardown_logging()
+
+    def _run(self) -> int:
+        from src.pipeline.keepawake import KeepAwake, QuickEditGuard
+        from src.utils.hardware import disable_power_throttling
+
+        o = self.opts
+        if not o.dry_run and disable_power_throttling():
+            self.say("Windows: wyłączono dławienie energii (EcoQoS) procesu orkiestratora")
+        with KeepAwake(enabled=o.keep_awake and not o.dry_run) as awake, \
+                QuickEditGuard(enabled=not o.dry_run) as quickedit:
+            if not o.dry_run:
+                self.say(f"run_all {self.ts} — blokada uśpienia: {awake.description}",
+                         logging.WARNING if awake.host_warning or (o.keep_awake and not awake.active)
+                         else logging.INFO)
+                if quickedit.active:
+                    self.say(f"Konsola: {quickedit.description}")
+            if not o.skip_preflight and not o.dry_run:
+                self.log_dir.mkdir(parents=True, exist_ok=True)
+                if not self.run_preflight():
+                    return 2
+            if not self.prepare():
+                self._write_status()
+                self.say(f"Wznowienie: {self._resume()}", logging.WARNING)
+                return 130 if self.interrupted else 2
+            self.plan()
+            self.print_plan()
+            if o.dry_run:
+                for task in self.tasks:
+                    if task.status == PENDING:
+                        self.say(f"  $ {subprocess.list2cmdline(train_command(task.model, task.fs, o.profile, o.tag, o.tune))}")
+                return 0
+            with self._lock:
+                self._lane_busy = {lane.name: True for lane in self.lanes}
+            self._write_status()
+            self._run_jobs([lambda lane=lane: self._lane_worker(lane) for lane in self.lanes])
+            for task in self.tasks:     # przerwanie w trakcie: oznacz, co nie ruszyło
+                if task.status == PENDING:
+                    task.status, task.eval_status = NOT_STARTED, NOT_STARTED
+                elif task.status == RUNNING:
+                    task.status = INTERRUPTED
+            if not self.interrupted:
+                self.run_compare()
+            for fs in o.feature_sets:
+                self.summaries.append(self.write_summary(fs))
+            self._write_status()
+            self._print_final()
+            return self.exit_code()
 
     def _print_final(self) -> None:
         self.say("═" * 72)
@@ -1045,39 +1463,63 @@ class Orchestrator:
             self.say(f"Podsumowanie: {path}")
         code = self.exit_code()
         if code != 0:
-            self.say(f"Wznowienie: {resume_command(self.opts.argv)}", logging.WARNING)
+            self.say(f"Wznowienie: {self._resume()}", logging.WARNING)
 
 
 # ─────────────────────────────────────────
 # --status
 # ─────────────────────────────────────────
+STATE_DEAD = "przerwany (proces nie działa)"
+
+
+def _latest_status() -> tuple[Path | None, dict[str, Any]]:
+    latest = sorted((Path(config.LOGS_DIR) / "run_all").glob("*/status.json"))
+    if not latest:
+        return None, {}
+    return latest[-1], read_json(latest[-1]) or {}
+
+
 def status_report(opts: Options) -> str:
-    """Tabela stanu z plików-znaczników (DONE.json, ewaluacja, badania Optuny) — nic nie uruchamia."""
+    """
+    Tabela stanu z plików-znaczników (DONE.json, ewaluacja, badania Optuny, ostatni status.json)
+    — nic nie uruchamia. Krok „w toku” w status.json martwego orkiestratora (PID nie działa,
+    był restart) jest pokazywany jako „przerwany (proces nie działa)”.
+    """
     from src.data.dataset import is_prepared
 
     runs_dir = Path(config.RUNS_DIR)
     fingerprint = data_fingerprint()
     manifest = read_json(Path(config.DATA_MANIFEST_JSON)) or {}
+    status_path, status = _latest_status()
+    same_run = status.get("tag") == opts.tag
+    running = {f"{t.get('fs')}/{t.get('model')}" for t in status.get("tasks", []) if t.get("status") == RUNNING}
+    active = status.get("state") in (None, "running")
+    alive = orchestrator_alive(status) if status and active else False
+    planned = resolve_devices(os.environ, status.get("devices") if same_run else None)
+
     lines = [
         f"Stan: profil '{opts.profile}', tag '{opts.tag}', dane {config.DATA_VERSION} "
         f"({'gotowe' if is_prepared() else 'NIEGOTOWE'}, podział '{manifest.get('split_strategy')}', "
         f"odcisk {fingerprint})",
         "",
-        f"{'zestaw':7s} {'model':14s} {'stan':22s} {'QWK val arg/koszt':18s} {'urządzenie':11s} run / szczegóły",
+        f"{'zestaw':7s} {'model':14s} {'stan':30s} {'QWK val arg/koszt':18s} {'urządzenie':11s} run / szczegóły",
     ]
     for fs in opts.feature_sets:
         for model in opts.models:
             run_dir = find_done_run(runs_dir, model, fs, opts.tag, config.DATA_VERSION, fingerprint, tuned=opts.tune)
             if run_dir is not None:
                 m = run_metrics(run_dir)
+                actual, _ = done_device(read_json(run_dir / DONE_JSON) or {})
                 state = "gotowy" + ("" if eval_done(run_dir) else " (bez ewaluacji)")
+                if planned.get(model) == "gpu" and not is_gpu_device(actual):
+                    state = "gotowy na CPU — do powtórki na GPU"
                 qwk = (f"{_fmt_metric(m.get('val_argmax_quadratic_weighted_kappa'), 3)} / "
                        f"{_fmt_metric(m.get('val_cost_quadratic_weighted_kappa'), 3)}")
-                lines.append(f"{fs:7s} {model:14s} {state:22s} {qwk:18s} {str(m.get('actual_device') or '—'):11s} "
-                             f"{run_dir.name}")
+                lines.append(f"{fs:7s} {model:14s} {state:30s} {qwk:18s} {str(actual or '—'):11s} {run_dir.name}")
                 continue
             progress = optuna_progress(Path(config.OPTUNA_STORAGE_DIR), model, fs, opts.profile, fingerprint)
             partial = [p for p in runs_dir.glob(f"*_{model}_{fs}_{opts.tag}") if not (p / DONE_JSON).exists()]
+            detail = ""
             if progress:
                 finished = progress.get("complete", 0) + progress.get("pruned", 0)
                 target = config.TUNING_PROFILES[opts.profile][model]["n_trials"]
@@ -1086,14 +1528,26 @@ def status_report(opts: Options) -> str:
             elif partial:
                 state, detail = "przerwany", f"niedokończony katalog {sorted(partial)[-1].name}"
             else:
-                state, detail = "nierozpoczęty", ""
-            lines.append(f"{fs:7s} {model:14s} {state:22s} {'—':18s} {'—':11s} {detail}")
-    latest = sorted((Path(config.LOGS_DIR) / "run_all").glob("*/status.json"))
-    if latest:
-        status = read_json(latest[-1]) or {}
-        running = [t["fs"] + "/" + t["model"] for t in status.get("tasks", []) if t.get("status") == RUNNING]
-        lines += ["", f"Ostatnie uruchomienie: {latest[-1].parent} (aktualizacja {status.get('updated_at')})"
-                  + (f" — w toku: {', '.join(running)}" if running else "")]
+                state = "nierozpoczęty"
+            if same_run and active and f"{fs}/{model}" in running:
+                if alive is False:
+                    detail = f"{state}; {detail}" if detail else state
+                    state = STATE_DEAD
+                elif alive:
+                    state = "w toku — " + state if progress else "w toku"
+            lines.append(f"{fs:7s} {model:14s} {state:30s} {'—':18s} {'—':11s} {detail}")
+    if status_path is not None:
+        line = f"Ostatnie uruchomienie: {status_path.parent} (aktualizacja {status.get('updated_at')})"
+        if active and alive is False:
+            line += f" — {STATE_DEAD}" + (f"; niedokończone: {', '.join(sorted(running))}" if running else "") \
+                + " — wznów tym samym poleceniem"
+        elif active and alive:
+            line += f" — w toku (PID {status.get('pid')})" + (f": {', '.join(sorted(running))}" if running else "")
+        elif active:
+            line += " — w toku: " + ", ".join(sorted(running)) if running else ""
+        else:
+            line += f" — zakończony ({status.get('state')}, kod {status.get('exit_code')})"
+        lines += ["", line]
     return "\n".join(lines)
 
 
@@ -1115,7 +1569,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Podział danych: random (stratyfikowany) albo site (oddział B jako test)")
     parser.add_argument("--no-tune", action="store_true", help="Bez tuningu — parametry domyślne z config.py")
     parser.add_argument("--lanes", choices=["auto", "1", "2"], default="auto",
-                        help="Tory równoległe: auto = 2 przy działającym GPU, ≥ 16 rdzeniach i ≥ 32 GB RAM")
+                        help="Tory równoległe: auto = 2, gdy któryś model idzie na GPU, przy ≥ 16 rdzeniach "
+                             "fizycznych i ≥ 30 GB RAM (tor GPU: tylko modele na GPU)")
     parser.add_argument("--force", action="store_true",
                         help="Trenuj ponownie także modele z gotowym DONE.json (ukończony tuning Optuny i tak "
                              "zostanie użyty ponownie)")
@@ -1164,12 +1619,18 @@ __all__ = [
     "build_child_env",
     "data_fingerprint",
     "decide_lanes",
+    "done_device",
     "find_done_run",
+    "gpu_planned_models",
+    "is_gpu_device",
+    "kill_process_tree",
     "log_has_gpu_error",
     "main",
     "model_eta_s",
+    "orchestrator_alive",
     "parse_feature_sets",
     "parse_models",
+    "popen_group_kwargs",
     "resolve_devices",
     "resume_command",
     "status_report",

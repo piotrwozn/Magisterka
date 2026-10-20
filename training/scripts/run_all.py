@@ -33,6 +33,11 @@ def run(argv: list[str] | None = None) -> int:
         from src.pipeline.orchestrator import main
     except KeyboardInterrupt:
         return 130
+    except ImportError as exc:          # świeży venv bez pakietów — wskazówka zamiast tracebacku
+        print(f"[BŁĄD ] {type(exc).__name__}: {exc}\n"
+              f"          → python -m pip install -r requirements-lock.txt   (w aktywnym venv), "
+              f"potem: python scripts/00_check_env.py")
+        return 2
     return main(argv)
 
 

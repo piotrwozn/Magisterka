@@ -280,6 +280,9 @@ def _isolate_logs(tmp_path_factory, monkeypatch):
     from src.utils import config
 
     logs = tmp_path_factory.mktemp("logs")
+    # LOGS_DIR: m.in. pamięć podręczna próby GPU (hardware_probe.json)
+    monkeypatch.setattr(config, "LOGS_DIR", logs)
+    monkeypatch.setattr(config, "EVAL_LOGS_DIR", logs / "evaluation")
     monkeypatch.setattr(config, "TRAINING_LOGS_DIR", logs / "training")
     monkeypatch.setattr(config, "EXPERIMENTS_DIR", logs / "experiments")
     monkeypatch.setattr(config, "MODELS_DIR", logs / "models")

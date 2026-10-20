@@ -14,11 +14,16 @@ Na GPU: `gpu_ram_part` = config.CATBOOST_GPU_RAM_PART, bez `rsm`/`colsample_byle
 (na GPU tylko dla trybów pairwise), MVS → Bernoulli (MVS nie działa z MultiClass na GPU).
 Błąd CUDA (sterownik, brak pamięci) → ponowny trening na CPU (baza).
 
+Wątki: budżet modelu (`thread_count` = config.N_JOBS) trafia także do budowy Pool
+i do predict_proba — domyślne -1 CatBoost zajęłoby wszystkie wątki logiczne (zderzenie
+z drugim torem orkiestratora).
+
 Logowanie (tylko fit()): krzywe `train_MultiClass` i `es_MultiClass` → JSON + plik .log.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
@@ -112,6 +117,16 @@ class CatBoostTriageModel(BaseTriageModel):
     def _switch_to_cpu(self) -> None:
         self.params = _normalize_catboost_params({**self.params, "task_type": "CPU"})
 
+    def _thread_count(self) -> int:
+        """Budżet wątków modelu (`thread_count`, ≤ liczba CPU tej maszyny); brak / ≤ 0 → -1 (wszystkie)."""
+        try:
+            value = int(self.params.get("thread_count") or -1)
+        except (TypeError, ValueError):
+            return -1
+        if value <= 0:
+            return -1
+        return min(value, os.cpu_count() or value)
+
     # ──────── Trening ────────
     def _build_model(self):
         from catboost import CatBoostClassifier
@@ -126,11 +141,13 @@ class CatBoostTriageModel(BaseTriageModel):
         self._label_classes = np.unique(y)
         self.model = self._build_model()
         # Pool — natywny format CatBoost (szybszy niż przekazywanie DataFrame)
-        train_pool = Pool(data=X, label=y, weight=sample_weight, feature_names=list(X.columns))
+        threads = self._thread_count()
+        train_pool = Pool(data=X, label=y, weight=sample_weight, feature_names=list(X.columns),
+                          thread_count=threads)
         fit_kwargs: dict[str, Any] = {}
         if X_es is not None:
             fit_kwargs.update(
-                eval_set=Pool(data=X_es, label=y_es, feature_names=list(X.columns)),
+                eval_set=Pool(data=X_es, label=y_es, feature_names=list(X.columns), thread_count=threads),
                 early_stopping_rounds=self.es_rounds or int(self.params.get("od_wait", 200)),
                 use_best_model=True,
             )
@@ -146,7 +163,7 @@ class CatBoostTriageModel(BaseTriageModel):
         self.best_iteration = int(best) + 1 if best is not None else None
 
     def _predict_proba_raw(self, X):
-        proba = np.asarray(self.model.predict_proba(X))
+        proba = np.asarray(self.model.predict_proba(X, thread_count=self._thread_count()))
         model_classes = np.asarray(self.model.classes_).astype(int)
         return proba[:, np.searchsorted(model_classes, self.classes_)]
 

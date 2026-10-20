@@ -1,9 +1,10 @@
 """Layer 1A — ensemble inference across loaded ML models.
 
-Weighted average of the class probabilities of the loaded models + decision rule
-(`registry.ensemble`: equal weights and argmax by default, optional override from
-`backend/models/ensemble_weights.json` — format in app/models/ensemble.py).
-Class index 0–4 = ESI 1–5.
+Weighted blend of the class probabilities of the loaded models (arithmetic or
+geometric mean), optional temperature scaling of the blend, then the decision rule
+(`registry.ensemble`: equal weights, mean, no temperature and argmax by default;
+optional override from `backend/models/ensemble_weights.json` — format in
+app/models/ensemble.py). Class index 0–4 = ESI 1–5.
 """
 from __future__ import annotations
 
@@ -78,8 +79,7 @@ def run_ensemble(
         )
 
     per_model: list[ModelPrediction] = []
-    weighted_proba = np.zeros(N_CLASSES)
-    total_weight = 0.0
+    probas: dict[str, np.ndarray] = {}
 
     for model_id in active:
         try:
@@ -89,15 +89,14 @@ def run_ensemble(
             continue
 
         per_model.append(pred)
-        weight = config.weight(model_id)
-        weighted_proba += np.array(pred.probabilities) * weight
-        total_weight += weight
+        probas[model_id] = np.array(pred.probabilities)
 
-    if total_weight == 0:
+    if not probas:
         raise RuntimeError("All models failed during inference")
 
-    weighted_proba /= total_weight
-    final_category = decide(weighted_proba, config.rule)
-    final_confidence = float(weighted_proba[final_category])
+    # Weights renormalised over the models that answered; temperature on the blend
+    final_proba = config.combine(probas)
+    final_category = decide(final_proba, config.rule)
+    final_confidence = float(final_proba[final_category])
 
     return final_category, final_confidence, per_model

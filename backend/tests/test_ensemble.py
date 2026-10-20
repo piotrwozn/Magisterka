@@ -10,11 +10,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.config import get_settings
+from app.config import ensure_training_on_path, get_settings
 from app.models.ensemble import (
     ENSEMBLE_MODELS,
     MODEL_WEIGHTS,
     EnsembleConfig,
+    apply_temperature,
+    blend,
     cost_matrix,
     decide,
     load_ensemble_config,
@@ -97,10 +99,28 @@ class TestLoadConfig:
         {"weights": {"extra_trees": 1}},
         {"weights": {}},
         {"weights": {"xgboost": 1}, "rule": "median"},
+        {"method": "median"},
+        {"temperature": 0},
+        {"temperature": -1.5},
+        {"temperature": "warm"},
+        {"temperature": True},
+        {"temprature": 1.2},                         # typo → unknown key
+        {"weights": {"xgboost": 1}, "note": "val logloss 0.71"},
     ])
     def test_invalid_file_is_loud(self, tmp_path, payload):
         with pytest.raises(ValueError):
             load_ensemble_config(_write(tmp_path / "w.json", payload))
+
+    def test_method_and_temperature(self, tmp_path):
+        cfg = load_ensemble_config(_write(tmp_path / "w.json", {
+            "weights": {"xgboost": 1, "catboost": 1}, "method": "geometric", "temperature": 1.25,
+        }))
+        assert (cfg.method, cfg.temperature, cfg.rule) == ("geometric", 1.25, "argmax")
+
+    def test_defaults_mean_without_temperature(self, tmp_path):
+        cfg = load_ensemble_config(_write(tmp_path / "w.json", {"rule": "cost", "temperature": None}))
+        assert (cfg.method, cfg.temperature) == ("mean", None)
+        assert EnsembleConfig().method == "mean" and EnsembleConfig().temperature is None
 
     def test_registry_loads_file_from_models_dir(self, tmp_path):
         models_dir = tmp_path / "backend" / "models"
@@ -182,6 +202,55 @@ class TestRunEnsemble:
         cat, _, preds = layer1a_ml.run_ensemble(ROW, reg)
         assert cat == 2
         assert [p.model_name for p in preds] == ["catboost"]
+
+
+class TestBlendAndTemperature:
+    P1 = np.array([0.05, 0.60, 0.30, 0.04, 0.01])
+    P2 = np.array([0.01, 0.20, 0.70, 0.08, 0.01])
+
+    def test_mean_and_geometric(self):
+        np.testing.assert_allclose(blend([self.P1, self.P2], [3, 1], "mean"), 0.75 * self.P1 + 0.25 * self.P2)
+        geo = np.exp(0.75 * np.log(self.P1) + 0.25 * np.log(self.P2))
+        np.testing.assert_allclose(blend([self.P1, self.P2], [3, 1], "geometric"), geo / geo.sum())
+        with pytest.raises(ValueError):
+            blend([self.P1], [1.0], "median")
+
+    def test_temperature(self):
+        np.testing.assert_allclose(apply_temperature(self.P1, 1.0), self.P1)
+        flat = apply_temperature(self.P1, 2.0)
+        assert flat.sum() == pytest.approx(1.0)
+        assert flat.max() < self.P1.max()                # T > 1 flattens
+        assert apply_temperature(self.P1, 0.5).max() > self.P1.max()
+
+    def test_matches_training_blend(self):
+        ensure_training_on_path()
+        runs = pytest.importorskip("src.ensemble.runs")
+        rng = np.random.default_rng(0)
+        a, b = rng.dirichlet(np.ones(5), 20), rng.dirichlet(np.ones(5), 20)
+        weights = {"lightgbm": 0.7, "xgboost": 0.3}
+        for method in ("mean", "geometric"):
+            expected = runs.apply_temperature(runs.blend({"lightgbm": a, "xgboost": b}, weights, method), 1.3)
+            cfg = EnsembleConfig(weights=weights, method=method, temperature=1.3, source="test")
+            got = np.stack([cfg.combine({"lightgbm": a[i], "xgboost": b[i]}) for i in range(20)])
+            np.testing.assert_allclose(got, expected, rtol=1e-10, atol=1e-12)
+
+    def test_temperature_applied_to_blend_before_rule(self):
+        # Blend [0, .45, .55, 0, 0]: argmax ESI 3; a temperature does not change the argmax
+        # but changes the confidence; per-model predictions stay unscaled
+        probas = {"catboost": [0.0, 0.5, 0.5, 0.0, 0.0], "lightgbm": [0.0, 0.4, 0.6, 0.0, 0.0]}
+        plain = layer1a_ml.run_ensemble(ROW, _registry(probas))
+        cfg = EnsembleConfig(temperature=3.0, source="test")
+        cat, conf, preds = layer1a_ml.run_ensemble(ROW, _registry(probas, cfg))
+        assert cat == plain[0] == 2
+        assert conf < plain[1]
+        assert [p.probabilities for p in preds] == [p.probabilities for p in plain[2]]
+
+    def test_geometric_blend_in_run_ensemble(self):
+        cfg = EnsembleConfig(method="geometric", source="test")
+        reg = _registry({"catboost": [0.1, 0.6, 0.1, 0.1, 0.1], "lightgbm": [0.1, 0.1, 0.6, 0.1, 0.1]}, cfg)
+        _, conf, _ = layer1a_ml.run_ensemble(ROW, reg)
+        geo = np.sqrt(np.array([0.1, 0.6, 0.1, 0.1, 0.1]) * np.array([0.1, 0.1, 0.6, 0.1, 0.1]))
+        assert conf == pytest.approx((geo / geo.sum()).max())
 
 
 class TestFullProba:

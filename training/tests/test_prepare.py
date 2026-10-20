@@ -10,7 +10,9 @@ kodowania kategorii, normalizacja nazw, podziały i zapis artefaktów.
 from __future__ import annotations
 
 import json
+import os
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -606,6 +608,26 @@ class TestPrepareDataset:
             prepare_dataset(strategy="random", raw=raw_yale)
         assert not isolated_paths.DATA_MANIFEST_JSON.exists()
         assert not is_prepared()
+
+    def test_json_writes_retry_transient_lock(self, isolated_paths, raw_yale, monkeypatch):
+        """Windows: manifest / listy cech chwilowo zablokowane (antywirus) — zapis ponawiany (src.utils.fileio)."""
+        from src.utils import fileio
+
+        real_replace = os.replace
+        locked: list[str] = []
+
+        def flaky(src, dst):
+            if Path(dst).suffix == ".json" and Path(dst).name not in locked:
+                locked.append(Path(dst).name)
+                raise PermissionError(13, "plik używany przez inny proces")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(fileio.os, "replace", flaky)
+        monkeypatch.setattr(fileio.time, "sleep", lambda s: None)
+        prepare_dataset(strategy="random", raw=raw_yale)
+        assert sorted(locked) == sorted([isolated_paths.DATA_MANIFEST_JSON.name, isolated_paths.FEATURE_SETS_JSON.name])
+        assert json.loads(isolated_paths.DATA_MANIFEST_JSON.read_text(encoding="utf-8"))["data_version"] == DATA_VERSION
+        assert not list(isolated_paths.ESI_DATA_DIR.glob("*.tmp"))
 
     def test_split_files_contain_meta_and_full_features(self, isolated_paths, raw_yale):
         prepare_dataset(strategy="random", raw=raw_yale)

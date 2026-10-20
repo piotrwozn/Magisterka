@@ -254,11 +254,31 @@ class TestThreads:
         monkeypatch.setitem(sys.modules, "psutil", None)
         monkeypatch.setattr(joblib, "cpu_count", lambda **kw: (_ for _ in ()).throw(OSError("brak")))
         monkeypatch.setattr(os, "cpu_count", lambda: 6)
+        monkeypatch.setattr(hardware, "usable_cpus", lambda: None)      # bez maski affinity
         hardware.physical_cores.cache_clear()
         try:
             assert hardware.physical_cores() == 6
         finally:
             hardware.physical_cores.cache_clear()
+
+    def test_physical_cores_clamped_to_affinity(self, monkeypatch):
+        """Proces ograniczony maską affinity (taskset / start /affinity) nie dostaje więcej wątków niż CPU."""
+        import joblib
+
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        monkeypatch.setattr(joblib, "cpu_count", lambda **kw: 8)
+        monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1, 2}, raising=False)
+        hardware.physical_cores.cache_clear()
+        try:
+            assert hardware.usable_cpus() == 3
+            assert hardware.physical_cores() == 3
+        finally:
+            hardware.physical_cores.cache_clear()
+
+    def test_usable_cpus_unknown_without_affinity_api(self, monkeypatch):
+        monkeypatch.delattr(os, "sched_getaffinity", raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        assert hardware.usable_cpus() is None
 
     def test_config_n_jobs_honours_env_set_before_import(self):
         """SOR_AI_N_JOBS ustawione przez proces nadrzędny trafia do config i parametrów modeli."""
@@ -273,6 +293,82 @@ class TestThreads:
                              capture_output=True, text=True, encoding="utf-8", timeout=120)
         assert out.returncode == 0, out.stderr
         assert out.stdout.split() == ["3"] * 6
+
+
+# ─────────────────────────────────────────
+# Windows: dławienie energii (EcoQoS)
+# ─────────────────────────────────────────
+class TestPowerThrottling:
+    def test_noop_outside_windows(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert hardware.disable_power_throttling() is False
+
+    def test_sets_execution_speed_state_zero_on_windows(self, monkeypatch):
+        import ctypes
+
+        calls = []
+
+        class _Func:
+            def __init__(self, result):
+                self.result = result
+
+            def __call__(self, *args):
+                calls.append(args)
+                return self.result
+
+        class _Kernel32:
+            GetCurrentProcess = _Func(-1)
+            SetProcessInformation = _Func(1)
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(ctypes, "WinDLL", lambda name, use_last_error=False: _Kernel32(), raising=False)
+        assert hardware.disable_power_throttling() is True
+        handle, info_class, state_ref, size = calls[-1]
+        state = state_ref._obj
+        assert info_class == 4                                          # ProcessPowerThrottling
+        assert (state.Version, state.ControlMask, state.StateMask) == (1, 0x1, 0)
+        assert size == ctypes.sizeof(state) == 12
+
+    def test_failure_never_raises(self, monkeypatch):
+        import ctypes
+
+        def broken(*args, **kwargs):
+            raise OSError("brak kernel32")
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(ctypes, "WinDLL", broken, raising=False)
+        assert hardware.disable_power_throttling() is False
+
+
+# ─────────────────────────────────────────
+# Pakiet src.utils: leniwe importy (preflight bez numpy)
+# ─────────────────────────────────────────
+class TestLazyUtilsPackage:
+    def test_config_and_hardware_import_without_numpy(self):
+        """`import src.utils.config` działa w środowisku bez numpy/pandas (preflight zgłasza braki)."""
+        code = (
+            "import sys; sys.modules['numpy'] = None; sys.modules['pandas'] = None; "
+            "import src.utils.config; import src.utils as u; "
+            "from src.utils import config, fileio, hardware, logger; "
+            "assert u.RUNS_DIR == config.RUNS_DIR and callable(u.get_logger); "
+            "hardware.physical_cores(); hardware.disable_power_throttling(); "
+            "print('ok', 'numpy' in sys.modules and sys.modules['numpy'] is not None)"
+        )
+        out = subprocess.run([sys.executable, "-c", code], cwd=PROJECT_ROOT, capture_output=True, text=True,
+                             encoding="utf-8", timeout=120)
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.split() == ["ok", "False"]
+
+    def test_all_exported_names_importable(self):
+        import src.utils as utils
+        from src.utils.experiment_tracker import ExperimentTracker
+
+        for name in utils.__all__:
+            assert getattr(utils, name) is not None, name
+        assert utils.ExperimentTracker is ExperimentTracker
+        assert {"ExperimentTracker", "RUNS_DIR", "get_logger", "close_training_logger"} <= set(utils.__all__)
+        with pytest.raises(AttributeError):
+            utils.nie_ma_takiej_nazwy  # noqa: B018
 
 
 # ─────────────────────────────────────────

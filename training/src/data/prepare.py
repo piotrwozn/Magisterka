@@ -62,6 +62,7 @@ from src.utils.config import (
     VAL_PARQUET,
     VAL_SIZE,
 )
+from src.utils.fileio import write_text_atomic
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -482,13 +483,6 @@ def make_splits(
 # ─────────────────────────────────────────
 # Krok 3: zapis + raport
 # ─────────────────────────────────────────
-def _write_text_atomic(path: Path, text: str) -> None:
-    """Zapis UTF-8 przez plik tymczasowy + rename (przerwany zapis nie zostawia połowy pliku)."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
-
-
 def save_prepared(
     prepared: PreparedData,
     splits: dict[str, pd.DataFrame],
@@ -513,7 +507,7 @@ def save_prepared(
         log.info(f"Zapisano {name}: {path} ({len(frame):,} wierszy)")
         del frame
 
-    _write_text_atomic(FEATURE_SETS_JSON, json.dumps(
+    write_text_atomic(FEATURE_SETS_JSON, json.dumps(
         {"data_version": DATA_VERSION, "feature_sets": prepared.feature_sets,
          "groups": prepared.groups},
         indent=2, ensure_ascii=False,
@@ -533,7 +527,7 @@ def save_prepared(
         "meta_columns": META_COLS,
         "audit": prepared.audit,
     }
-    _write_text_atomic(
+    write_text_atomic(
         DATA_MANIFEST_JSON, json.dumps(manifest, indent=2, ensure_ascii=False, default=str)
     )
     return paths

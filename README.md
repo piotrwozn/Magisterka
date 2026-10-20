@@ -62,6 +62,7 @@ python scripts/run_all.py --profile smoke   # 5–10 min: test całego pipeline'
 python scripts/run_all.py                # tuning + trening 6 modeli, ewaluacja, porównanie (noc, wznawialne)
 ```
 
+Na noc pod Windows: tryb zasilania „Najlepsza wydajność” i otwarte (niezminimalizowane) okno konsoli.
 Instrukcja na domowy komputer (Windows/Linux, czasy, wznawianie, wyniki, łączenie modeli,
 rozwiązywanie problemów): **[`training/README.md`](training/README.md)**.
 

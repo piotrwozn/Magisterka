@@ -46,6 +46,11 @@ def _is_weighted(weights: Any) -> bool:
     return weights not in (None, "none") and not (isinstance(weights, float) and np.isnan(weights))
 
 
+def _is_tuned(tuned: Any) -> bool:
+    """Run po tuningu Optuną (brak informacji w run_info.json = bez tuningu)."""
+    return isinstance(tuned, (bool, np.bool_)) and bool(tuned)
+
+
 @dataclass
 class Run:
     name: str
@@ -126,6 +131,7 @@ def latest_runs(
     require_done: bool = True,
     include_weighted: bool = False,
     data_version: str | None = "current",
+    require_tuned: bool = True,
 ) -> list[Run]:
     """
     Najnowszy run każdego modelu dla zestawu cech — kandydaci do porównania i łączenia.
@@ -135,8 +141,11 @@ def latest_runs(
         - nieukończone (bez DONE.json)                  → require_done=False,
         - bez pliku modelu (--no-save)                  → require_model=False,
         - z wagami klas (nieskalibrowane prawdopodobieństwa; z notą w logu) → include_weighted=True,
+        - bez tuningu (parametry domyślne, np. tag '<profil>-notune'; z notą w logu)
+                                                        → require_tuned=False,
         - z innej wersji danych niż bieżąca DATA_VERSION → data_version=None (dowolna) albo nazwa.
     tag : tylko runy z tym tagiem (np. nazwa profilu 'standard').
+    Jawna lista runów (`load_run`, `07_compare_runs.py --runs`) nie podlega tym filtrom.
     """
     table = list_runs(runs_dir)
     if table.empty:
@@ -161,6 +170,12 @@ def latest_runs(
             log.info("Pominięto runy z wagami klas (prawdopodobieństwa nieskalibrowane — nie do domyślnego "
                      "łączenia; include_weighted=True je uwzględni): " + ", ".join(weighted["run"]))
             table = table[~table["run"].isin(weighted["run"])]
+    if require_tuned and not table.empty:
+        untuned = table[~table["tuned"].map(_is_tuned)]
+        if not untuned.empty:
+            log.info("Pominięto runy bez tuningu (parametry domyślne; require_tuned=False / "
+                     "--include-untuned je uwzględni): " + ", ".join(untuned["run"]))
+            table = table[~table["run"].isin(untuned["run"])]
     latest = table.groupby("model", sort=False).tail(1)
     return [load_run(r, runs_dir) for r in latest["run"]]
 

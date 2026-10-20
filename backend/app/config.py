@@ -1,6 +1,7 @@
 """Global configuration loaded from .env."""
 from __future__ import annotations
 
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -21,6 +22,11 @@ class Settings(BaseSettings):
     models_dir: Path = BACKEND_ROOT / "models"
     feature_set: str = "triage"                     # training feature set of the served models
     project_root: Path = PROJECT_ROOT
+
+    # Arrival time features (arrival_month / _weekday / _hour_bin) use the local
+    # time of the ED, not the server clock (containers usually run in UTC).
+    # IANA name; on Windows the tz database comes from the `tzdata` package.
+    timezone: str = "Europe/Warsaw"
 
     # Ollama (Layer 0 / 1B / 2)
     ollama_base_url: str = "http://localhost:11434"
@@ -50,3 +56,15 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def ensure_training_on_path() -> Path:
+    """Put training/ on sys.path (src.data / src.features / src.utils.config) and return it.
+
+    In Docker the training sources are on PYTHONPATH already (/opt/sorai/src);
+    a missing directory is not added.
+    """
+    training_root = get_settings().project_root / "training"
+    if training_root.is_dir() and str(training_root) not in sys.path:
+        sys.path.insert(0, str(training_root))
+    return training_root

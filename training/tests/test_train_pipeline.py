@@ -105,8 +105,11 @@ def _check_run(result: dict, model_name: str, paths) -> dict:
     assert done["run_name"] == result["run_name"] and done["model"] == model_name
     assert done["data_version"] == DATA_VERSION
     assert done["data_fingerprint"] == info["data_fingerprint"] and len(done["data_fingerprint"]) == 10
-    for key in ("feature_set", "tag", "profile", "study_name", "best_trial", "actual_device", "finished_at"):
+    for key in ("feature_set", "tag", "profile", "study_name", "best_trial", "actual_device", "finished_at",
+                "custom", "overrides", "tuned", "budget", "device"):
         assert key in done
+    assert done["device"] == info["device"] and done["budget"] == info["budget"]
+    assert done["custom"] is info["custom"] is bool(info["overrides"]) and done["tuned"] is info["tuned"]
     # DONE.json zapisany jako ostatni artefakt runa
     assert all(p.stat().st_mtime <= (run_dir / DONE_JSON).stat().st_mtime for p in run_dir.iterdir())
 
@@ -129,8 +132,11 @@ class TestRunTraining:
         ]
         for name, result in zip(("logreg", "lightgbm"), results, strict=True):
             assert result["model_name"] == name
-            assert result["run_name"].endswith(f"_{name}_triage_standard")   # tag = profil
+            # custom_params → run niestandardowy, nie zwykły run profilu
+            assert result["run_name"].endswith(f"_{name}_triage_standard-custom")
             _check_run(result, name, pipeline)
+            done = _read_json(pipeline.RUNS_DIR / result["run_name"] / DONE_JSON)
+            assert done["custom"] is True and done["overrides"] == ["custom_params"] and done["tuned"] is False
 
         board = pd.read_csv(pipeline.LEADERBOARD_CSV)
         assert len(board) == 2
@@ -140,8 +146,9 @@ class TestRunTraining:
         assert not [c for c in board.columns if c.startswith("test_")]      # leaderboard = tylko VAL
         assert set(board["profile"]) == {"standard"}
 
-        # Runy nadają się do ręcznego łączenia
-        runs = latest_runs("triage", runs_dir=pipeline.RUNS_DIR)
+        # Runy nadają się do ręcznego łączenia (bez tuningu — domyślnie pomijane)
+        assert latest_runs("triage", runs_dir=pipeline.RUNS_DIR) == []
+        runs = latest_runs("triage", runs_dir=pipeline.RUNS_DIR, require_tuned=False)
         assert {r.model for r in runs} == {"logreg", "lightgbm"}
         y_val, probas = aligned_probas(runs, "val")
         assert set(probas) == {"logreg", "lightgbm"}
@@ -184,8 +191,8 @@ class TestRunTraining:
         assert info["n_fit"] + info["n_early_stopping"] == 400
         assert info["n_val"] == 60
         # Runy na próbkach są domyślnie pomijane przy łączeniu modeli
-        assert latest_runs("full", runs_dir=pipeline.RUNS_DIR) == []
-        assert len(latest_runs("full", include_samples=True, runs_dir=pipeline.RUNS_DIR)) == 1
+        assert latest_runs("full", runs_dir=pipeline.RUNS_DIR, require_tuned=False) == []
+        assert len(latest_runs("full", include_samples=True, runs_dir=pipeline.RUNS_DIR, require_tuned=False)) == 1
 
     def test_model_without_early_stopping_fits_whole_train(self, pipeline):
         result = run_training("random_forest", custom_params=FAST["random_forest"], tag="")
@@ -220,6 +227,9 @@ class TestRunTraining:
 
         done = _read_json(run_dir / DONE_JSON)
         assert done["study_name"] == tuning["study_name"] and done["best_trial"] == tuning["best_trial"]
+        assert done["tuned"] is True and done["custom"] is True
+        assert set(done["overrides"]) == {"n_trials", "n_folds", "tune_rows", "custom_params"}
+        assert done["budget"]["n_trials"] == 2 and done["budget"]["n_folds"] == 2
         report = (run_dir / "report.md").read_text(encoding="utf-8")
         assert tuning["study_name"] in report and "| `C` |" in report and "CV logloss" in report
         row = pd.read_csv(pipeline.LEADERBOARD_CSV).iloc[-1]
@@ -254,13 +264,27 @@ class TestRunTraining:
         assert info["n_features"] == info["n_features_before_filter"]
         assert "--filter działa tylko razem z --tune" in caplog.text
 
-    def test_profile_samples_and_tag(self, pipeline):
-        result = run_training("logreg", custom_params=FAST["logreg"], profile="smoke")
-        assert result["run_name"].endswith("_logreg_triage_smoke")
+    def test_profile_samples_and_notune_tag(self, pipeline):
+        result = run_training("logreg", profile="smoke")
+        assert result["run_name"].endswith("_logreg_triage_smoke-notune")      # bez tuningu
         info = _read_json(pipeline.RUNS_DIR / result["run_name"] / "run_info.json")
         assert info["train_sample"] == TUNING_PROFILES["smoke"]["train_sample"]
         assert info["eval_sample"] == TUNING_PROFILES["smoke"]["eval_sample"]
         assert info["budget"]["n_trials"] == TUNING_PROFILES["smoke"]["logreg"]["n_trials"]
+        done = _read_json(pipeline.RUNS_DIR / result["run_name"] / DONE_JSON)
+        assert done["tag"] == "smoke-notune" and done["custom"] is False and done["tuned"] is False
+
+    def test_plain_tuned_profile_run_gets_profile_tag(self, pipeline):
+        result = run_training("logreg", tune=True, profile="smoke")
+        assert result["run_name"].endswith("_logreg_triage_smoke")
+        done = _read_json(pipeline.RUNS_DIR / result["run_name"] / DONE_JSON)
+        assert done["tag"] == "smoke" and done["profile"] == "smoke"
+        assert done["custom"] is False and done["overrides"] == [] and done["tuned"] is True
+        assert done["budget"]["n_trials"] == TUNING_PROFILES["smoke"]["logreg"]["n_trials"]
+        assert done["device"] == {"requested": "cpu", "actual": "cpu", "fallback_reason": None}
+        # Run po tuningu = kandydat do porównania (smoke ma próbki → include_samples)
+        assert [r.name for r in latest_runs("triage", include_samples=True, runs_dir=pipeline.RUNS_DIR)] == \
+            [result["run_name"]]
 
     def test_explicit_args_override_profile(self, pipeline, monkeypatch):
         from src.models import tuning
@@ -311,6 +335,33 @@ def test_resolve_budget_profiles_and_cpu_fallback():
     assert resolve_budget("catboost", "standard")["cpu_fallback_budget"] is True
     with pytest.raises(ValueError, match="Nieznany profil"):
         resolve_budget("logreg", "turbo")
+
+
+def test_default_run_tag_and_custom_overrides():
+    assert train.default_run_tag("standard", tune=True, custom=False) == "standard"
+    assert train.default_run_tag("standard", tune=False, custom=False) == "standard-notune"
+    assert train.default_run_tag("quick", tune=True, custom=True) == "quick-custom"
+    assert train.default_run_tag("quick", tune=False, custom=True) == "quick-custom"
+
+    budget = resolve_budget("logreg", "quick", device="cpu")
+    none = dict.fromkeys(("n_trials", "tune_rows", "n_folds", "timeout_s", "train_sample", "eval_sample"))
+    plain = {"tune_metric": "logloss", "sample_weight_strategy": "none", "do_filter": False,
+             "custom_params": None, "save_model": True}
+
+    def overrides(tune=True, **changes):
+        explicit = {**none, **{k: v for k, v in changes.items() if k in none}}
+        flags = {**plain, **{k: v for k, v in changes.items() if k in plain}}
+        return train._custom_overrides(budget, explicit, tune=tune, **flags)
+
+    assert overrides() == []
+    assert overrides(n_trials=budget["n_trials"]) == []                  # jawnie, ale jak w profilu
+    assert overrides(n_trials=budget["n_trials"] + 1, tune_timeout=None) == ["n_trials"]
+    assert overrides(tune=False, n_trials=99, timeout_s=5) == []         # bez tuningu bez znaczenia
+    assert overrides(tune=False, train_sample=123) == ["train_sample"]
+    assert overrides(tune=False, tune_metric="qwk", do_filter=True) == []
+    assert overrides(tune_metric="qwk", do_filter=True) == ["tune_metric", "do_filter"]
+    assert overrides(tune=False, sample_weight_strategy="balanced", custom_params={"C": 2.0},
+                     save_model=False) == ["sample_weight_strategy", "custom_params", "no_save"]
 
 
 def test_scale_count_params_sqrt():
@@ -388,3 +439,17 @@ def test_train_script_sets_n_jobs_before_import(monkeypatch):
     assert module.apply_n_jobs(["--model", "all", "--n-jobs", "6"]) == 6
     assert os.environ["SOR_AI_N_JOBS"] == "6" and os.environ["OMP_NUM_THREADS"] == "6"
     assert module.apply_n_jobs(["--model", "all"]) is None
+
+
+def test_train_script_disables_power_throttling_first(monkeypatch):
+    """Windows (EcoQoS): 03_train.py wyłącza dławienie energii przed treningiem."""
+    from src.utils import hardware
+
+    spec = importlib.util.spec_from_file_location("train_script", PROJECT_ROOT / "scripts" / "03_train.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    order: list[str] = []
+    monkeypatch.setattr(hardware, "disable_power_throttling", lambda: order.append("qos") or False)
+    monkeypatch.setattr(train, "main", lambda argv: order.append("main") or 0)
+    assert module.run(["--model", "logreg"]) == 0
+    assert order == ["qos", "main"]

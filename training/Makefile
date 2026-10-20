@@ -113,8 +113,12 @@ format:
 	@command -v black > /dev/null && black src/ tests/ scripts/ app/ || echo "Zainstaluj: pip install -r requirements-dev.txt"
 
 # --- Sprzątanie ---
+# Odcisk danych (DONE.json, nazwy badań Optuny) pomija czas i ścieżkę przygotowania, więc ponowne
+# przygotowanie TYCH SAMYCH danych tym samym kodem daje ten sam odcisk — runy i badania pozostają ważne.
 clean:
-	@echo "Usuwam logi, wyniki i przygotowane splity (runy w runs/ i badania Optuny zostają)…"
+	@echo "Usuwam logi (bez logs/optuna), wyniki results/ i przygotowane splity data/processed/esi."
+	@echo "Zostają: runy w runs/ i badania Optuny. Następny trening przygotuje dane od nowa (~3-5 min);"
+	@echo "przy tych samych danych i kodzie odcisk się nie zmieni, więc gotowe runy nadal będą pomijane."
 	rm -rf logs/training/* logs/experiments/* logs/evaluation/* logs/run_all/*
 	rm -rf results/figures/* results/tables/*
 	rm -rf data/processed/esi

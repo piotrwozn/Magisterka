@@ -6,7 +6,9 @@ imputes inside its own Pipeline) — see app.pipeline.feature_engineering.align_
 (use_medians=True is an explicit, non-default fallback). The file serves as:
   - diagnostics: typical patient values (temperature in °C) for sanity checks,
   - vocabulary: the orchestrator reads the cc_* keys as the list of
-    chief-complaint columns of the trained models.
+    chief-complaint columns of the trained models,
+  - unknown sex: training has no missing is_male, so a request without sex gets
+    the train mode — the median of the 0/1 column (feature_engineering.unknown_sex_value).
 
 Regenerate whenever the training data are re-prepared (DATA_VERSION changes):
     python backend/scripts/generate_imputation_medians.py [--feature-set triage]
@@ -65,12 +67,13 @@ def main() -> None:
         "data_version": DATA_VERSION,
         "n_rows": n_rows,
         "n_features": len(medians),
-        "note": "Train-set medians (diagnostics + cc_* vocabulary). Not used for "
-                "imputation by default — missing features stay NaN. Temperature in °C.",
+        "note": "Train-set medians (diagnostics + cc_* vocabulary; is_male = train mode for an "
+                "unknown sex). Not used for imputation otherwise — missing features stay NaN. "
+                "Temperature in °C.",
         "medians": medians,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    args.output.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"Saved {len(medians)} feature medians → {args.output}")
 
 

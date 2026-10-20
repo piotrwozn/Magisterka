@@ -23,6 +23,16 @@ Przebieg dla każdego modelu:
     6. runs/<run>/: model, metryki, predykcje, raport, leaderboard_row.json, NA KOŃCU DONE.json;
        runs/leaderboard.csv przebudowywany ze wszystkich ukończonych runów (tylko metryki VAL).
 
+Tag runa (domyślny, gdy nie podano `tag`):
+    <profil>          — tuning z budżetem profilu, bez nadpisań (zwykły run profilu),
+    <profil>-notune   — bez tuningu (parametry domyślne),
+    <profil>-custom   — z nadpisaniami: n_trials / tune_rows / cv_folds / tune_timeout (z tuningiem)
+                        albo train_sample / eval_sample różne od profilu, wagi klas ≠ 'none',
+                        cel 'qwk', filtr cech, custom_params, bez zapisu modelu.
+    DONE.json i run_info.json zapisują `custom` (+ listę `overrides`), `tuned`, budżet i urządzenie —
+    orkiestrator (run_all.py) nie uznaje runa niestandardowego za ukończony krok profilu,
+    niezależnie od tagu.
+
 `--filter` działa tylko z `--tune` (filtr cech jest częścią konfiguracji tuningu); bez `--tune`
 jest pomijany z ostrzeżeniem.
 
@@ -37,7 +47,6 @@ import argparse
 import json
 import math
 import os
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -46,6 +55,7 @@ import numpy as np
 import pandas as pd
 
 from src.data.dataset import (
+    data_fingerprint,
     early_stopping_split,
     ensure_prepared,
     get_xy,
@@ -58,7 +68,6 @@ from src.data.prepare import VITALS_COMPLETE_COL
 from src.evaluation.metrics import decide, full_evaluation
 from src.models import MODEL_REGISTRY, get_model, resolve_model_name
 from src.models.base import ITERATION_CAP_WARN_FRACTION, compute_class_weights_dict
-from src.models.tuning import data_fingerprint, write_json_atomic
 from src.utils.config import (
     CLASS_NAMES,
     CPU_FALLBACK_BUDGETS,
@@ -70,6 +79,7 @@ from src.utils.config import (
     TUNE_SQRT_SCALED_PARAMS,
     TUNING_PROFILES,
 )
+from src.utils.fileio import replace_with_retry, write_json_atomic, write_text_atomic
 from src.utils.hardware import device_for, hardware_summary
 from src.utils.logger import get_logger
 
@@ -265,21 +275,8 @@ def _json_default(obj):
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    """JSON w ASCII (bezpieczny dla każdego czytelnika, także bez encoding= na Windows), UTF-8."""
-    path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
-
-
-def _replace_with_retry(tmp: Path, target: Path, retries: int = 5) -> None:
-    """os.replace z ponowieniami (Windows: plik docelowy chwilowo otwarty, np. w Excelu)."""
-    for attempt in range(retries):
-        try:
-            os.replace(tmp, target)
-            return
-        except PermissionError:
-            if attempt == retries - 1:
-                tmp.unlink(missing_ok=True)
-                raise
-            time.sleep(0.2 * (attempt + 1))
+    """JSON w ASCII (bezpieczny dla każdego czytelnika, także bez encoding= na Windows), zapis atomowy."""
+    write_text_atomic(path, json.dumps(payload, indent=2, default=_json_default))
 
 
 # ─────────────────────────────────────────
@@ -296,6 +293,7 @@ def _leaderboard_row(info: dict, metrics: dict) -> dict:
         "profile": info.get("profile"),
         "weights": info.get("weights_strategy"),
         "tuned": info.get("tuned"),
+        "custom": info.get("custom"),
         "n_fit": info.get("n_fit"),
         "n_val": info.get("n_val"),
         "train_sample": info.get("train_sample"),
@@ -353,9 +351,55 @@ def rebuild_leaderboard(runs_dir: Path | str | None = None) -> Path:
     rows.sort(key=lambda item: (item[0], str(item[1].get("run_name"))))
     board = pd.DataFrame([row for _, row in rows])
     tmp = csv_path.with_name(f"{csv_path.name}.{os.getpid()}.tmp")
-    board.to_csv(tmp, index=False, encoding="utf-8")
-    _replace_with_retry(tmp, csv_path)
+    try:
+        board.to_csv(tmp, index=False, encoding="utf-8")
+        replace_with_retry(tmp, csv_path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
     return csv_path
+
+
+def _custom_overrides(
+    budget: dict[str, Any],
+    explicit: dict[str, Any],
+    *,
+    tune: bool,
+    tune_metric: str,
+    sample_weight_strategy: str,
+    do_filter: bool,
+    custom_params: dict | None,
+    save_model: bool,
+) -> list[str]:
+    """
+    Nadpisania czyniące run NIESTANDARDOWYM (nie zwykłym runem profilu).
+
+    Jawna wartość budżetu liczy się tylko, gdy różni się od profilu; parametry tuningu
+    (n_trials, tune_rows, n_folds, timeout_s, cel, filtr) — tylko przy tune=True.
+    """
+    tune_only = ("n_trials", "tune_rows", "n_folds", "timeout_s")
+    names = [key for key, value in explicit.items()
+             if value is not None and (tune or key not in tune_only) and value != budget.get(key)]
+    if tune and tune_metric != "logloss":
+        names.append("tune_metric")
+    if sample_weight_strategy != "none":
+        names.append("sample_weight_strategy")
+    if tune and do_filter:
+        names.append("do_filter")
+    if custom_params:
+        names.append("custom_params")
+    if not save_model:
+        names.append("no_save")
+    return names
+
+
+def default_run_tag(profile: str, tune: bool, custom: bool) -> str:
+    """Domyślny tag runa: '<profil>' / '<profil>-notune' / '<profil>-custom' (jak orchestrator.run_tag)."""
+    if custom:
+        return f"{profile}-custom"
+    return profile if tune else f"{profile}-notune"
 
 
 # ─────────────────────────────────────────
@@ -387,8 +431,10 @@ def run_training(
     ----------
     profile : 'smoke' | 'quick' | 'standard' | 'thorough' — budżet tuningu i próbki danych.
     n_trials, tune_rows (0 = cały X_fit), cv_folds, tune_timeout (s), train_sample, eval_sample :
-        None → wartość z profilu; podana wartość ma pierwszeństwo.
-    tag : dopisek do nazwy runa; None → nazwa profilu, '' → bez dopisku.
+        None → wartość z profilu; podana wartość ma pierwszeństwo (inna niż w profilu → run 'custom').
+    tag : dopisek do nazwy runa; None → `default_run_tag`: '<profil>' (tuning z budżetem profilu),
+        '<profil>-notune' (bez tuningu), '<profil>-custom' (nadpisania, zob. `_custom_overrides`);
+        '' → bez dopisku. Flaga `custom` w DONE.json / run_info.json nie zależy od tagu.
     custom_params : parametry modelu (w tuningu stałe dla każdej próby; dostrojone je nadpisują).
     do_filter : filtr cech o zerowej ważności — tylko z tune=True (inaczej pomijany z ostrzeżeniem).
 
@@ -399,22 +445,29 @@ def run_training(
     model_name = resolve_model_name(model_name)
     feature_set = resolve_feature_set(feature_set)
     budget = resolve_budget(model_name, profile)
-    overrides = {"n_trials": n_trials, "tune_rows": tune_rows, "n_folds": cv_folds, "timeout_s": tune_timeout,
-                 "train_sample": train_sample, "eval_sample": eval_sample}
-    for key, value in overrides.items():
+    explicit = {"n_trials": n_trials, "tune_rows": tune_rows, "n_folds": cv_folds, "timeout_s": tune_timeout,
+                "train_sample": train_sample, "eval_sample": eval_sample}
+    if do_filter and not tune:
+        log.warning("--filter działa tylko razem z --tune (filtr jest częścią konfiguracji tuningu) — pomijam")
+        do_filter = False
+    overrides = _custom_overrides(
+        budget, explicit, tune=tune, tune_metric=tune_metric, sample_weight_strategy=sample_weight_strategy,
+        do_filter=do_filter, custom_params=custom_params, save_model=save_model,
+    )
+    custom = bool(overrides)
+    for key, value in explicit.items():
         if value is not None:
             budget[key] = value
     train_sample, eval_sample = budget["train_sample"], budget["eval_sample"]
     if tag is None:
-        tag = profile
+        tag = default_run_tag(profile, tune, custom)
 
     log.info("═" * 64)
-    log.info(f" {model_name} · {feature_set} · profil '{profile}'" + (" · tuning" if tune else ""))
+    log.info(f" {model_name} · {feature_set} · profil '{profile}'" + (" · tuning" if tune else "")
+             + (f" · tag '{tag}'" if tag else ""))
     log.info("═" * 64)
-
-    if do_filter and not tune:
-        log.warning("--filter działa tylko razem z --tune (filtr jest częścią konfiguracji tuningu) — pomijam")
-        do_filter = False
+    if custom:
+        log.info(f"Run niestandardowy (nadpisania: {', '.join(overrides)}) — nie zastąpi zwykłego runa profilu")
 
     # 1. Dane (przed utworzeniem katalogu runa — brak danych nie zostawia pustych katalogów)
     ensure_prepared()
@@ -537,6 +590,8 @@ def run_training(
         "feature_set": feature_set,
         "profile": profile,
         "tag": tag or None,
+        "custom": custom,
+        "overrides": overrides,
         "n_features": len(feature_names),
         "n_features_before_filter": n_features_before,
         "feature_filter": bool(do_filter),
@@ -578,20 +633,24 @@ def run_training(
     _write_json(run_dir / LEADERBOARD_ROW_JSON, _leaderboard_row(info, metrics))
 
     # DONE.json = znacznik ukończenia (orkiestrator) — zapisywany jako OSTATNI artefakt runa
-    write_json_atomic(run_dir / DONE_JSON, json.loads(json.dumps({
+    write_json_atomic(run_dir / DONE_JSON, {
         "run_name": run_name,
         "model": model_name,
         "feature_set": feature_set,
         "tag": tag or None,
         "profile": profile,
-        "tuned": tune,
+        "tuned": bool(tune),
+        "custom": custom,
+        "overrides": overrides,
+        "budget": budget,
         "data_version": DATA_VERSION,
         "data_fingerprint": fingerprint,
         "study_name": (tuning_info or {}).get("study_name"),
         "best_trial": (tuning_info or {}).get("best_trial"),
+        "device": info["device"],
         "actual_device": model.actual_device,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
-    }, default=_json_default)))
+    }, ensure_ascii=True, default=_json_default)
 
     try:
         board = rebuild_leaderboard()
@@ -718,7 +777,9 @@ def _write_report(path: Path, info: dict, metrics: dict, importances: pd.DataFra
         "",
         f"- model: `{info['model']}`, zestaw cech: `{info['feature_set']}` ({info['n_features']} cech"
         + (f", filtr z {info['n_features_before_filter']}" if info.get("feature_filter") else "") + ")",
-        f"- profil: `{info.get('profile')}`, tag: `{info.get('tag')}`",
+        f"- profil: `{info.get('profile')}`, tag: `{info.get('tag')}`"
+        + (f" — **run niestandardowy** (nadpisania: {', '.join(info.get('overrides') or [])})"
+           if info.get("custom") else ""),
         f"- wagi klas: `{info['weights_strategy']}`"
         + (" (" + ", ".join(f"ESI {int(k) + 1}: {float(v):.3g}" for k, v in cw.items()) + ")" if cw else ""),
         f"- dane: `{info['data_version']}` (odcisk `{info.get('data_fingerprint')}`), podział "
@@ -832,7 +893,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Stratyfikowana próbka TRAIN (domyślnie z profilu; standard = całość)")
     parser.add_argument("--eval-sample", type=_positive_int, default=None,
                         help="Próbka VAL i TEST (domyślnie z profilu; nie do raportowania!)")
-    parser.add_argument("--tag", default=None, help="Dopisek do nazwy runa (domyślnie nazwa profilu)")
+    parser.add_argument(
+        "--tag", default=None,
+        help="Dopisek do nazwy runa (domyślnie: <profil> dla tuningu z budżetem profilu, <profil>-notune "
+             "bez --tune, <profil>-custom przy nadpisaniach budżetu/próbek/wag/celu/--filter/--no-save)",
+    )
     parser.add_argument("--mlflow", action="store_true", help="Loguj równolegle do MLflow")
     parser.add_argument("--no-save", action="store_true", help="Nie zapisuj pliku modelu")
     return parser.parse_args(argv)

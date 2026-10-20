@@ -11,7 +11,8 @@ Narzędzia do RĘCZNEGO łączenia modeli na predykcjach zapisanych w runs/.
 
 Protokół: wszystko (wagi, kalibracja, wybór modeli) dobieraj na `val`,
 raportuj na `test` dokładnie tą samą recepturą — raz, na końcu.
-Runy z wagami klas są domyślnie pomijane (prawdopodobieństwa nieskalibrowane).
+Runy z wagami klas (prawdopodobieństwa nieskalibrowane) i runy bez tuningu są domyślnie
+pomijane (`latest_runs(..., include_weighted=True, require_tuned=False)` je uwzględni).
 """
 
 from src.ensemble.runs import (

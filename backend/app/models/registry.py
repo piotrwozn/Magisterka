@@ -4,15 +4,23 @@ ensemble configuration at startup.
 Search order per model (first location with a valid artifact wins):
   1. backend/models/<model>_*.joblib or <model>.joblib   (explicit deployment, newest file)
   2. <repo>/models/<model>_*.joblib or <model>.joblib
-  3. training/runs/<run>/model.joblib                     (runs with run_info.json; runs
-     trained on the full train split (not a --sample / smoke / quick profile sample) first,
-     then finished runs (DONE.json), then the newest)
+  3. training/runs/<run>/model.joblib                     (runs with run_info.json), best
+     run first — sort keys in priority order:
+       a. trained on the full train split (a --sample / smoke / quick profile run is
+          only a fallback, logged as such),
+       b. tuned (Optuna) before untuned ("<profile>-notune"),
+       c. plain profile runs before custom ones ("<profile>-custom": explicit
+          budgets, feature filter, custom params, …),
+       d. unweighted before class-weighted (weighted probabilities are not calibrated),
+       e. finished (DONE.json) before interrupted,
+       f. newest.
 
 Artifacts are written by `BaseTriageModel.save()` (training/src/models/base.py):
 dict with name, model (raw estimator / sklearn Pipeline), feature_names,
 feature_set, classes_, class_names (["ESI1", …, "ESI5"]), label="esi", run_id,
 data_version. Class index 0..4 = ESI 1..5. Legacy artifacts without label="esi"
-are skipped.
+and runs / artifacts of another data version than the training code's
+DATA_VERSION (other feature schema) are skipped with a warning.
 
 Ensemble weights + decision rule: `<models_dir>/ensemble_weights.json`
 (format in app/models/ensemble.py; default = equal weights, argmax).
@@ -26,7 +34,7 @@ from typing import Any, NamedTuple
 
 import joblib
 
-from app.config import get_settings
+from app.config import ensure_training_on_path, get_settings
 from app.models.ensemble import (
     ENSEMBLE_MODELS,
     ENSEMBLE_WEIGHTS_FILE,
@@ -50,11 +58,41 @@ def resolve_feature_set(name: str | None) -> str | None:
     return _FEATURE_SET_ALIASES.get(name, name)
 
 
+def training_data_version() -> str | None:
+    """DATA_VERSION of the training code (src.utils.config) — the feature schema the
+    runtime feature row is built for; None when the training sources are missing."""
+    ensure_training_on_path()
+    try:
+        from src.utils.config import DATA_VERSION
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Cannot import training src.utils.config (%s) — data_version not checked", exc)
+        return None
+    return DATA_VERSION
+
+
+def _is_weighted(info: dict[str, Any]) -> bool:
+    """Run trained with class weights (as training src.ensemble.runs._is_weighted)."""
+    strategy = info.get("weights_strategy") or info.get("sample_weight_strategy")
+    return strategy not in (None, "none") or bool(info.get("class_weights"))
+
+
+def _is_custom(info: dict[str, Any], done: dict[str, Any]) -> bool:
+    """Run with non-profile settings (DONE.json "custom"; older runs: tag / custom params)."""
+    for source in (done, info):
+        if "custom" in source:
+            return bool(source["custom"])
+    return (str(info.get("tag") or "").endswith("-custom")
+            or bool(info.get("custom_params")) or bool(info.get("feature_filter")))
+
+
 class _Candidate(NamedTuple):
     path: Path
     source: str
     train_sample: bool = False     # run trained on a --sample of the train split
     finished: bool = True          # run wrote DONE.json (its last artifact)
+    tuned: bool = False            # hyperparameters tuned with Optuna
+    custom: bool = False           # non-profile settings ("<profile>-custom")
+    weighted: bool = False         # trained with class weights
 
 
 class ModelRegistry:
@@ -63,11 +101,14 @@ class ModelRegistry:
 
     def __init__(self, feature_set: str | None = None) -> None:
         self.models: dict[str, dict[str, Any]] = {}
-        # Optional (imputation_medians.json): diagnostics + chief-complaint vocabulary.
-        # NOT used for imputation by default — see feature_engineering.align_features.
+        # Optional (imputation_medians.json): diagnostics, chief-complaint vocabulary and
+        # the train mode of is_male (unknown sex). NOT used for imputation otherwise —
+        # see feature_engineering.align_features / unknown_sex_value.
         self.medians: dict[str, float] = {}
         self.feature_set: str = resolve_feature_set(feature_set or get_settings().feature_set)
         self.ensemble: EnsembleConfig = EnsembleConfig()
+        # Data version the served artifacts must have (training DATA_VERSION; None = any)
+        self.data_version: str | None = None
 
     # ── Discovery ────────────────────────────────────────────────────
 
@@ -84,33 +125,54 @@ class ModelRegistry:
         return out
 
     def _run_candidates(self, runs_dir: Path) -> dict[str, list[_Candidate]]:
-        """training/runs/*/model.joblib per model — full-data, then finished, then newest runs first."""
+        """training/runs/*/model.joblib per model, best run first (order in the module docstring)."""
         if not runs_dir.is_dir():
             return {}
         found: dict[str, list[_Candidate]] = {}
         for info_path in runs_dir.glob("*/run_info.json"):
-            model_path = info_path.parent / "model.joblib"
+            run_dir = info_path.parent
+            model_path = run_dir / "model.joblib"
             if not model_path.exists():
                 continue
             try:
                 info = json.loads(info_path.read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
-                log.warning("  skipping run %s — unreadable run_info.json (%s)", info_path.parent.name, exc)
+                log.warning("  skipping run %s — unreadable run_info.json (%s)", run_dir.name, exc)
                 continue
             if resolve_feature_set(info.get("feature_set")) != self.feature_set:
                 continue
+            if self.data_version is not None and info.get("data_version") != self.data_version:
+                log.warning("  skipping run %s — data_version %r, the training code expects %r "
+                            "(re-train on the current data)", run_dir.name,
+                            info.get("data_version"), self.data_version)
+                continue
+            done_path = run_dir / "DONE.json"
+            done: dict[str, Any] = {}
+            if done_path.exists():
+                try:
+                    done = json.loads(done_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    done = {}
+                if not isinstance(done, dict):
+                    done = {}
             found.setdefault(info.get("model"), []).append(_Candidate(
                 model_path,
-                f"run {info_path.parent.name}",
+                f"run {run_dir.name}",
                 train_sample=info.get("train_sample") is not None,
-                finished=(info_path.parent / "DONE.json").exists(),
+                finished=done_path.exists(),
+                tuned=bool(done.get("tuned", info.get("tuned", False))),
+                custom=_is_custom(info, done),
+                weighted=_is_weighted(info),
             ))
         for runs in found.values():
-            # Full-data runs before sample runs; within each group finished runs
-            # (DONE.json) before interrupted ones; then newest first (directory names
-            # start with YYYYmmdd_HHMMSS). Stable sorts: the last sort is the primary key.
+            # Stable sorts — the LAST sort is the primary key: full-data > tuned >
+            # plain profile > unweighted > finished (DONE.json) > newest (directory
+            # names start with YYYYmmdd_HHMMSS).
             runs.sort(key=lambda c: c.path.parent.name, reverse=True)
             runs.sort(key=lambda c: not c.finished)
+            runs.sort(key=lambda c: c.weighted)
+            runs.sort(key=lambda c: c.custom)
+            runs.sort(key=lambda c: not c.tuned)
             runs.sort(key=lambda c: c.train_sample)
         return found
 
@@ -147,6 +209,11 @@ class ModelRegistry:
             log.warning("  %-15s ✗ %s uses feature set %r (backend serves %r) — skipping",
                         model_id, path, artifact_fs, self.feature_set)
             return None
+        if self.data_version is not None and data.get("data_version") != self.data_version:
+            log.warning("  %-15s ✗ %s was trained on data_version %r, the training code (feature "
+                        "row schema) expects %r — skipping; re-train it on the current data",
+                        model_id, path, data.get("data_version"), self.data_version)
+            return None
         classes = data.get("classes_")
         return {
             "model": data["model"],
@@ -160,18 +227,27 @@ class ModelRegistry:
             "source": source,
         }
 
-    def load_from_dir(self, models_dir: Path, runs_dir: Path | None = None) -> None:
+    def load_from_dir(
+        self,
+        models_dir: Path,
+        runs_dir: Path | None = None,
+        data_version: str | None = "current",
+    ) -> None:
         """Load the best available artifact of each target model.
 
-        models_dir : deployment dir (backend/models); <models_dir>/../../models
-                     (repo-root models/) is searched next
-        runs_dir   : training runs dir; default <models_dir>/../../training/runs
+        models_dir   : deployment dir (backend/models); <models_dir>/../../models
+                       (repo-root models/) is searched next
+        runs_dir     : training runs dir; default <models_dir>/../../training/runs
+        data_version : runs / artifacts of another data version are skipped;
+                       "current" = training DATA_VERSION, None = no check
         """
         models_dir = Path(models_dir).resolve()
         project_root = models_dir.parent.parent
         runs_dir = Path(runs_dir) if runs_dir is not None else project_root / "training" / "runs"
-        log.info("Loading models (feature set %r) from %s, %s, %s",
-                 self.feature_set, models_dir, project_root / "models", runs_dir)
+        self.data_version = training_data_version() if data_version == "current" else data_version
+        log.info("Loading models (feature set %r, data %s) from %s, %s, %s",
+                 self.feature_set, self.data_version or "any version",
+                 models_dir, project_root / "models", runs_dir)
 
         deploy_dirs = list(dict.fromkeys([models_dir, project_root / "models"]))
         run_candidates = self._run_candidates(runs_dir)
@@ -185,6 +261,7 @@ class ModelRegistry:
                 if bundle is None:
                     continue
                 bundle["train_sample"] = cand.train_sample
+                bundle["tuned"] = cand.tuned
                 self.models[model_id] = bundle
                 log.info("  %-15s ✓ loaded (%d features, data %s) from %s [%s]",
                          model_id, len(bundle["feature_names"]), bundle["data_version"],
@@ -192,6 +269,14 @@ class ModelRegistry:
                 if cand.train_sample:
                     log.warning("  %-15s ! trained on a sample of the train split "
                                 "(smoke/quick run) — not for clinical evaluation", model_id)
+                if cand.source.startswith("run "):
+                    if not cand.tuned:
+                        log.warning("  %-15s ! untuned run (default hyperparameters)", model_id)
+                    if cand.custom:
+                        log.warning("  %-15s ! custom run (non-profile settings)", model_id)
+                    if cand.weighted:
+                        log.warning("  %-15s ! trained with class weights — probabilities "
+                                    "not calibrated", model_id)
                 if not cand.finished:
                     log.warning("  %-15s ! run has no DONE.json (unfinished run or older "
                                 "training version) — prefer a finished run", model_id)
@@ -208,7 +293,8 @@ class ModelRegistry:
         missing = [m for m, w in self.ensemble.weights.items() if w > 0 and m not in self.models]
         if missing and not self.ensemble.is_default:
             log.warning("Weighted models not loaded (weights renormalised over the rest): %s", missing)
-        log.info("Ensemble: %s (rule=%s)", active, self.ensemble.rule)
+        log.info("Ensemble: %s (method=%s, temperature=%s, rule=%s)", active,
+                 self.ensemble.method, self.ensemble.temperature, self.ensemble.rule)
 
     def _load_medians(self, medians_path: Path) -> None:
         """Optional train-set medians (scripts/generate_imputation_medians.py)."""
@@ -222,8 +308,12 @@ class ModelRegistry:
         if medians_fs is not None and medians_fs != self.feature_set:
             log.warning("imputation_medians.json is for feature set %r, backend serves %r",
                         medians_fs, self.feature_set)
-        log.info("Loaded %d train medians (%s) — diagnostics only, not used for imputation",
-                 len(self.medians), medians_fs)
+        medians_dv = payload.get("data_version")
+        if self.data_version is not None and medians_dv != self.data_version:
+            log.warning("imputation_medians.json is from data_version %r, the training code expects "
+                        "%r — re-run scripts/generate_imputation_medians.py", medians_dv, self.data_version)
+        log.info("Loaded %d train medians (%s) — diagnostics, cc_* vocabulary and the is_male mode "
+                 "for an unknown sex; not used for imputation", len(self.medians), medians_fs)
 
     @property
     def loaded_ids(self) -> list[str]:

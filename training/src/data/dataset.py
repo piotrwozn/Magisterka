@@ -9,9 +9,12 @@ Użycie:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -41,6 +44,12 @@ FEATURE_SET_ALIASES = {"triage_only": "triage", "top": "triage"}
 # (ustawiane przez orkiestrator: podprocesy treningu nie mogą równolegle przygotowywać danych)
 NO_AUTO_PREPARE_ENV = "SOR_AI_NO_AUTO_PREPARE"
 SPLIT_STRATEGIES = ("random", "site")
+
+# Odcisk danych: klucze manifestu zmienne między identycznymi przygotowaniami (czas, ścieżka
+# pliku źródłowego) + klucze najwyższego poziomu wyglądające na znacznik czasu
+VOLATILE_MANIFEST_KEYS = frozenset({"created", "source"})
+_TIMESTAMP_KEY = re.compile(r"(created|timestamp|_at$|_ts$|_time$|_date$|^time$|^date$)")
+NO_DATA_FINGERPRINT = "brak-danych"
 
 
 def resolve_feature_set(name: str) -> str:
@@ -110,6 +119,34 @@ def ensure_prepared(strategy: str | None = None) -> None:
 
 def manifest() -> dict:
     return json.loads(DATA_MANIFEST_JSON.read_text(encoding="utf-8"))
+
+
+def data_fingerprint(manifest: dict | str | Path | None = None) -> str:
+    """
+    Odcisk przygotowanych danych: sha1[:10] manifestu BEZ kluczy zmiennych przy każdym
+    przygotowaniu (`created`, `source` i inne znaczniki czasu najwyższego poziomu).
+
+    Ponowne przygotowanie tych samych danych tym samym kodem daje ten sam odcisk, więc
+    ukończone runy (DONE.json) i badania Optuny pozostają ważne. Zmiana danych lub logiki
+    (liczby wierszy, audyt, cechy, podział, DATA_VERSION) zmienia odcisk.
+
+    manifest : dict manifestu, ścieżka do manifest.json albo None (bieżący DATA_MANIFEST_JSON).
+    Brak / uszkodzony plik → 'brak-danych'.
+    """
+    if isinstance(manifest, dict):
+        meta = manifest
+    else:
+        path = Path(manifest) if manifest is not None else Path(DATA_MANIFEST_JSON)
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return NO_DATA_FINGERPRINT
+        if not isinstance(meta, dict):
+            return NO_DATA_FINGERPRINT
+    stable = {k: v for k, v in meta.items()
+              if k not in VOLATILE_MANIFEST_KEYS and not _TIMESTAMP_KEY.search(str(k).lower())}
+    payload = json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
 
 
 @lru_cache(maxsize=1)

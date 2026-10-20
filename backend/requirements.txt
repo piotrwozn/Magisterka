@@ -3,6 +3,9 @@ uvicorn[standard]>=0.30.0
 pydantic>=2.8.0
 pydantic-settings>=2.5.0
 python-dotenv>=1.0.0
+# IANA time zones for zoneinfo (settings.timezone, default Europe/Warsaw) —
+# Windows and slim containers have no system tz database
+tzdata>=2024.1
 
 # ML inference — the SAME versions as training (training/requirements.txt);
 # pickled estimators are version-sensitive (scikit-learn warns or breaks across

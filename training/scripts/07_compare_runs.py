@@ -13,7 +13,8 @@ Zbiór testowy nie jest tu pokazywany: wybór modeli, wag i progów odbywa się 
 oceniasz raz, na końcu, dla wybranej receptury (src.ensemble).
 
 Domyślnie pomijane: runy na próbkach (--include-samples), z wagami klas (--include-weighted),
-nieukończone (bez DONE.json), bez pliku modelu, z innej wersji danych.
+bez tuningu (--include-untuned), nieukończone (bez DONE.json), bez pliku modelu, z innej wersji
+danych. Jawna lista --runs nie jest filtrowana.
 
 Użycie:
     python scripts/07_compare_runs.py                         # zestaw 'triage'
@@ -21,6 +22,7 @@ Użycie:
     python scripts/07_compare_runs.py --tag standard          # tylko runy z profilu 'standard'
     python scripts/07_compare_runs.py --runs RUN_A RUN_B ...  # konkretne runy (np. z run_all.py)
     python scripts/07_compare_runs.py --include-samples       # także runy testowe na próbkach
+    python scripts/07_compare_runs.py --include-untuned       # także runy bez tuningu (-notune)
 """
 
 from __future__ import annotations
@@ -105,6 +107,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Uwzględnij runy trenowane na próbkach (--sample)")
     parser.add_argument("--include-weighted", action="store_true",
                         help="Uwzględnij runy z wagami klas (nieskalibrowane prawdopodobieństwa)")
+    parser.add_argument("--include-untuned", action="store_true",
+                        help="Uwzględnij runy bez tuningu (parametry domyślne, tag <profil>-notune)")
     parser.add_argument("--out", type=Path, default=None, help="Ścieżka raportu .md")
     return parser.parse_args(argv)
 
@@ -128,10 +132,11 @@ def main(argv: list[str] | None = None) -> int:
             log.warning(f"Wskazane runy mają też inne zestawy cech: {other}")
     else:
         runs = latest_runs(feature_set, include_samples=args.include_samples, tag=args.tag,
-                           include_weighted=args.include_weighted)
+                           include_weighted=args.include_weighted, require_tuned=not args.include_untuned)
     if not runs:
-        log.error("Brak ukończonych runów. Najpierw: python scripts/run_all.py "
-                  "(albo python scripts/03_train.py --model all)")
+        log.error("Brak ukończonych runów spełniających filtry (próbki, wagi klas, bez tuningu — zob. "
+                  "--include-samples / --include-weighted / --include-untuned). Najpierw: "
+                  "python scripts/run_all.py (albo python scripts/03_train.py --model all --tune)")
         return 1
     log.info("Runy: " + ", ".join(r.name for r in runs))
 
