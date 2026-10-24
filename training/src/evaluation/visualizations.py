@@ -9,6 +9,7 @@ Wykresy:
     5. Training history (loss/error per iteration)
     6. Reliability diagram per poziom ESI + top-label, z liczebnością binów (plot_reliability)
     7. Wykres leśny metryk z przedziałami ufności (plot_metric_ci)
+    8. Kompromis undertriage–QWK reguł decyzyjnych (plot_tradeoff; dane: decision.tradeoff_curve)
 
 Kolory poziomów ESI = kolory TOPSOR (ESI 1 czerwony, …, ESI 5 niebieski),
 przypisane po indeksie klasy 0–4 — nie po nazwie.
@@ -529,4 +530,89 @@ def plot_metric_ci(
         fig.legend(handles, names, loc="upper right", fontsize=9, frameon=False, ncol=len(groups))
     fig.suptitle(title or "Metryki z 95% przedziałami ufności", fontsize=12, color=_INK)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return _save_or_show(fig, path, show)
+
+
+# ─────────────────────────────────────────
+# Kompromis undertriage–QWK reguł decyzyjnych (C6)
+# ─────────────────────────────────────────
+# metoda → (podpis, kolor, styl linii, znacznik)
+_TRADEOFF_STYLES: dict[str, tuple[str, str, str, str]] = {
+    "cost": ("reguła kosztowa, mnożnik k", "#546E7A", "-", "o"),
+    "target": ("B1: EL + progi (cel undertriage)", "#00897B", "-", "D"),
+    "target_safety": ("B1 + siatka bezpieczeństwa (B2)", "#004D40", "--", "d"),
+    "bayes_target": ("B4: decyzja Bayesa, λ do celu", "#8E24AA", "-", "s"),
+}
+
+
+def plot_tradeoff(
+    df: pd.DataFrame,
+    path: Path | str | None = None,
+    *,
+    chosen: dict | None = None,
+    title: str | None = None,
+    show: bool = False,
+):
+    """
+    Wykres kompromisu: undertriage ESI1–2 → ESI3–5 [%] (oś X) vs QWK (oś Y).
+
+    df : wynik `src.evaluation.decision.tradeoff_curve` (kolumny method, target, param,
+         undertriage, qwk). Linie: reguła kosztowa (punkty podpisane k), reguły z celem T;
+         argmax jako pojedynczy punkt.
+    chosen : wybrany punkt pracy, np. {"method": "target_safety", "target": 0.15} — wyróżniony
+             gwiazdką (brak takiego wiersza → ostrzeżenie, wykres bez wyróżnienia).
+    """
+    missing = {"method", "undertriage", "qwk"} - set(df.columns)
+    if missing:
+        raise ValueError(f"Brak kolumn {sorted(missing)} w tabeli kompromisu")
+    data = df.copy()
+    for col in ("target", "param"):
+        if col not in data.columns:
+            data[col] = np.nan
+    data = data.dropna(subset=["undertriage", "qwk"])
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.4))
+    for method, (label, color, linestyle, marker) in _TRADEOFF_STYLES.items():
+        part = data[data["method"] == method].sort_values("undertriage")
+        if part.empty:
+            continue
+        # Siatka bezpieczeństwa zmienia mało decyzji — krzywa B1+B2 leży prawie na B1: puste znaczniki
+        ax.plot(part["undertriage"] * 100, part["qwk"], linestyle=linestyle, marker=marker, color=color,
+                markeredgecolor=_INK if method != "target_safety" else color, markeredgewidth=0.8,
+                markerfacecolor="white" if method == "target_safety" else color,
+                markersize=5, linewidth=1.8 if method != "target_safety" else 1.2, label=label)
+        if method == "cost":
+            for _, row in part.iterrows():
+                ax.annotate(f"k={row['param']:g}", (row["undertriage"] * 100, row["qwk"]),
+                            textcoords="offset points", xytext=(4, -11), fontsize=7.5, color=color)
+    argmax = data[data["method"] == "argmax"]
+    if not argmax.empty:
+        row = argmax.iloc[0]
+        ax.plot(row["undertriage"] * 100, row["qwk"], linestyle="none", marker="o", markersize=9,
+                markerfacecolor="white", markeredgecolor=_INK, markeredgewidth=1.5, zorder=5, label="argmax")
+
+    if chosen:
+        sel = data["method"] == chosen.get("method")
+        if chosen.get("target") is not None:
+            sel &= np.isclose(data["target"].astype(float), float(chosen["target"]))
+        if sel.any():
+            row = data[sel].iloc[0]
+            ax.plot(row["undertriage"] * 100, row["qwk"], linestyle="none", marker="*", markersize=17,
+                    color="#D32F2F", markeredgecolor=_INK, markeredgewidth=0.8, zorder=6,
+                    label="wybrany punkt pracy")
+            ax.annotate(f"undertriage {row['undertriage']:.1%}, QWK {row['qwk']:.3f}",
+                        (row["undertriage"] * 100, row["qwk"]), textcoords="offset points",
+                        xytext=(10, -16), fontsize=8.5, color=_INK)
+        else:
+            log.warning(f"plot_tradeoff: brak wiersza dla wybranego punktu pracy {chosen}")
+
+    ax.set_xlabel("undertriage ESI1–2 → ESI3–5 [%] (mniej = bezpieczniej)", fontsize=10)
+    ax.set_ylabel("QWK", fontsize=10)
+    ax.grid(alpha=0.35, color=_GRID, linewidth=0.6)
+    ax.set_xlim(left=0)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.legend(fontsize=8.5, frameon=False, loc="lower right")
+    ax.set_title(title or "Kompromis undertriage – QWK reguł decyzyjnych", fontsize=12, color=_INK)
+    fig.tight_layout()
     return _save_or_show(fig, path, show)

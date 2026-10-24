@@ -1232,3 +1232,170 @@ def test_run_all_smoke_end_to_end(tmp_path, make_raw):
 
     # Raport z audytu syntetycznych danych nie nadpisał wersjonowanego DATA_AUDIT.md
     assert (audit.read_bytes() if audit.exists() else None) == audit_before
+
+
+# ─────────────────────────────────────────
+# Etap analyses (--stage analyses | all): scripts/09–11 po treningu
+# ─────────────────────────────────────────
+ANALYSIS_SCRIPTS = {"09_seed_refits.py": "seeds", "10_leave_site_out.py": "site_out",
+                    "11_learning_curve.py": "learning_curve"}
+
+
+class AnalysisFakeRunner(FakeRunner):
+    """FakeRunner + udawane skrypty analiz: plan.json, pliki jednostek i results.json jak prawdziwe."""
+
+    def __init__(self, analysis_rc: dict[str, int] | None = None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.analysis_rc = analysis_rc or {}      # nazwa analizy → kod wyjścia
+
+    def __call__(self, cmd, env, log_path, prefix) -> int:
+        name = ANALYSIS_SCRIPTS.get(Path(cmd[3]).name)
+        if name is None:
+            return super().__call__(cmd, env, log_path, prefix)
+        from src.analysis.common import UnitStore, analysis_dir
+
+        with self._lock:
+            self.calls.append(("analysis", list(cmd), dict(env)))
+        args = dict(zip(cmd[4::2], cmd[5::2]))
+        store = UnitStore(analysis_dir(name, args["--feature-set"], args["--tag"]))
+        units = [{"unit": f"{m}/u", "source_run": "src"} for m in args["--models"].split(",")]
+        store.write_plan({"units": units})
+        rc = self.analysis_rc.get(name, 0)
+        done = units if rc == 0 else units[:1]
+        for u in done:
+            store.save(u["unit"], {"source_run": "src"})
+        store.write_results({"complete": rc == 0, "failures": [] if rc == 0 else [{"unit": "x"}],
+                             "created": "2026-10-24T12:00:00"})
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("ok\n", encoding="utf-8")
+        return rc
+
+    def analyses(self) -> list[tuple[str, list[str]]]:
+        return [(ANALYSIS_SCRIPTS[Path(cmd[3]).name], cmd) for kind, cmd, _ in self.calls if kind == "analysis"]
+
+
+def _arg(cmd: list[str], name: str) -> str:
+    return cmd[cmd.index(name) + 1]
+
+
+class TestAnalysesStage:
+    def test_cli_stage_default_train(self):
+        assert orchestrator.options_from_args([]).stage == "train"
+        assert orchestrator.options_from_args(["--stage", "all"]).stage == "all"
+        with pytest.raises(SystemExit):
+            orchestrator.options_from_args(["--stage", "wszystko"])
+
+    def test_pure_helpers(self):
+        from src.analysis import learning_curve, site_out
+
+        assert orchestrator.ANALYSIS_STEPS["site_out"][1] == site_out.DEFAULT_MODELS
+        assert orchestrator.ANALYSIS_STEPS["learning_curve"][1] == learning_curve.DEFAULT_MODELS
+        assert orchestrator.analysis_models("seeds", ["xgboost", "logreg"]) == ["logreg", "xgboost"]
+        assert orchestrator.analysis_models("learning_curve", ["logreg", "xgboost"]) == ["xgboost"]
+        assert orchestrator.analysis_models("learning_curve", ["logreg"]) == []
+        cmd = orchestrator.analysis_command("site_out", "triage", "standard", ["lightgbm", "logreg"])
+        assert Path(cmd[3]).name == "10_leave_site_out.py"
+        assert cmd[4:] == ["--feature-set", "triage", "--tag", "standard", "--models", "lightgbm,logreg"]
+        assert orchestrator.analysis_eta_s("seeds", {"lightgbm": 100.0}) == pytest.approx(3 * 100 + 30)
+
+    def test_no_main_runs_is_a_clear_error(self, workspace, caplog):
+        runner = AnalysisFakeRunner()
+        orch = Orchestrator(make_opts(stage="analyses"), runner=runner)
+        assert orch.run() == 2
+        assert runner.calls == []
+        assert "Najpierw trening: python scripts/run_all.py --profile smoke" in caplog.text
+        status = json.loads((orch.log_dir / "status.json").read_text(encoding="utf-8"))
+        assert status["state"] == "finished" and status["exit_code"] == 2
+
+    def test_analyses_after_training_then_resume(self, workspace):
+        assert Orchestrator(make_opts(), runner=FakeRunner()).run() == 0          # logreg, lightgbm, xgboost
+        runner = AnalysisFakeRunner()
+        orch = Orchestrator(make_opts(stage="analyses"), runner=runner)
+        assert orch.run() == 0
+        assert runner.kinds("train") == [] and runner.kinds("eval") == [] and runner.kinds("compare") == []
+        calls = runner.analyses()
+        assert [name for name, _ in calls] == ["seeds", "site_out", "learning_curve"]
+        assert {_arg(cmd, "--tag") for _, cmd in calls} == {"smoke"}
+        assert [_arg(cmd, "--models") for _, cmd in calls] == ["logreg,lightgbm,xgboost", "logreg,lightgbm,xgboost",
+                                                                 "lightgbm,xgboost"]
+        assert all(t.status == DONE and t.units_done == t.units_total for t in orch.analysis_tasks)
+        status = json.loads((orch.log_dir / "status.json").read_text(encoding="utf-8"))
+        assert [a["name"] for a in status["analyses"]] == ["seeds", "site_out", "learning_curve"]
+        assert status["options"]["stage"] == "analyses" and status["tasks"] == []
+        assert orch.summaries == []                                                 # bez podsumowania treningu
+
+        text = status_report(make_opts())
+        lines = {line.split()[1]: line for line in text.splitlines() if line.startswith("triage ")}
+        assert "3/3 jednostek — gotowe" in lines["seeds"] and "2/2 jednostek — gotowe" in lines["learning_curve"]
+
+        # Ponownie: skrypty uruchamiane znowu (same pomijają gotowe jednostki), treningu nadal brak
+        runner2 = AnalysisFakeRunner()
+        assert Orchestrator(make_opts(stage="analyses"), runner=runner2).run() == 0
+        assert len(runner2.analyses()) == 3 and runner2.kinds("train") == []
+
+    def test_only_models_with_main_run_and_missing_steps(self, workspace, caplog):
+        assert Orchestrator(make_opts(models=["logreg"]), runner=FakeRunner()).run() == 0
+        runner = AnalysisFakeRunner()
+        orch = Orchestrator(make_opts(stage="analyses"), runner=runner)
+        assert orch.run() == 0
+        assert [(n, _arg(c, "--models")) for n, c in runner.analyses()] == [("seeds", "logreg"), ("site_out", "logreg")]
+        lc = next(t for t in orch.analysis_tasks if t.name == "learning_curve")
+        assert lc.status == NOT_STARTED and lc.models == [] and "brak modeli" in lc.note
+        assert "brak ukończonych runów 'smoke'" in caplog.text and "lightgbm, xgboost" in caplog.text
+
+    def test_untuned_runs_do_not_count(self, workspace):
+        assert Orchestrator(make_opts(models=["logreg"], tune=False), runner=FakeRunner()).run() == 0
+        runner = AnalysisFakeRunner()
+        assert Orchestrator(make_opts(stage="analyses"), runner=runner).run() == 2        # run '-notune' to nie źródło
+        assert Orchestrator(make_opts(stage="analyses", tune=False), runner=runner).run() == 2
+        assert runner.calls == []
+
+    def test_stage_all_trains_then_analyses(self, workspace):
+        runner = AnalysisFakeRunner()
+        orch = Orchestrator(make_opts(stage="all", models=["logreg", "lightgbm"]), runner=runner)
+        assert orch.run() == 0
+        kinds = [k for k, _, _ in runner.calls]
+        assert kinds.index("analysis") > max(i for i, k in enumerate(kinds) if k in ("train", "eval", "compare"))
+        assert len(runner.kinds("train")) == 2 and len(runner.analyses()) == 3
+        assert len(orch.summaries) == 1                                             # podsumowanie treningu zostaje
+
+    def test_failed_analysis_continues_and_fail_fast_stops(self, workspace):
+        assert Orchestrator(make_opts(), runner=FakeRunner()).run() == 0
+        runner = AnalysisFakeRunner(analysis_rc={"seeds": 1})
+        orch = Orchestrator(make_opts(stage="analyses"), runner=runner)
+        assert orch.run() == 1
+        states = {t.name: t.status for t in orch.analysis_tasks}
+        assert states == {"seeds": FAILED, "site_out": DONE, "learning_curve": DONE}
+        seeds_task = orch.analysis_tasks[0]
+        assert (seeds_task.units_done, seeds_task.units_total) == (1, 3)
+
+        runner = AnalysisFakeRunner(analysis_rc={"seeds": 1})
+        orch = Orchestrator(make_opts(stage="analyses", fail_fast=True), runner=runner)
+        assert orch.run() == 1
+        assert [n for n, _ in runner.analyses()] == ["seeds"]
+        assert {t.name: t.status for t in orch.analysis_tasks}["site_out"] == NOT_STARTED
+
+    def test_interrupted_analysis_stops_next(self, workspace):
+        assert Orchestrator(make_opts(models=["lightgbm"]), runner=FakeRunner()).run() == 0
+        runner = AnalysisFakeRunner(analysis_rc={"site_out": 130})
+        orch = Orchestrator(make_opts(stage="analyses"), runner=runner)
+        assert orch.run() == 130
+        assert {t.name: t.status for t in orch.analysis_tasks} == {"seeds": DONE, "site_out": INTERRUPTED,
+                                                                    "learning_curve": NOT_STARTED}
+
+    def test_dry_run_prints_commands(self, workspace, caplog):
+        assert Orchestrator(make_opts(models=["lightgbm"]), runner=FakeRunner()).run() == 0
+        runner = AnalysisFakeRunner()
+        assert Orchestrator(make_opts(stage="analyses", dry_run=True), runner=runner).run() == 0
+        assert runner.calls == []
+        assert "09_seed_refits.py" in caplog.text and "11_learning_curve.py" in caplog.text
+        # --stage all na sucho: analizy zaplanowane dla wszystkich modeli (runy powstaną w treningu)
+        runner = AnalysisFakeRunner()
+        assert Orchestrator(make_opts(stage="all", dry_run=True, models=["xgboost"]), runner=runner).run() == 0
+        assert runner.calls == []
+
+    def test_status_shows_not_started_analyses(self, workspace):
+        text = status_report(make_opts(models=["lightgbm"]))
+        assert "Analizy (tag 'smoke'" in text
+        lines = {line.split()[1]: line for line in text.splitlines() if line.startswith("triage ")}
+        assert "nierozpoczęta" in lines["seeds"] and "nierozpoczęta" in lines["site_out"]

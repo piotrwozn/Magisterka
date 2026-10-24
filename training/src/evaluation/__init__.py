@@ -1,6 +1,8 @@
 """
 Ewaluacja modeli ESI: metryki, reguły decyzyjne, CV, wizualizacje, UQ, statystyka
 (przedziały ufności bootstrap, porównania parami, kalibracja — `src.evaluation.statistics`).
+Reguły z celem undertriage, siatka bezpieczeństwa, decyzja Bayesa z λ i krzywa kompromisu —
+`src.evaluation.decision` (spec reguły w formacie backendu: `decide_rule`).
 
 Metryki importowane od razu (lekkie, używa ich trening i src.ensemble).
 CV, wizualizacje (matplotlib/seaborn), UQ i statystyka ładowane leniwie przy pierwszym
@@ -52,6 +54,22 @@ _LAZY_EXPORTS: dict[str, str] = {
     "ece_top_label": "src.evaluation.statistics",
     "paired_bootstrap_diff": "src.evaluation.statistics",
     "reliability_table": "src.evaluation.statistics",
+    "plot_tradeoff": "src.evaluation.visualizations",
+    "BayesRule": "src.evaluation.decision",
+    "TargetRule": "src.evaluation.decision",
+    "apply_cutpoints": "src.evaluation.decision",
+    "apply_safety_net": "src.evaluation.decision",
+    "bayes_cost_matrix": "src.evaluation.decision",
+    "crossfit_rule": "src.evaluation.decision",
+    "decide_rule": "src.evaluation.decision",
+    "expected_level": "src.evaluation.decision",
+    "fit_bayes_rule": "src.evaluation.decision",
+    "fit_safety_net": "src.evaluation.decision",
+    "fit_target_rule": "src.evaluation.decision",
+    "normalize_spec": "src.evaluation.decision",
+    "population_mask": "src.evaluation.decision",
+    "rule_from_dict": "src.evaluation.decision",
+    "tradeoff_curve": "src.evaluation.decision",
 }
 
 
@@ -69,7 +87,12 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
+    "BayesRule",
     "ESI_COLORS",
+    "TargetRule",
+    "apply_cutpoints",
+    "apply_safety_net",
+    "bayes_cost_matrix",
     "bootstrap_ci",
     "bootstrap_samples",
     "brier_score",
@@ -80,15 +103,22 @@ __all__ = [
     "cost_matrix",
     "critical_miss_rate",
     "cross_validate_model",
+    "crossfit_rule",
     "crossfit_temperature",
     "decide",
+    "decide_rule",
     "ece_classwise",
     "ece_top_label",
     "ensemble_report",
     "expected_cost",
+    "expected_level",
+    "fit_bayes_rule",
+    "fit_safety_net",
+    "fit_target_rule",
     "full_evaluation",
     "linear_weighted_kappa",
     "mistriage_rates",
+    "normalize_spec",
     "overtriage_rate",
     "paired_bootstrap_diff",
     "plot_calibration",
@@ -97,10 +127,14 @@ __all__ = [
     "plot_metric_ci",
     "plot_reliability",
     "plot_roc_curves",
+    "plot_tradeoff",
     "plot_training_history",
+    "population_mask",
     "quadratic_weighted_kappa",
     "reliability_table",
+    "rule_from_dict",
     "save_cv_results",
     "summarize_cv",
+    "tradeoff_curve",
     "undertriage_rate",
 ]

@@ -202,6 +202,30 @@ UNDERTRIAGE_COST_MULTIPLIER: float = 3.0
 OVERTRIAGE_COST_MULTIPLIER: float = 1.0
 
 # ─────────────────────────────────────────
+# REGUŁY DECYZYJNE (src/evaluation/decision.py)
+# ─────────────────────────────────────────
+# Reguła "undertriage ≤ T" (B1): oczekiwany poziom EL = Σ k·p_k dzielony 4 progami; próg ESI2/ESI3
+# wynika z celu T, pozostałe trzy maksymalizują QWK. Parametry dobierane WYŁĄCZNIE na val —
+# domyślnie w podgrupie vitals_complete==1 (populacja TOPSOR; dobór na całym val przestrzeliwuje
+# w vc o 2–4 pp) — i stosowane bez zmian na teście. Progi zależą od rozkładu ESI: w Polsce
+# trzeba je dobrać na nowo na danych lokalnych.
+DECISION_TARGET_UNDERTRIAGE: float = 0.15
+DECISION_FIT_POPULATION: str = "vc"           # "vc" (vitals_complete == 1) | "all"
+DECISION_GUARANTEE_ALPHA: float = 0.05        # B6: jednostronna górna granica Clopper–Pearsona ≤ T
+DECISION_CUTPOINT_GRID: int = 1000            # kandydaci na progi = tyle kwantyli EL
+# Siatka bezpieczeństwa (B2): P(ESI1) + P(ESI2) ≥ q → najwyżej ESI3. q = NAJWIĘKSZE spełniające
+# cel critical miss (ESI1 → ESI4–5) na danych dopasowania; q < SAFETY_NET_MIN_Q nie jest
+# rozważane (zbyt wielu pacjentów spychanych do ESI3).
+SAFETY_NET_MAX_CRITICAL_MISS: float = 0.005
+SAFETY_NET_MIN_Q: float = 0.05
+# q dobierane na WSZYSTKICH wierszach val ("all"), nawet gdy progi na vc: w vc jest tylko ~60 pacjentów
+# ESI1 (pomiar: dobór na połowie vc czasem nie widzi żadnego pominięcia i siatka znika)
+SAFETY_NET_FIT_POPULATION: str = "all"        # "all" | "mask" (te same wiersze co progi)
+# Wykres kompromisu undertriage–QWK (C6): cele T reguł i mnożniki k reguły kosztowej
+TRADEOFF_TARGETS: tuple[float, ...] = (0.05, 0.075, 0.10, 0.125, 0.15, 0.175, 0.20, 0.25, 0.30, 0.40)
+TRADEOFF_COST_MULTIPLIERS: tuple[float, ...] = (1.0, 1.5, 2.0, 3.0, 5.0, 10.0)
+
+# ─────────────────────────────────────────
 # PODZIAŁ DANYCH
 # ─────────────────────────────────────────
 # Yale EMMLC nie ma roku ani identyfikatora pacjenta — podział chronologiczny

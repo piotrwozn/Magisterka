@@ -11,10 +11,14 @@ Użycie (z katalogu training/, w aktywnym venv):
     python scripts/run_all.py --profile thorough      # dłuższy tuning
     python scripts/run_all.py --feature-set full      # z historią pacjenta (osobna noc, ≥ 32 GB RAM)
     python scripts/run_all.py --models lightgbm,xgboost --dry-run
+    python scripts/run_all.py --stage analyses        # po treningu: analizy do pracy (seedy, leave-site-out,
+                                                      # krzywa uczenia — scripts/09–11, wznawialne)
+    python scripts/run_all.py --stage all             # trening, potem analizy (jedna noc + kilka godzin)
 
 Opcje: --profile {smoke,quick,standard,thorough}, --feature-set triage|full|triage,full,
 --models all|lista, --split random|site, --no-tune, --lanes auto|1|2, --force, --fail-fast,
---dry-run, --status, --skip-preflight, --no-keep-awake. Szczegóły: src/pipeline/orchestrator.py.
+--dry-run, --status, --skip-preflight, --no-keep-awake, --stage train|analyses|all (domyślnie train).
+Szczegóły: src/pipeline/orchestrator.py. Wyniki analiz: runs/analyses/<analiza>__<cechy>__<profil>/.
 
 Kody wyjścia: 0 = wszystko gotowe, 1 = któryś krok nieudany, 2 = preflight / dane, 130 = Ctrl+C.
 """

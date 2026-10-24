@@ -12,7 +12,9 @@ manual blend):
       "weights": {"xgboost": 0.35, "lightgbm": 0.25, "catboost": 0.40},
       "method": "mean",
       "temperature": 1.12,
-      "rule": "cost"
+      "rule": "target",
+      "cutpoints": [1.03, 1.95, 2.35, 3.02],
+      "safety_q": 0.13
     }
 
     weights     : model → weight ≥ 0 (normalised to sum 1 over the loaded models).
@@ -26,11 +28,25 @@ manual blend):
                   `src.ensemble.apply_temperature`), fitted on val with
                   `fit_temperature(blend(P_val, ...), y_val)`. Applied before the
                   decision rule; per-model predictions are not rescaled.
-    rule        : "argmax" (most probable class, default) or "cost" (Bayes decision
-                  with the training cost matrix: undertriage costs 3× more than
-                  overtriage, cost[t, p] = (p − t)² × 3 if p > t else (p − t)²).
+    rule        : decision rule, exactly training `src.evaluation.decision.decide_rule`:
+                  "argmax"       — most probable class (default);
+                  "cost"         — Bayes decision with the training cost matrix:
+                                   undertriage costs 3× more than overtriage,
+                                   cost[t, p] = (p − t)² × 3 if p > t else (p − t)²;
+                  "target"       — expected level EL = Σ k·p_k (k = 0…4) cut by the 4
+                                   "cutpoints" (class = number of cutpoints strictly
+                                   exceeded; the ESI2/ESI3 cutpoint was fitted on val to an
+                                   undertriage target); optional safety net "safety_q":
+                                   P(ESI1) + P(ESI2) ≥ q → at most ESI 3;
+                  "bayes_target" — Bayes decision with cost (p − t)² + "lam" ×
+                                   1[t ∈ ESI 1–2 and p ∈ ESI 3–5], λ fitted on val to the
+                                   undertriage target.
                   The rule is applied to the blended probabilities and to every
-                  per-model prediction.
+                  per-model prediction (its parameters were fitted on the blend).
+    cutpoints   : 4 non-decreasing finite numbers — required for "target", not
+                  allowed for other rules.
+    safety_q    : number in (0, 1] or null — optional, only for "target".
+    lam         : number > 0 — required for "bayes_target", not allowed otherwise.
 
 An invalid file (also an unknown key, e.g. a typo "temprature") raises ValueError
 at startup — a mistake in the ensemble must be loud, not silently replaced by
@@ -58,9 +74,20 @@ MODEL_WEIGHTS: dict[str, float] = dict.fromkeys(ENSEMBLE_MODELS, 1.0)
 
 ENSEMBLE_WEIGHTS_FILE = "ensemble_weights.json"
 DEFAULT_SOURCE = "default (equal weights)"
-DECISION_RULES: tuple[str, ...] = ("argmax", "cost")
+DECISION_RULES: tuple[str, ...] = ("argmax", "cost", "target", "bayes_target")
+# Parameters each rule accepts (training src/evaluation/decision.py RULE_PARAMS)
+RULE_PARAMS: dict[str, frozenset[str]] = {
+    "argmax": frozenset(),
+    "cost": frozenset(),
+    "target": frozenset({"cutpoints", "safety_q"}),
+    "bayes_target": frozenset({"lam"}),
+}
+RULE_KEYS: frozenset[str] = frozenset({"rule", "cutpoints", "safety_q", "lam"})
 BLEND_METHODS: tuple[str, ...] = ("mean", "geometric")
-CONFIG_KEYS: frozenset[str] = frozenset({"weights", "method", "temperature", "rule"})
+CONFIG_KEYS: frozenset[str] = frozenset({"weights", "method", "temperature"}) | RULE_KEYS
+N_CUTPOINTS = 4
+URGENT_MAX = 1          # index of ESI 2: predictions > 1 (ESI 3–5) of an ESI 1–2 patient = undertriage
+SAFETY_NET_CAP = 2      # safety net: at most ESI 3 (index 2)
 
 # Same as training/src/ensemble/runs.py (_EPS): clip before log
 _EPS = 1e-12
@@ -78,14 +105,169 @@ def cost_matrix(n_classes: int = 5) -> np.ndarray:
     return np.where(p > t, UNDERTRIAGE_COST_MULTIPLIER * dist2, OVERTRIAGE_COST_MULTIPLIER * dist2)
 
 
-def decide(proba: np.ndarray, rule: str = "argmax") -> int:
-    """Class index (0–4 = ESI 1–5) for ONE probability vector."""
+def bayes_cost_matrix(lam: float, n_classes: int = 5) -> np.ndarray:
+    """cost[t, p] = (p − t)² + λ·1[t ∈ ESI 1–2 and p ∈ ESI 3–5] — as training
+    `src.evaluation.decision.bayes_cost_matrix`."""
+    t = np.arange(n_classes)[:, None]
+    p = np.arange(n_classes)[None, :]
+    return (p - t).astype(float) ** 2 + float(lam) * ((t <= URGENT_MAX) & (p > URGENT_MAX))
+
+
+def expected_level(proba: np.ndarray) -> float:
+    """EL = Σ k·p_k (k = 0…4), summed column by column exactly like training
+    `src.evaluation.decision.expected_level` (bit-identical, no BLAS)."""
+    el = 0.0
+    for k in range(1, len(proba)):
+        el = el + k * proba[k]
+    return float(el)
+
+
+def _number(value: Any, name: str, where: str) -> float:
+    """A finite number (bools rejected) or ValueError."""
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"{where}: \"{name}\" must be a number (got {value!r})")
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{where}: \"{name}\" must be a number (got {value!r})") from None
+    if not math.isfinite(out):
+        raise ValueError(f"{where}: \"{name}\" must be finite (got {value!r})")
+    return out
+
+
+class DecisionRule(str):
+    """Decision rule name WITH its parameters.
+
+    A `str` subclass so that `config.rule == "cost"`, logging and existing callers
+    (`decide(proba, config.rule)`) keep working; the parameters ride along as
+    attributes. Two rules are equal only if names and parameters match.
+    """
+
+    cutpoints: tuple[float, ...] | None
+    safety_q: float | None
+    lam: float | None
+
+    def __new__(cls, name: str = "argmax", *, cutpoints: Any = None, safety_q: Any = None,
+                lam: Any = None) -> DecisionRule:
+        spec: dict[str, Any] = {"rule": str(name)}
+        if cutpoints is not None:
+            spec["cutpoints"] = cutpoints
+        if safety_q is not None:
+            spec["safety_q"] = safety_q
+        if lam is not None:
+            spec["lam"] = lam
+        return cls.from_spec(spec)
+
+    @classmethod
+    def from_spec(cls, spec: dict[str, Any], where: str = "decision rule") -> DecisionRule:
+        """{"rule": ..., "cutpoints": ..., "safety_q": ..., "lam": ...} → validated rule
+        (same checks as training `src.evaluation.decision.normalize_spec`)."""
+        if not isinstance(spec, dict):
+            raise ValueError(f"{where}: expected an object {{\"rule\": ...}} (got {spec!r})")
+        unknown = sorted(set(spec) - RULE_KEYS)
+        if unknown:
+            raise ValueError(f"{where}: unknown rule key(s) {unknown} (allowed: {sorted(RULE_KEYS)})")
+        name = spec.get("rule", "argmax")
+        if name not in DECISION_RULES:
+            raise ValueError(f"{where}: \"rule\" must be one of {DECISION_RULES} (got {name!r})")
+        foreign = sorted(set(spec) - {"rule"} - RULE_PARAMS[name])
+        if foreign:
+            raise ValueError(f"{where}: rule {name!r} does not take {foreign}")
+        cutpoints = safety_q = lam = None
+        if name == "target":
+            if "cutpoints" not in spec:
+                raise ValueError(f"{where}: rule \"target\" needs \"cutpoints\" (4 numbers)")
+            raw = spec["cutpoints"]
+            if not isinstance(raw, (list, tuple)) or len(raw) != N_CUTPOINTS:
+                raise ValueError(f"{where}: \"cutpoints\" must be a list of {N_CUTPOINTS} numbers (got {raw!r})")
+            cutpoints = tuple(_number(c, "cutpoints", where) for c in raw)
+            if any(b < a for a, b in zip(cutpoints, cutpoints[1:])):
+                raise ValueError(f"{where}: \"cutpoints\" must be sorted ascending (got {raw!r})")
+            if spec.get("safety_q") is not None:
+                safety_q = _number(spec["safety_q"], "safety_q", where)
+                if not 0.0 < safety_q <= 1.0:
+                    raise ValueError(f"{where}: \"safety_q\" must be in (0, 1] (got {spec['safety_q']!r})")
+        elif name == "bayes_target":
+            if "lam" not in spec:
+                raise ValueError(f"{where}: rule \"bayes_target\" needs \"lam\" (a number > 0)")
+            lam = _number(spec["lam"], "lam", where)
+            if lam <= 0:
+                raise ValueError(f"{where}: \"lam\" must be > 0 (got {spec['lam']!r})")
+        obj = super().__new__(cls, name)
+        obj.cutpoints, obj.safety_q, obj.lam = cutpoints, safety_q, lam
+        return obj
+
+    def __reduce__(self):
+        return (_rule_from_spec, (self.spec(),))
+
+    def spec(self) -> dict[str, Any]:
+        """JSON spec (the keys of ensemble_weights.json that describe the rule)."""
+        out: dict[str, Any] = {"rule": str(self)}
+        if str(self) == "target":
+            out["cutpoints"] = list(self.cutpoints or ())
+            out["safety_q"] = self.safety_q
+        elif str(self) == "bayes_target":
+            out["lam"] = self.lam
+        return out
+
+    def _key(self) -> tuple:
+        return (str(self), self.cutpoints, self.safety_q, self.lam)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, DecisionRule):
+            return self._key() == other._key()
+        return str.__eq__(self, other)
+
+    def __ne__(self, other: object) -> bool:
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    __hash__ = str.__hash__
+
+    def __repr__(self) -> str:
+        params = {k: v for k, v in self.spec().items() if k != "rule"}
+        return f"DecisionRule({str(self)!r}{', ' if params else ''}" + \
+            ", ".join(f"{k}={v!r}" for k, v in params.items()) + ")"
+
+    def describe(self) -> str:
+        """Short text for logs: name + parameters."""
+        params = {k: v for k, v in self.spec().items() if k != "rule"}
+        return str(self) if not params else f"{self} {params}"
+
+
+def _rule_from_spec(spec: dict[str, Any]) -> DecisionRule:
+    return DecisionRule.from_spec(spec)
+
+
+def as_rule(rule: str | dict[str, Any] | DecisionRule) -> DecisionRule:
+    """str / spec dict / DecisionRule → validated DecisionRule ("target" and
+    "bayes_target" need their parameters, so a bare name raises ValueError)."""
+    if isinstance(rule, DecisionRule):
+        return rule
+    if isinstance(rule, dict):
+        return DecisionRule.from_spec(rule)
+    if isinstance(rule, str):
+        return DecisionRule.from_spec({"rule": rule})
+    raise ValueError(f"Unknown decision rule {rule!r} (expected one of {DECISION_RULES})")
+
+
+def decide(proba: np.ndarray, rule: str | dict[str, Any] | DecisionRule = "argmax") -> int:
+    """Class index (0–4 = ESI 1–5) for ONE probability vector — the same decision as
+    training `src.evaluation.decision.decide_rule` for that row."""
     proba = np.asarray(proba, dtype=float)
+    rule = as_rule(rule)
     if rule == "argmax":
         return int(np.argmax(proba))
     if rule == "cost":
         return int(np.argmin(proba @ cost_matrix(len(proba))))
-    raise ValueError(f"Unknown decision rule {rule!r} (expected one of {DECISION_RULES})")
+    if rule == "bayes_target":
+        return int(np.argmin(proba @ bayes_cost_matrix(rule.lam, len(proba))))
+    # "target": number of cutpoints strictly exceeded by EL, then the optional safety net
+    el = expected_level(proba)
+    category = int(sum(el > c for c in rule.cutpoints))
+    if rule.safety_q is not None and proba[0] + proba[1] >= rule.safety_q:
+        category = min(category, SAFETY_NET_CAP)
+    return category
 
 
 def blend(probas: list[np.ndarray], weights: list[float], method: str = "mean") -> np.ndarray:
@@ -118,10 +300,14 @@ class EnsembleConfig:
     """Weights per model + blend method + optional temperature + decision rule."""
 
     weights: dict[str, float] = field(default_factory=lambda: dict(MODEL_WEIGHTS))
-    rule: str = "argmax"
+    rule: DecisionRule | str = "argmax"
     source: str = DEFAULT_SOURCE
     method: str = "mean"
     temperature: float | None = None
+
+    def __post_init__(self) -> None:
+        # Always a validated DecisionRule (a str): parameters travel with config.rule
+        object.__setattr__(self, "rule", as_rule(self.rule))
 
     @property
     def is_default(self) -> bool:
@@ -181,9 +367,7 @@ def load_ensemble_config(path: Path) -> EnsembleConfig:
         raise ValueError(f"{path}: unknown key(s) {unknown} (allowed: {sorted(CONFIG_KEYS)})")
 
     weights = _parse_weights(payload["weights"], path) if "weights" in payload else dict(MODEL_WEIGHTS)
-    rule = payload.get("rule", "argmax")
-    if rule not in DECISION_RULES:
-        raise ValueError(f"{path}: \"rule\" must be one of {DECISION_RULES} (got {rule!r})")
+    rule = DecisionRule.from_spec({k: v for k, v in payload.items() if k in RULE_KEYS}, where=str(path))
     method = payload.get("method", "mean")
     if method not in BLEND_METHODS:
         raise ValueError(f"{path}: \"method\" must be one of {BLEND_METHODS} (got {method!r})")
@@ -192,7 +376,7 @@ def load_ensemble_config(path: Path) -> EnsembleConfig:
     config = EnsembleConfig(weights=weights, rule=rule, source=str(path),
                             method=method, temperature=temperature)
     log.info("Ensemble from %s: method=%s, temperature=%s, rule=%s, weights=%s", path, method,
-             temperature, rule, {m: round(w, 4) for m, w in weights.items()})
+             temperature, rule.describe(), {m: round(w, 4) for m, w in weights.items()})
     return config
 
 
