@@ -156,7 +156,8 @@ class TestFinalReport:
     def test_weights_from_backend_file_and_previous_report(self, report_runs):
         module = _load_script()
         first = report_runs / "final_report__triage__c"
-        assert module.main(["--runs", *RUNS, "--bootstrap", "20", "--no-plots", "--out", str(first)]) == 0
+        assert module.main(["--runs", *RUNS, "--weights", "equal", "--bootstrap", "20", "--no-plots",
+                            "--out", str(first)]) == 0
         second = report_runs / "final_report__triage__d"
         assert module.main(["--runs", *RUNS, "--weights", str(first / "backend_ensemble_weights.json"),
                             "--bootstrap", "20", "--no-plots", "--out", str(second)]) == 0

@@ -180,10 +180,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--include-samples", action="store_true", help="Uwzględnij runy na próbkach (tylko test!)")
     parser.add_argument("--include-untuned", action="store_true", help="Uwzględnij runy bez tuningu")
     parser.add_argument("--include-weighted", action="store_true", help="Uwzględnij runy z wagami klas")
-    parser.add_argument("--weights", default="equal",
+    parser.add_argument("--weights", default="optimize",
                         help="JSON {model: waga}, ścieżka do pliku JSON (także backend_ensemble_weights.json — "
                              "wtedy jego method / rule / temperature są przejmowane), 'optimize' (min log loss "
-                             "na VAL) albo 'equal'")
+                             "na VAL, domyślnie) albo 'equal'")
     parser.add_argument("--method", choices=["mean", "geometric"], default=None,
                         help=f"Sposób łączenia (domyślnie z pliku wag, inaczej {DEFAULT_METHOD})")
     parser.add_argument("--temperature", choices=["fit", "none"], default=None,

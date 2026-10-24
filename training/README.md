@@ -545,7 +545,7 @@ Poza tym: `metrics.json` (wszystkie liczby, także porównania połączenia z ka
 | opcja | znaczenie |
 |---|---|
 | `--runs RUN …` albo `--feature-set FS --tag TAG [--models a,b]` | jawne runy albo najnowszy ukończony run każdego modelu (filtry jak w 07: `--include-samples`, `--include-untuned`, `--include-weighted`) |
-| `--weights JSON\|plik.json\|optimize\|equal` | wagi połączenia (domyślnie `equal`; `optimize` = minimalny log loss na VAL); model spoza wag ma wagę 0, ale w tabelach jest oceniany osobno; z pliku w formacie backendu przejmowane są też `method`, `rule` i (nie)obecność temperatury |
+| `--weights JSON\|plik.json\|optimize\|equal` | wagi połączenia (domyślnie `optimize` = minimalny log loss na VAL; `equal` = równe wagi — w testach wyraźnie gorsze); model spoza wag ma wagę 0, ale w tabelach jest oceniany osobno; z pliku w formacie backendu przejmowane są też `method`, `rule` i (nie)obecność temperatury |
 | `--method mean\|geometric` | średnia arytmetyczna albo geometryczna prawdopodobieństw (domyślnie z pliku wag, inaczej `mean`) |
 | `--temperature fit\|none` | temperatura połączenia dopasowana na VAL (domyślnie z pliku wag, inaczej `fit`) |
 | `--rule argmax\|cost\|both` | reguły w raporcie (domyślnie obie); `--backend-rule` — reguła w pliku dla backendu (domyślnie `cost` przy `both`) |

@@ -24,7 +24,7 @@ MODEL ?= xgboost
 ARGS ?=
 RUN_ARGS ?=
 TAG ?= standard
-WEIGHTS ?= equal
+WEIGHTS ?= optimize
 REPORT_ARGS ?=
 
 RUN_ALL = $(PYTHON) scripts/run_all.py --feature-set $(FEATURES) --models $(MODELS) $(RUN_ARGS)
