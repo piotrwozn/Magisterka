@@ -15,6 +15,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -349,6 +350,13 @@ class TestHelpers:
         # Brak informacji o zadaniach (przerwanie przed planem) — --force bez zmian
         assert resume_command(argv, None) == "python scripts/run_all.py " + " ".join(argv)
 
+    def test_resume_command_for_one_feature_set(self):
+        argv = ["--force", "--feature-set", "triage,full", "--models", "all", "--dry-run"]
+        assert resume_command(argv, ["ebm"], feature_set="full") == \
+            "python scripts/run_all.py --force --feature-set full --models ebm"
+        assert resume_command(["--force", "--feature-set=triage,full"], ["xgboost"], feature_set="triage") == \
+            "python scripts/run_all.py --force --feature-set triage --models xgboost"
+
 
 # ─────────────────────────────────────────
 # Blokada uśpienia
@@ -508,7 +516,7 @@ class FakeRunner:
     def __init__(self, fail: dict[str, list[tuple[int, str]]] | None = None, delay: float = 0.0,
                  delays: dict[str, float] | None = None) -> None:
         self.calls: list[tuple[str, list[str], dict[str, str]]] = []
-        self.fail = fail or {}             # model → kolejne (kod, tekst logu) dla treningu
+        self.fail = fail or {}             # model albo "fs/model" → kolejne (kod, tekst logu) dla treningu
         self.delay = delay
         self.delays = delays or {}         # model → opóźnienie pierwszego treningu (s)
         self._lock = threading.Lock()
@@ -533,7 +541,7 @@ class FakeRunner:
                 delay = self.delays.pop(model, 0.0)
             if delay:
                 time.sleep(delay)
-            queue = self.fail.get(model)
+            queue = self.fail.get(f"{fs}/{model}") or self.fail.get(model)
             if queue:
                 code, text = queue.pop(0)
                 log_path.write_text(text + "\n", encoding="utf-8")
@@ -897,6 +905,80 @@ class TestOrchestrator:
         text = orch.summaries[0].read_text(encoding="utf-8")
         assert "python scripts/run_all.py --profile smoke --force --models lightgbm,xgboost" in text
 
+    @staticmethod
+    def _run_printed(command: str, runner: FakeRunner) -> Orchestrator:
+        """Orkiestrator z wypisanego polecenia wznowienia (udawane kroki, bez preflight)."""
+        args = shlex.split(command)
+        assert args[:2] == ["python", "scripts/run_all.py"]
+        opts = orchestrator.options_from_args(args[2:])
+        opts.skip_preflight, opts.keep_awake = True, False
+        return Orchestrator(opts, runner=runner)
+
+    def test_interrupted_force_run_two_feature_sets_resumes_per_feature_set(self, workspace):
+        """Ctrl+C w fazie 'full': gotowe modele 'triage' nie są trenowane drugi raz."""
+        argv = ["--profile", "smoke", "--force", "--feature-set", "triage,full", "--models", "logreg,lightgbm,xgboost"]
+        runner = FakeRunner(fail={"full/lightgbm": [(130, "KeyboardInterrupt")]})
+        orch = Orchestrator(make_opts(force=True, feature_sets=["triage", "full"], argv=argv), runner=runner)
+        assert orch.run() == 130
+        assert {t.key: t.status for t in orch.tasks} == {
+            "triage/logreg": DONE, "triage/lightgbm": DONE, "triage/xgboost": DONE,
+            "full/logreg": DONE, "full/lightgbm": INTERRUPTED, "full/xgboost": NOT_STARTED}
+        commands, followup = orch._resume_plan()
+        assert commands == ["python scripts/run_all.py --profile smoke --force --feature-set full "
+                            "--models lightgbm,xgboost"]
+        assert followup == "python scripts/run_all.py --profile smoke --feature-set triage,full " \
+                           "--models logreg,lightgbm,xgboost"
+        text = next(p for p in orch.summaries if "__full__" in p.name).read_text(encoding="utf-8")
+        assert f"`{commands[0]}`" in text and f"`{followup}`" in text
+        assert "--force --feature-set triage,full" not in text
+
+        resumed = FakeRunner()
+        assert self._run_printed(commands[0], resumed).run() == 0
+        assert [(c[5], c[7]) for c in resumed.kinds("train")] == [("lightgbm", "full"), ("xgboost", "full")]
+        final = FakeRunner()
+        assert self._run_printed(followup, final).run() == 0
+        assert final.kinds("train") == [] and final.kinds("eval") == []
+        compared = [c[c.index("--runs") + 1:c.index("--out")] for c in final.kinds("compare")]
+        assert [len(names) for names in compared] == [3, 3]          # oba zestawy, komplet modeli
+
+    def test_force_run_interrupted_during_eval_prints_followup(self, workspace):
+        """Model wytrenowany, ewaluacja przerwana: wznowienie z --force go pomija, „potem” ją dorabia."""
+        argv = ["--profile", "smoke", "--force", "--models", "logreg,lightgbm,xgboost"]
+
+        class InterruptEval(FakeRunner):
+            orch: Orchestrator | None = None
+
+            def __call__(self, cmd, env, log_path, prefix):
+                if Path(cmd[3]).name == "04_evaluate.py" and "_lightgbm_" in cmd[cmd.index("--run") + 1]:
+                    self.orch.interrupted = True          # Ctrl+C w trakcie ewaluacji (jak _handle_interrupt)
+                    self.orch.stop.set()
+                    return 130
+                return super().__call__(cmd, env, log_path, prefix)
+
+        runner = InterruptEval()
+        orch = runner.orch = Orchestrator(make_opts(force=True, argv=argv), runner=runner)
+        assert orch.run() == 130
+        tasks = by_model(orch)
+        assert [(tasks[m].status, tasks[m].eval_status) for m in ("logreg", "lightgbm", "xgboost")] == \
+            [(DONE, DONE), (DONE, INTERRUPTED), (NOT_STARTED, NOT_STARTED)]
+        commands, followup = orch._resume_plan()
+        assert commands == ["python scripts/run_all.py --profile smoke --force --models xgboost"]
+        assert followup == "python scripts/run_all.py --profile smoke --models logreg,lightgbm,xgboost"
+        text = orch.summaries[0].read_text(encoding="utf-8")
+        assert f"`{commands[0]}`" in text and f"`{followup}`" in text
+        log_text = (orch.log_dir / "run_all.log").read_text(encoding="utf-8")
+        assert f"Potem (brakujące ewaluacje i porównanie wszystkich modeli): {followup}" in log_text
+
+        resumed = FakeRunner()
+        assert self._run_printed(commands[0], resumed).run() == 0
+        assert [c[5] for c in resumed.kinds("train")] == ["xgboost"]
+        final = FakeRunner()
+        assert self._run_printed(followup, final).run() == 0
+        assert final.kinds("train") == []
+        assert [Path(c[c.index("--run") + 1]).name.split("_")[2] for c in final.kinds("eval")] == ["lightgbm"]
+        compare = final.kinds("compare")[0]
+        assert len(compare[compare.index("--runs") + 1:compare.index("--out")]) == 3
+
     # ── --status: czy orkiestrator żyje ──
     @staticmethod
     def _write_status(status: dict) -> Path:
@@ -949,6 +1031,30 @@ def test_orchestrator_alive_unit():
     created = orchestrator._process_create_time(me)
     if created is not None:
         assert orchestrator_alive({"pid": me, "pid_create_time": created - 3600}) is False   # PID użyty ponownie
+
+
+def test_orchestrator_alive_survives_clock_step(monkeypatch):
+    """Zegar przestawiony w trakcie przebiegu (NTP, resynchronizacja WSL2) o < 120 s: proces nadal żyje."""
+    me = os.getpid()
+    boot, created = orchestrator._boot_time(), orchestrator._process_create_time(me)
+    if boot is None or created is None:
+        pytest.skip("brak psutil")
+    stored = {"pid": me, "pid_create_time": created, "boot_time": boot}
+    if sys.platform.startswith("linux"):    # prawdziwe psutil: btime i create_time przesunięte o tyle samo
+        assert orchestrator_alive({**stored, "pid_create_time": created + 60, "boot_time": boot + 60}) is True
+    # Linux: create_time = btime + takty od startu systemu → oba przesuwają się z zegarem
+    monkeypatch.setattr(orchestrator, "CREATE_TIME_FROM_BOOT", True)
+    for step in (3.0, 60.0, 119.0):
+        monkeypatch.setattr(orchestrator, "_boot_time", lambda step=step: boot + step)
+        monkeypatch.setattr(orchestrator, "_process_create_time", lambda pid, step=step: created + step)
+        assert orchestrator_alive(stored) is True
+    assert orchestrator_alive({**stored, "pid_create_time": created - 600}) is False      # PID użyty ponownie
+    # Windows / macOS: create_time bezwzględny (nie przesuwa się z zegarem) — porównanie wprost
+    monkeypatch.setattr(orchestrator, "CREATE_TIME_FROM_BOOT", False)
+    monkeypatch.setattr(orchestrator, "_process_create_time", lambda pid: created)
+    assert orchestrator_alive(stored) is True
+    monkeypatch.setattr(orchestrator, "_process_create_time", lambda pid: created + 60)
+    assert orchestrator_alive(stored) is False
 
 
 # ─────────────────────────────────────────

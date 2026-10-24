@@ -370,6 +370,49 @@ class TestCrossValidation:
 
 
 # ─────────────────────────────────────────
+# Uncertainty — wybór runów z runs/ (runy bez tuningu)
+# ─────────────────────────────────────────
+class TestUncertaintyRunSelection:
+    @staticmethod
+    def _untuned_run(runs_dir: Path, name: str, model: str, seed: int) -> None:
+        """Run jak z `03_train.py` bez --tune (tuned=False): run_info, predykcje val, model, DONE.json."""
+        from src.ensemble.runs import PROBA_COLS
+
+        rng = np.random.default_rng(seed)
+        y = np.arange(200) % len(CLASS_NAMES)
+        proba = rng.dirichlet(np.ones(len(CLASS_NAMES)), size=len(y))
+        run_dir = runs_dir / name
+        run_dir.mkdir(parents=True)
+        info = {"run_name": name, "model": model, "feature_set": "triage", "tuned": False,
+                "tag": "standard-notune", "data_version": DATA_VERSION, "train_sample": None, "eval_sample": None}
+        (run_dir / "run_info.json").write_text(json.dumps(info), encoding="utf-8")
+        frame = pd.DataFrame({"row_id": np.arange(len(y)), "target": y})
+        for i, col in enumerate(PROBA_COLS):
+            frame[col] = proba[:, i]
+        frame.to_parquet(run_dir / "predictions_val.parquet", index=False)
+        (run_dir / "model.joblib").write_bytes(b"fake")
+        (run_dir / "DONE.json").write_text(json.dumps({"run_name": name}), encoding="utf-8")
+
+    def test_untuned_runs_need_flag(self, tmp_path, monkeypatch):
+        from src.evaluation import uncertainty
+
+        runs_dir = tmp_path / "runs"
+        self._untuned_run(runs_dir, "20260101_000000_logreg_triage_standard-notune", "logreg", 1)
+        self._untuned_run(runs_dir, "20260101_000100_lightgbm_triage_standard-notune", "lightgbm", 2)
+        monkeypatch.setattr(config, "RUNS_DIR", runs_dir)
+
+        monkeypatch.setattr(sys, "argv", ["uncertainty"])
+        with pytest.raises(SystemExit, match="--include-untuned"):
+            uncertainty.main()
+
+        report = tmp_path / "uncertainty_val.txt"
+        monkeypatch.setattr(sys, "argv", ["uncertainty", "--include-untuned", "--output", str(report)])
+        uncertainty.main()
+        text = report.read_text(encoding="utf-8")
+        assert "logreg" in text and "lightgbm" in text
+
+
+# ─────────────────────────────────────────
 # 05_explain — reguły ESI + SHAP na syntetycznym splicie
 # ─────────────────────────────────────────
 def test_explain_script_end_to_end(prepared_paths, tmp_path, monkeypatch):

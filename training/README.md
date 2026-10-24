@@ -224,7 +224,9 @@ Na Linuksie są też skróty z Makefile'a: `make check-env`, `make smoke`, `make
   i ponawiana raz.
 - **Ctrl+C**: orkiestrator nie uruchamia już nowych kroków i czeka do 2 minut, aż bieżące się
   zakończą (drugie Ctrl+C = natychmiast). Potem zapisuje podsumowanie i wypisuje polecenie wznowienia
-  (po `--force`: z `--force` i `--models` zawężonym do niedokończonych). Kod wyjścia to 130.
+  (po `--force`: z `--force` i `--models` zawężonym do niedokończonych, osobno dla każdego zestawu
+  cech, a na końcu zwykłe polecenie bez `--force`, które dorobi brakujące ewaluacje i porównanie).
+  Kod wyjścia to 130.
 - **Twarda awaria kroku** (np. błąd natywny, zabity proces) nie blokuje toru: orkiestrator zabija
   pozostałości kroku (Linux: całą grupę procesów) i przechodzi do następnego modelu.
 - **Restart / zanik prądu**: po prostu uruchom to samo polecenie.

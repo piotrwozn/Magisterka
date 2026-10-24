@@ -35,8 +35,10 @@ zabicie obejmuje drzewo procesów (taskkill /T).
 
 Ctrl+C (także SIGTERM / SIGHUP): żadnych nowych kroków, do 120 s na zakończenie bieżących (potem
 terminate/kill; drugie Ctrl+C = natychmiast), podsumowanie i polecenie wznowienia (po `--force`:
-z `--force` i tylko niedokończonymi modelami). xgboost/catboost z błędem GPU w logu są powtarzane
-raz na CPU (SOR_AI_DEVICE_<MODEL>=cpu) — z budżetem wątków toru CPU, gdy ten tor już skończył.
+z `--force` i tylko niedokończonymi modelami, osobno dla zestawów cech, a potem zwykłe polecenie
+— brakujące ewaluacje i porównanie wszystkich modeli). xgboost/catboost z błędem GPU w logu są
+powtarzane raz na CPU (SOR_AI_DEVICE_<MODEL>=cpu) — z budżetem wątków toru CPU, gdy ten tor już
+skończył.
 
 Windows: na czas przebiegu wyłączone dławienie energii procesu (EcoQoS) i tryb QuickEdit konsoli
 (kliknięcie w okno zatrzymywałoby wypisywanie, a przez potoki — trening).
@@ -92,6 +94,9 @@ CHILD_GRACE_S: float = 120.0          # Ctrl+C: tyle czekamy na samodzielne zako
 CHILD_KILL_S: float = 10.0            # po terminate() — tyle do kill()
 READER_JOIN_S: float = 10.0           # po końcu procesu kroku: tyle czekamy na domknięcie jego wyjścia
 BOOT_TIME_TOLERANCE_S: float = 120.0  # --status: inny czas startu systemu = był restart
+# Linux (psutil): create_time = btime z /proc/stat + takty od startu systemu, a przestawienie zegara
+# (NTP, resynchronizacja WSL2) przesuwa btime — --status porównuje wtedy czas od startu systemu
+CREATE_TIME_FROM_BOOT: bool = sys.platform.startswith("linux")
 LOG_TAIL_LINES: int = 40
 
 # Zapas na trening finalny + ewaluację ponad limit czasu tuningu (pełne dane; szacunek ±50%)
@@ -469,7 +474,25 @@ def format_duration(seconds: float | None) -> str:
     return f"{secs} s"
 
 
-def resume_command(argv: Sequence[str], redo_models: Sequence[str] | None = None) -> str:
+def _without_option(args: Sequence[str], name: str) -> list[str]:
+    """argv bez opcji `name` z wartością (postać `name WARTOŚĆ` i `name=WARTOŚĆ`)."""
+    out: list[str] = []
+    skip_value = False
+    for a in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if a == name:
+            skip_value = True
+            continue
+        if a.startswith(name + "="):
+            continue
+        out.append(a)
+    return out
+
+
+def resume_command(argv: Sequence[str], redo_models: Sequence[str] | None = None,
+                   feature_set: str | None = None) -> str:
     """
     Polecenie wznowienia: to samo bez jednorazowych flag (--dry-run, --status).
 
@@ -478,26 +501,20 @@ def resume_command(argv: Sequence[str], redo_models: Sequence[str] | None = None
     ale `--models` zawęża się do redo_models, żeby nie trenować drugi raz modeli już gotowych.
     Pusta lista → bez `--force` (zostały tylko ewaluacje / porównanie, które dokończy zwykłe
     wznowienie). redo_models=None → `--force` bez zmian (np. przerwanie przed planem).
+    feature_set : zastępuje `--feature-set` (wznowienie z --force osobno dla jednego zestawu cech).
     """
     args = [a for a in argv if a not in ("--dry-run", "--status")]
+    tail: list[str] = []
+    if feature_set is not None:
+        args = _without_option(args, "--feature-set")
+        tail += ["--feature-set", feature_set]
     if "--force" in args and redo_models is not None:
         if not redo_models:
             args = [a for a in args if a != "--force"]
         else:
-            out: list[str] = []
-            skip_value = False
-            for a in args:
-                if skip_value:
-                    skip_value = False
-                    continue
-                if a == "--models":
-                    skip_value = True
-                    continue
-                if a.startswith("--models="):
-                    continue
-                out.append(a)
-            args = [*out, "--models", ",".join(redo_models)]
-    return " ".join(["python", "scripts/run_all.py", *(shlex.quote(a) for a in args)])
+            args = _without_option(args, "--models")
+            tail += ["--models", ",".join(redo_models)]
+    return " ".join(["python", "scripts/run_all.py", *(shlex.quote(a) for a in [*args, *tail])])
 
 
 # ─────────────────────────────────────────
@@ -593,7 +610,8 @@ def orchestrator_alive(status: Mapping[str, Any]) -> bool | None:
     Czy orkiestrator ze status.json nadal działa. None = brak danych (status.json bez PID).
 
     False, gdy: od zapisu był restart (inny czas startu systemu), PID nie istnieje albo należy
-    już do innego procesu (inny czas utworzenia procesu).
+    już do innego procesu (inny czas utworzenia procesu; na Linuksie liczony od startu systemu,
+    więc przestawienie zegara w trakcie przebiegu nie robi z żywego orkiestratora martwego).
     """
     pid = status.get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool):
@@ -604,8 +622,12 @@ def orchestrator_alive(status: Mapping[str, Any]) -> bool | None:
     if not _pid_exists(pid):
         return False
     created, created_now = status.get("pid_create_time"), _process_create_time(pid)
-    if isinstance(created, (int, float)) and created_now is not None and abs(float(created) - created_now) > 2.0:
-        return False
+    if isinstance(created, (int, float)) and created_now is not None:
+        created = float(created)
+        if CREATE_TIME_FROM_BOOT and isinstance(boot, (int, float)) and boot_now is not None:
+            created, created_now = created - float(boot), created_now - boot_now   # niezależne od zegara
+        if abs(created - created_now) > 2.0:
+            return False
     return True
 
 
@@ -717,8 +739,8 @@ class Orchestrator:
         self.summaries: list[Path] = []
         self.run_state = "running"         # running | finished | interrupted | failed (status.json)
         self.exit_status: int | None = None
+        self._boot_time = _boot_time()     # najpierw: starsze psutil liczą create_time z zapamiętanego boot_time
         self._pid_create_time = _process_create_time(os.getpid())
-        self._boot_time = _boot_time()
         self._children: set[subprocess.Popen] = set()
         self._lane_busy: dict[str, bool] = {}
         self._lock = threading.Lock()
@@ -1350,10 +1372,14 @@ class Orchestrator:
         unfinished = [t for t in tasks if t.status not in _OK_STATES or t.eval_status in (FAILED, NOT_STARTED,
                                                                                             INTERRUPTED)]
         if unfinished:
-            lines.append(("- wznowienie (tylko modele niewytrenowane w tym przebiegu --force; Optuna dokończy "
-                          "brakujące próby): " if o.force else
-                          "- wznowienie (gotowe modele zostaną pominięte, Optuna dokończy brakujące próby): ")
-                         + f"`{self._resume()}`")
+            commands, followup = self._resume_plan()
+            what = ("tylko modele niewytrenowane w tym przebiegu --force"
+                    + (", osobno dla każdego zestawu cech" if len(commands) > 1 else "")
+                    if o.force else "gotowe modele zostaną pominięte")
+            lines += [f"- wznowienie ({what}; Optuna dokończy brakujące próby): `{cmd}`" for cmd in commands]
+            if followup:
+                lines.append("- potem (bez --force: gotowe modele zostaną pominięte, brakujące ewaluacje "
+                             f"dorobione, porównanie obejmie wszystkie modele): `{followup}`")
         lines += [f"- stan bez uruchamiania: `python scripts/run_all.py --status --profile {o.profile}"
                   + (f" --feature-set {fs}" if fs != "triage" else "") + "`"]
         if o.profile in ("smoke", "quick"):
@@ -1373,13 +1399,39 @@ class Orchestrator:
         bad = bad or any(c.get("status") == FAILED for c in self.compare.values())
         return 1 if bad else 0
 
-    def _resume(self) -> str:
-        """Polecenie wznowienia; po --force — z --force i tylko modelami bez ukończonego treningu."""
-        redo = None
-        if self.opts.force and self.tasks:
-            redo = [m for m in self.opts.models
-                    if any(t.model == m and t.status not in _OK_STATES for t in self.tasks)]
-        return resume_command(self.opts.argv, redo)
+    def _resume_plan(self) -> tuple[list[str], str | None]:
+        """
+        (polecenia wznowienia, polecenie „potem” albo None).
+
+        Bez --force (albo przed planem): jedno polecenie — to samo. Po --force: z --force tylko
+        modele, których trening NIE został ukończony w tym przebiegu — osobno dla każdego zestawu
+        cech, gdy zestawy różnią się listą (jedno `--feature-set triage,full` trenowałoby od nowa
+        także gotowe modele drugiego zestawu). Takie wznowienie nie wraca do modeli już
+        wytrenowanych, więc „potem” (zwykłe polecenie, bez --force) dorabia ich brakujące
+        ewaluacje i porównuje komplet modeli.
+        """
+        o = self.opts
+        if not (o.force and self.tasks):
+            return [resume_command(o.argv)], None
+        redo = {fs: [m for m in o.models
+                     if any(t.fs == fs and t.model == m and t.status not in _OK_STATES for t in self.tasks)]
+                for fs in o.feature_sets}
+        todo = [fs for fs in o.feature_sets if redo[fs]]
+        if not todo:                        # wszystko wytrenowane — zostały ewaluacje / porównanie
+            return [resume_command(o.argv, [])], None
+        if len(todo) == len(o.feature_sets) and all(redo[fs] == redo[todo[0]] for fs in todo):
+            commands = [resume_command(o.argv, redo[todo[0]])]
+        else:
+            commands = [resume_command(o.argv, redo[fs], feature_set=fs) for fs in todo]
+        trained = any(t.status in _OK_STATES for t in self.tasks)
+        return commands, (resume_command(o.argv, []) if trained else None)
+
+    def _say_resume(self) -> None:
+        commands, followup = self._resume_plan()
+        for cmd in commands:
+            self.say(f"Wznowienie: {cmd}", logging.WARNING)
+        if followup:
+            self.say(f"Potem (brakujące ewaluacje i porównanie wszystkich modeli): {followup}", logging.WARNING)
 
     def run(self) -> int:
         """Cały przebieg; status.json zawsze kończy się stanem (finished / interrupted / failed) i kodem."""
@@ -1425,7 +1477,7 @@ class Orchestrator:
                     return 2
             if not self.prepare():
                 self._write_status()
-                self.say(f"Wznowienie: {self._resume()}", logging.WARNING)
+                self._say_resume()
                 return 130 if self.interrupted else 2
             self.plan()
             self.print_plan()
@@ -1463,7 +1515,7 @@ class Orchestrator:
             self.say(f"Podsumowanie: {path}")
         code = self.exit_code()
         if code != 0:
-            self.say(f"Wznowienie: {self._resume()}", logging.WARNING)
+            self._say_resume()
 
 
 # ─────────────────────────────────────────

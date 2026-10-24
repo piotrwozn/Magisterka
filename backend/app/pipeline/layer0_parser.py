@@ -91,9 +91,11 @@ def _near(a: str, b: str, gap: int = 30) -> str:
     return rf"\b(?:{a}){sep}\b(?:{b})|\b(?:{b}){sep}\b(?:{a})"
 
 
-def _cooccur(a: str, b: str) -> str:
-    """Both stems anywhere in the note (zero-width match)."""
-    return rf"^(?=[\s\S]*?\b(?:{a}))(?=[\s\S]*?\b(?:{b}))"
+def _cooccur(a: str, b: str, unless: str | None = None) -> str:
+    """Both stems anywhere in the note (zero-width match) and — if given — no phrase
+    of `unless` (negation, e.g. "test ciążowy ujemny") anywhere in the note."""
+    guard = rf"(?![\s\S]*?\b(?:{unless}))" if unless else ""
+    return rf"^{guard}(?=[\s\S]*?\b(?:{a}))(?=[\s\S]*?\b(?:{b}))"
 
 
 def _without(a: str, b: str) -> str:
@@ -106,6 +108,18 @@ _SWELLING = r"obrzęk|opuchl|opuchn|swelling|swollen|edema|oedema"
 _FEVER = r"gorącz|fever|febr|sepsa|sepsy|sepsis|septic|posocznic"
 _OVERDOSE = r"przedawkow|overdose|zatruci\w* lek|intoksykac\w* lek|połkn\w* \w* ?tabletk"
 _SUICIDE = r"samobój|suicid|celow\w* przedawk|intentional"
+# Negated mentions — a co-occurrence rule must not fire on "test ciążowy ujemny"
+# or "bez immunosupresji" (the generic complaint would be dropped for a wrong code)
+_NEG_PREGNANCY = (
+    r"ciąż\w*[\s:-]+(?:wykluczon|ujemn|negatywn)|wyklucz\w* ciąż|nie (?:jest )?w ciąży"
+    r"|bez ciąży|brak ciąży|neguje ciąż|not pregnant|denies pregnan|negative (?:urine )?pregnan"
+    r"|pregnancy test[\s:-]+negative|pregnancy ruled out"
+)
+_NEG_IMMUNOSUPPRESSION = (
+    r"(?:bez|brak|neguje|nie(?: jest| był\w*)?(?: w trakcie| po)?)\s+"
+    r"(?:immunosupres|chemioterapi|neutropeni|przeszczep)"
+    r"|not immunocompromis|non-immunocompromis|no (?:neutropeni|transplant)"
+)
 
 
 # Keyword → cc_* mapping (PL + EN). Patterns use leading \b but no trailing \b
@@ -192,7 +206,7 @@ KEYWORD_MAP: dict[str, str] = {
     # ── Abdominal / GI ──
     r"\b(ból brzucha|bólu brzucha|bóle brzucha|brzuch|abdominal pain)":
         "cc_abdominalpain",
-    _cooccur(r"ciąż|pregnan", r"brzuch|podbrzusz|abdominal"):
+    _cooccur(r"ciąż|pregnan", r"brzuch|podbrzusz|abdominal", unless=_NEG_PREGNANCY):
         "cc_abdominalpainpregnant",
     r"\b(nadbrzusz|epigastr|zgag|heartburn)":
         "cc_epigastricpain",
@@ -266,7 +280,8 @@ KEYWORD_MAP: dict[str, str] = {
     # Sepsis has no own complaint in Yale — closest real code is "Fever"
     rf"\b({_FEVER}|wysoka temperatura|stan podgorączk)":
         "cc_fever",
-    _cooccur(_FEVER, r"immunosupres|chemioterapi|neutropeni|immunocompromis|przeszczep|transplant"):
+    _cooccur(_FEVER, r"immunosupres|chemioterapi|neutropeni|immunocompromis|przeszczep|transplant",
+             unless=_NEG_IMMUNOSUPPRESSION):
         "cc_feverimmunocompromised",
     r"\b(dreszcz|chills|rigors)":
         "cc_chills",
@@ -392,6 +407,10 @@ REDUNDANT_GENERIC: dict[str, frozenset[str]] = {
                                        "cc_vaginalbleeding"}),
     "cc_poisoning": frozenset({"cc_overdose_accidental", "cc_overdose_intentional"}),
     "cc_seizures": frozenset({"cc_seizure_newonset", "cc_seizure_priorhxof"}),
+    # "ciężka duszność" also matches the shortness-of-breath rule (together: 0.7% of
+    # Respiratory Distress visits); "near syncope" contains "syncope" (together: 0)
+    "cc_shortnessofbreath": frozenset({"cc_respiratorydistress"}),
+    "cc_syncope": frozenset({"cc_nearsyncope"}),
     # Synonyms (the keyword rules emit only the more frequent one; the LLM may return both)
     "cc_dyspnea": frozenset({"cc_shortnessofbreath"}),
     "cc_confusion": frozenset({"cc_alteredmentalstatus"}),

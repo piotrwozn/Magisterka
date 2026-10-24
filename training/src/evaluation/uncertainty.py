@@ -6,7 +6,8 @@ Analizuje niepewność predykcji na poziomie:
   - Cross-model: agreement, conflict (różnica ≥2 poziomy ESI między modelami)
 
 Źródła prawdopodobieństw:
-  - runy z runs/ (domyślnie) — zapisane predictions_<split>.parquet, bez ponownego liczenia;
+  - runy z runs/ (domyślnie: najnowszy run z tuningiem każdego modelu) — zapisane
+    predictions_<split>.parquet, bez ponownego liczenia;
   - pliki model.joblib (--model-paths) — predykcje liczone na nowo na wskazanym splicie,
     każdy model na własnym zestawie cech z artefaktu.
 
@@ -15,7 +16,8 @@ Protokół: analizy robocze na `val`; `--split test` wyłącznie do raportu koń
 Użycie:
     python -m src.evaluation.uncertainty                                  # najnowsze runy 'triage', val
     python -m src.evaluation.uncertainty --runs RUN_A RUN_B --split test
-    python -m src.evaluation.uncertainty --include-samples --sample 3000  # szybki test na runach z próbek
+    python -m src.evaluation.uncertainty --include-untuned                # także runy bez tuningu (-notune)
+    python -m src.evaluation.uncertainty --include-samples --include-untuned --sample 3000  # runy z próbek
     python -m src.evaluation.uncertainty --model-paths runs/*/model.joblib --shap
 """
 
@@ -640,6 +642,8 @@ def _parse_args() -> argparse.Namespace:
                         help="Zestaw cech przy wyborze najnowszych runów")
     parser.add_argument("--include-samples", action="store_true",
                         help="Uwzględnij runy trenowane na próbkach (--sample)")
+    parser.add_argument("--include-untuned", action="store_true",
+                        help="Uwzględnij runy bez tuningu (parametry domyślne, tag <profil>-notune)")
     parser.add_argument("--split", choices=["val", "test"], default="val",
                         help="Zbiór analizy; 'test' wyłącznie do raportu końcowego")
     parser.add_argument("--sample", type=int, default=None,
@@ -674,10 +678,17 @@ def main() -> None:
         if args.runs:
             runs = [load_run(r) for r in args.runs]
         else:
-            runs = latest_runs(args.feature_set, include_samples=args.include_samples)
+            runs = latest_runs(args.feature_set, include_samples=args.include_samples,
+                               require_tuned=not args.include_untuned)
         if not runs:
-            hint = "" if args.include_samples else " (runy na próbkach pomijane — dodaj --include-samples)"
-            raise SystemExit(f"Brak runów w {RUNS_DIR}{hint}. Najpierw: python scripts/03_train.py")
+            skipped = []
+            if not args.include_untuned:
+                skipped.append("bez tuningu (03_train.py bez --tune) — dodaj --include-untuned")
+            if not args.include_samples:
+                skipped.append("na próbkach — dodaj --include-samples")
+            hint = f" (pomijane runy: {'; '.join(skipped)})" if skipped else ""
+            raise SystemExit(f"Brak runów w {RUNS_DIR}{hint}. Najpierw: python scripts/run_all.py "
+                             "(albo python scripts/03_train.py --model all --tune)")
         log.info("Runy: " + ", ".join(r.name for r in runs))
         y_true, probas = probas_from_runs(runs, args.split, args.sample)
         if args.shap:

@@ -97,6 +97,8 @@ SINGLE_PROBLEM_NOTES = [
     "gorączka, chemioterapia", "ciąża, ból brzucha", "ból głowy migrenowy",
     "najgorszy ból głowy w życiu", "krwawienie z nosa", "krwawienie z rany",
     "zatrucie lekami", "przedawkowanie leków, próba samobójcza", "drgawki",
+    "ciężka duszność", "skrajna duszność", "respiratory distress, short of breath",
+    "near syncope", "near-syncope",
 ]
 
 
@@ -175,8 +177,31 @@ class TestKeywordParser:
         ("obrzęk nóg", {"cc_legswelling"}),                      # not + cc_edema
         ("ból głowy migrenowy", {"cc_migraine"}),                # not + cc_headache
         ("upadek, uraz głowy", {"cc_fall", "cc_headinjury"}),    # both real complaints
+        ("ciężka duszność", {"cc_respiratorydistress"}),        # not + cc_shortnessofbreath
+        ("skrajna duszność", {"cc_respiratorydistress"}),
+        ("respiratory distress, short of breath", {"cc_respiratorydistress"}),
+        ("duszność", {"cc_shortnessofbreath"}),
+        ("near syncope", {"cc_nearsyncope"}),                    # not + cc_syncope
+        ("near-syncope", {"cc_nearsyncope"}),
+        ("omdlenie", {"cc_syncope"}),
     ])
     def test_one_code_per_problem(self, note: str, expected: set[str]):
+        assert set(parse_with_keywords(note)["cc"]) == expected
+
+    @pytest.mark.parametrize("note, expected", [
+        # Negated pregnancy → the plain complaint, not "Abdominal Pain Pregnant"
+        ("Kobieta 25 lat, ból brzucha, test ciążowy ujemny", {"cc_abdominalpain"}),
+        ("ból brzucha, nie jest w ciąży", {"cc_abdominalpain"}),
+        ("ból brzucha, ciąża wykluczona", {"cc_abdominalpain"}),
+        ("abdominal pain, negative pregnancy test", {"cc_abdominalpain"}),
+        ("ciąża 20 tydz., ból brzucha", {"cc_abdominalpainpregnant"}),
+        # Negated immunosuppression → plain fever, not "Fever Immunocompromised"
+        ("gorączka, bez immunosupresji", {"cc_fever"}),
+        ("gorączka, nie jest w trakcie chemioterapii", {"cc_fever"}),
+        ("fever, not immunocompromised", {"cc_fever"}),
+        ("gorączka, po przeszczepie nerki", {"cc_feverimmunocompromised"}),
+    ])
+    def test_negated_co_occurrence(self, note: str, expected: set[str]):
         assert set(parse_with_keywords(note)["cc"]) == expected
 
     def test_generic_trauma_kept_without_specific_code(self):
@@ -331,6 +356,9 @@ class TestLlmParser:
         assert drop_redundant_generic({"cc_trauma", "cc_fall"}) == {"cc_fall"}
         assert drop_redundant_generic({"cc_trauma"}) == {"cc_trauma"}
         assert drop_redundant_generic(["cc_fever", "cc_fever_75yearsorolder"]) == {"cc_fever_75yearsorolder"}
+        assert drop_redundant_generic({"cc_shortnessofbreath", "cc_respiratorydistress"}) == {
+            "cc_respiratorydistress"}
+        assert drop_redundant_generic({"cc_syncope", "cc_nearsyncope"}) == {"cc_nearsyncope"}
 
 
 class TestParserContract:
