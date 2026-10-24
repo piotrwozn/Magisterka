@@ -23,6 +23,8 @@ log = get_logger(__name__)
 
 PROBA_COLS = [f"p_{name.lower()}" for name in CLASS_NAMES]
 VITALS_COMPLETE_COL = "vitals_complete"     # = src.data.prepare.VITALS_COMPLETE_COL
+# Kolumny meta w predykcjach (bez prawdopodobieństw), które `aligned_meta` zwraca, jeśli są
+META_COLUMNS = ("site", "esi", "target", VITALS_COMPLETE_COL, "admitted")
 DONE_JSON = "DONE.json"                     # = src.models.train.DONE_JSON (run ukończony)
 _EPS = 1e-12
 
@@ -188,8 +190,10 @@ def aligned_probas(
     """
     Prawdopodobieństwa wszystkich runów na tym samym zbiorze wierszy (po `row_id`).
 
-    Sprawdza: ten sam zbiór wierszy, identyczną etykietę dla każdego `row_id` i tę samą wersję
-    danych we wszystkich runach (inaczej ValueError — łącz tylko runy z jednego przygotowania).
+    Sprawdza: ten sam zbiór wierszy, identyczną etykietę dla każdego `row_id`, tę samą wersję
+    danych we wszystkich runach (inaczej ValueError — łącz tylko runy z jednego przygotowania)
+    i poprawność prawdopodobieństw (skończone, nieujemne, dodatnia suma wiersza — inaczej
+    ValueError z nazwą runa i liczbą złych wierszy).
 
     Returns
     -------
@@ -226,7 +230,7 @@ def aligned_probas(
         if not np.array_equal(df["target"].to_numpy(), y):
             raise ValueError(f"Run '{key}' ma inne etykiety niż '{first_key}' dla tych samych row_id — "
                              f"runy pochodzą z różnych przygotowań danych")
-    probas = {k: _normalize(df[PROBA_COLS].to_numpy(dtype=float)) for k, df in frames.items()}
+    probas = {k: _normalize(_checked_proba(df, k, split)) for k, df in frames.items()}
     if not return_vc:
         return y, probas
     vc_mask = None
@@ -235,6 +239,31 @@ def aligned_probas(
         if values.notna().any():
             vc_mask = values.fillna(0).to_numpy() == 1
     return y, probas, vc_mask
+
+
+def aligned_meta(runs: list[Run], split: str = "val") -> pd.DataFrame:
+    """
+    Kolumny meta splitu (oddział, ESI, target, vitals_complete, admitted — te, które są
+    w predykcjach) z indeksem `row_id` w KOLEJNOŚCI `aligned_probas` (rosnące row_id).
+
+    Wywołuj po `aligned_probas` (ta sprawdza, że wszystkie runy mają te same wiersze i etykiety).
+    """
+    if not runs:
+        raise ValueError("Brak runów")
+    df = runs[0].predictions(split).set_index("row_id").sort_index()
+    return df[[c for c in META_COLUMNS if c in df.columns]].copy()
+
+
+def _checked_proba(df: pd.DataFrame, key: str, split: str) -> np.ndarray:
+    """p_esi1..p_esi5 runa; NaN / nieskończoność / wartości ujemne / zerowa suma wiersza → ValueError."""
+    proba = df[PROBA_COLS].to_numpy(dtype=float)
+    bad = ~np.isfinite(proba).all(axis=1) | (proba < 0).any(axis=1)
+    bad |= ~(np.where(bad, 1.0, proba.sum(axis=1)) > 0)
+    if bad.any():
+        examples = ", ".join(str(i) for i in df.index[bad][:5])
+        raise ValueError(f"Run '{key}' ({split}): {int(bad.sum()):,} z {len(proba):,} wierszy ma prawdopodobieństwa "
+                         f"NaN / nieskończone / ujemne albo o zerowej sumie (row_id: {examples}) — popraw predykcje")
+    return proba
 
 
 def _normalize(proba: np.ndarray) -> np.ndarray:

@@ -9,9 +9,13 @@ Wykonuje:
     4. Podgrupy: pacjenci z kompletem parametrów życiowych (`vitals_complete == 1`:
        HR, SBP i RR zmierzone — populacja jak w TOPSOR, gdzie pomiar jest obowiązkowy;
        klucze `{split}_vc_{reguła}_{metryka}`) oraz każdy oddział Yale osobno.
-    5. Wykresy: macierze pomyłek (całość i podgrupa vc), krzywe ROC, kalibracja, ważność cech.
-    6. Zapis do runs/<run>/figures/ (wykresy + metrics_<split>.json);
-       dla modelu spoza runs/ — do results/figures/<model>_eval_<czas>/.
+    5. Kalibrację (zawsze): ECE top-label i per poziom ESI, MCE, pewność − trafność
+       (całość i podgrupa vc) + wykres niezawodności `reliability_<split>.png`.
+    6. Przedziały ufności 95% (bootstrap percentylowy stratyfikowany po ESI, `--bootstrap N`,
+       domyślnie 1000, 0 = wyłączone) dla obu reguł — całość i podgrupa vc.
+    7. Wykresy: macierze pomyłek (całość i podgrupa vc), krzywe ROC, kalibracja, ważność cech.
+    8. Zapis do runs/<run>/figures/ (wykresy + metrics_<split>.json z kluczami "metrics",
+       "subgroups", "calibration" i "ci"); dla modelu spoza runs/ — do results/figures/<model>_eval_<czas>/.
 
 Protokół: rozwój i porównania na VAL; `--split test` tylko do raportu końcowego.
 
@@ -21,13 +25,14 @@ Użycie:
     python scripts/04_evaluate.py --model-name lgbm --split test    # raport końcowy
     python scripts/04_evaluate.py --model path/do/model.joblib
     python scripts/04_evaluate.py --run <run> --sample 3000         # szybki test
+    python scripts/04_evaluate.py --run <run> --bootstrap 0         # bez przedziałów ufności
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -44,14 +49,24 @@ from src.data.prepare import SITE_COL, VITALS_COMPLETE_COL  # noqa: E402
 from src.ensemble import list_runs, load_run  # noqa: E402
 from src.evaluation.cross_validation import DECISION_RULES  # noqa: E402
 from src.evaluation.metrics import decide, full_evaluation  # noqa: E402
+from src.evaluation.statistics import (  # noqa: E402
+    DEFAULT_N_BINS,
+    PROBA_METRICS,
+    bootstrap_samples,
+    calibration_summary,
+    ci_to_dict,
+    format_ci,
+)
 from src.evaluation.visualizations import (  # noqa: E402
     plot_calibration,
     plot_confusion_matrix,
     plot_feature_importances,
+    plot_reliability,
     plot_roc_curves,
 )
 from src.models import MODEL_ALIASES, MODEL_REGISTRY, load_model, resolve_model_name  # noqa: E402
 from src.utils.config import CLASS_NAMES, DATA_VERSION, FIGURES_DIR, RUNS_DIR, TARGET_COL  # noqa: E402
+from src.utils.fileio import write_json_atomic  # noqa: E402
 from src.utils.logger import get_logger  # noqa: E402
 
 log = get_logger(__name__)
@@ -64,6 +79,16 @@ SUMMARY_METRICS = [
 ]
 # Kolumny prawdopodobieństw w runs/<run>/predictions_<split>.parquet (p_esi1 … p_esi5)
 PROBA_COLS = [f"p_{name.lower()}" for name in CLASS_NAMES]
+
+# Przedziały ufności: metryki w tabeli na konsoli (pełny komplet w metrics_<split>.json → "ci")
+CI_SUMMARY_METRICS = [
+    "quadratic_weighted_kappa", "undertriage_rate", "critical_miss_rate", "overtriage_rate",
+    "recall_esi1", "expected_cost", "auc_macro", "log_loss", "ece",
+]
+BOOTSTRAP_SEED = 42
+BOOTSTRAP_ALPHA = 0.05
+# Losowania „idealnie skalibrowanego” modelu — wartość odniesienia ECE (szum przy tej liczności)
+ECE_NULL_SIMS = 200
 
 # Metryki w tabeli per oddział (metryka → krótka etykieta kolumny)
 SITE_SUMMARY_METRICS: dict[str, str] = {
@@ -232,6 +257,93 @@ def evaluate_subgroups(
     return vc_metrics, info
 
 
+# ─────────────────────────────────────────
+# Kalibracja i przedziały ufności
+# ─────────────────────────────────────────
+def calibration_section(
+    y: np.ndarray, proba: np.ndarray, vc_mask: np.ndarray | None, n_bins: int = DEFAULT_N_BINS
+) -> dict[str, Any]:
+    """Miary kalibracji (ECE top-label i per poziom ESI, MCE, pewność − trafność) — całość i podgrupa vc."""
+    out: dict[str, Any] = {"all": calibration_summary(y, proba, n_bins, n_null=ECE_NULL_SIMS), "vc": None}
+    if vc_mask is not None and vc_mask.any():
+        out["vc"] = calibration_summary(y[vc_mask], proba[vc_mask], n_bins, n_null=ECE_NULL_SIMS)
+    cal = out["all"]
+    ref = cal["ece_reference"]
+    log.info(f"Kalibracja: ECE top-label = {cal['ece_top_label']:.4f} (idealny model przy tej liczności: "
+             f"~{ref['null_mean']:.4f}, p = {ref['p_value']:.3f}), ECE per poziom (średnia) = "
+             f"{cal['ece_classwise']['mean']:.4f}, MCE = {cal['mce_top_label']:.4f}, "
+             f"pewność − trafność = {cal['overconfidence']:+.4f}")
+    return out
+
+
+def bootstrap_section(
+    y: np.ndarray,
+    proba: np.ndarray,
+    vc_mask: np.ndarray | None,
+    n_boot: int,
+    seed: int = BOOTSTRAP_SEED,
+    alpha: float = BOOTSTRAP_ALPHA,
+) -> dict[str, Any] | None:
+    """
+    95% przedziały ufności (bootstrap percentylowy, losowanie w każdej klasie ESI osobno) dla obu
+    reguł decyzyjnych — całość i podgrupa vc. n_boot ≤ 0 → None.
+
+    Returns
+    -------
+    {"n_boot", "alpha", "seed", "stratified", "method", "duration_s",
+     "all": {reguła: {metryka: {value, ci_low, ci_high, se, n_valid}}}, "vc": … | None}
+    """
+    if n_boot <= 0:
+        return None
+    start = time.perf_counter()
+    out: dict[str, Any] = {"n_boot": int(n_boot), "alpha": alpha, "seed": seed, "stratified": True,
+                           "method": "percentile", "all": None, "vc": None}
+    res = bootstrap_samples(y, {"model": proba}, DECISION_RULES, n_boot=n_boot, alpha=alpha, seed=seed)
+    out["all"] = {rule: ci_to_dict(res.ci("model", rule)) for rule in DECISION_RULES}
+    if vc_mask is not None and vc_mask.any():
+        res_vc = bootstrap_samples(y[vc_mask], {"model": proba[vc_mask]}, DECISION_RULES, n_boot=n_boot,
+                                   alpha=alpha, seed=seed)
+        out["vc"] = {rule: ci_to_dict(res_vc.ci("model", rule)) for rule in DECISION_RULES}
+    out["duration_s"] = round(time.perf_counter() - start, 2)
+    log.info(f"Bootstrap {n_boot}× (całość{' + vc' if out['vc'] else ''}): {out['duration_s']:.1f} s")
+    return out
+
+
+def _ci_cell(ci: dict[str, Any] | None, rule: str, metric: str) -> str:
+    row = ((ci or {}).get(rule) or {}).get(metric)
+    if not row:
+        return "—"
+    return format_ci(row["value"], row["ci_low"], row["ci_high"], digits=4)
+
+
+def print_ci_table(ci: dict[str, Any] | None, calibration: dict[str, Any] | None, split: str) -> None:
+    """Zwięzła tabela: wartość [95% CI] dla obu reguł, całość i podgrupa vc; kalibracja w skrócie."""
+    if calibration:
+        for name, cal in (("całość", calibration.get("all")), ("vc", calibration.get("vc"))):
+            if cal:
+                ref = cal.get("ece_reference") or {}
+                noise = (f" (szum idealnego modelu ~{ref['null_mean']:.4f}, p = {ref['p_value']:.3f})"
+                         if ref else "")
+                print(f"Kalibracja ({name}): ECE top-label {cal['ece_top_label']:.4f}{noise} | ECE per poziom "
+                      f"{cal['ece_classwise']['mean']:.4f} | MCE {cal['mce_top_label']:.4f} | "
+                      f"pewność − trafność {cal['overconfidence']:+.4f}")
+    if not ci:
+        return
+    groups = [("all", "")] + ([("vc", "vc ")] if ci.get("vc") else [])
+    width = 26
+    print(f"\n=== {split.upper()}: 95% przedziały ufności (bootstrap {ci['n_boot']}×, stratyfikowany po ESI) ===")
+    decision = [m for m in CI_SUMMARY_METRICS if m not in PROBA_METRICS]
+    header = " ".join(f"{prefix + rule:>{width}s}" for _, prefix in groups for rule in DECISION_RULES)
+    print(f"{'metryka':26s} {header}")
+    for m in decision:
+        cells = [_ci_cell(ci[g], rule, m) for g, _ in groups for rule in DECISION_RULES]
+        print(f"{m:26s} " + " ".join(f"{c:>{width}s}" for c in cells))
+    print(f"{'(prawdopodobieństwa)':26s} " + " ".join(f"{prefix + 'bez reguły':>{width}s}" for _, prefix in groups))
+    for m in [m for m in CI_SUMMARY_METRICS if m in PROBA_METRICS]:
+        cells = [_ci_cell(ci[g], DECISION_RULES[0], m) for g, _ in groups]
+        print(f"{m:26s} " + " ".join(f"{c:>{width}s}" for c in cells))
+
+
 def make_plots(
     model_name: str,
     split: str,
@@ -265,6 +377,11 @@ def make_plots(
         y, proba,
         save_path=out_dir / f"calibration_{split}{suffix}.png",
         title=f"Kalibracja — {model_name} ({split})",
+    ))
+    paths.append(plot_reliability(
+        y, proba,
+        path=out_dir / f"reliability_{split}{suffix}.png",
+        title=f"Wykres niezawodności — {model_name} ({split})",
     ))
     if importances is not None and not importances.empty:
         paths.append(plot_feature_importances(
@@ -333,7 +450,11 @@ def main() -> None:
     parser.add_argument("--sample", type=int, default=None,
                         help="Stratyfikowana próbka splitu — do szybkich testów (nie do raportowania!)")
     parser.add_argument("--no-plots", action="store_true", help="Pomiń wykresy")
+    parser.add_argument("--bootstrap", type=int, default=1000, metavar="N",
+                        help="Liczba losowań bootstrap do 95%% przedziałów ufności (0 = bez przedziałów)")
     args = parser.parse_args()
+    if args.bootstrap < 0:
+        parser.error("--bootstrap musi być ≥ 0")
 
     # 1. Wybór modelu
     run = None
@@ -378,6 +499,11 @@ def main() -> None:
     # 4. Podgrupy: komplet parametrów (populacja TOPSOR) i oddziały
     vc_metrics, subgroups = evaluate_subgroups(df, proba, args.split)
     metrics.update(vc_metrics)
+    vc_mask = vitals_complete_mask(df)
+
+    # 5–6. Kalibracja (zawsze) i przedziały ufności (bootstrap)
+    calibration = calibration_section(y, proba, vc_mask)
+    ci = bootstrap_section(y, proba, vc_mask, args.bootstrap)
 
     # 5. Wykresy + zapis
     if run is not None:
@@ -390,7 +516,7 @@ def main() -> None:
     if not args.no_plots:
         log.info("Generowanie wykresów…")
         make_plots(model.name, args.split, y, proba, model.feature_importances(), out_dir, suffix,
-                   vc_mask=vitals_complete_mask(df))
+                   vc_mask=vc_mask)
 
     payload = {
         "run": run.name if run is not None else None,
@@ -404,12 +530,16 @@ def main() -> None:
         "evaluated_at": datetime.now().isoformat(timespec="seconds"),
         "metrics": metrics,
         "subgroups": subgroups,
+        "calibration": calibration,
+        "ci": ci,
     }
     metrics_path = out_dir / f"metrics_{args.split}{suffix}.json"
-    metrics_path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
+    write_json_atomic(metrics_path, payload, default=_json_default)
 
     print(f"\n=== {label} — {args.split.upper()} (n={len(df):,}) ===")
     _print_summary(metrics, args.split, subgroups)
+    print()
+    print_ci_table(ci, calibration, args.split)
 
     log.info("✓ Ewaluacja zakończona!")
     log.info(f"  Wyniki: {out_dir}")

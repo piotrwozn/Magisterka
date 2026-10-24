@@ -254,7 +254,47 @@ class TestEvaluateScript:
         assert payload["subgroups"]["vitals_complete"]["n"] > 0
         assert set(payload["subgroups"]["sites"]) <= {"A", "B", "C"}
         assert payload["subgroups"]["sites"]
-        assert "vc koszt" in capsys.readouterr().out
+        # Kalibracja zawsze, przedziały ufności domyślnie (bootstrap 1000)
+        cal = payload["calibration"]["all"]
+        assert 0 <= cal["ece_top_label"] <= 1 and "mean" in cal["ece_classwise"]
+        assert cal["ece_reference"]["n_sim"] > 0
+        assert payload["calibration"]["vc"] is not None
+        ci = payload["ci"]
+        assert ci["n_boot"] == 1000 and ci["stratified"] is True
+        qwk = ci["all"]["cost"]["quadratic_weighted_kappa"]
+        assert qwk["ci_low"] <= qwk["value"] <= qwk["ci_high"]
+        assert qwk["value"] == pytest.approx(metrics["val_cost_quadratic_weighted_kappa"])
+        assert set(ci["vc"]) == {"argmax", "cost"}
+        out = capsys.readouterr().out
+        assert "vc koszt" in out and "95% przedziały ufności" in out and "Kalibracja (całość)" in out
+
+    def test_main_bootstrap_disabled(self, prepared_paths, evaluate_script, tmp_path, monkeypatch, capsys):
+        model = _fitted_logreg(prepared_paths)
+        model_path = model.save(tmp_path / "logreg.joblib")
+        figures = tmp_path / "figures"
+        monkeypatch.setattr(evaluate_script, "FIGURES_DIR", figures)
+        monkeypatch.setattr(sys, "argv", ["04_evaluate.py", "--model", str(model_path), "--bootstrap", "0"])
+
+        evaluate_script.main()
+
+        out_dir = next(figures.glob("*"))
+        payload = json.loads((out_dir / "metrics_val.json").read_text(encoding="utf-8"))
+        assert payload["ci"] is None and payload["calibration"]["all"]["ece_top_label"] >= 0
+        assert (out_dir / "reliability_val.png").exists()
+        assert "przedziały ufności" not in capsys.readouterr().out
+
+    def test_bootstrap_section_and_table(self, evaluate_script, capsys):
+        df, proba = _toy_frame()
+        y = df[TARGET_COL].to_numpy()
+        vc = df[VITALS_COMPLETE_COL].to_numpy() == 1
+        ci = evaluate_script.bootstrap_section(y, proba, vc, n_boot=50)
+        cal = evaluate_script.calibration_section(y, proba, vc)
+        assert ci["all"]["argmax"]["undertriage_rate"]["n_valid"] == 50
+        assert ci["vc"]["cost"]["auc_macro"]["value"] is not None
+        assert evaluate_script.bootstrap_section(y, proba, vc, n_boot=0) is None
+        evaluate_script.print_ci_table(ci, cal, "val")
+        out = capsys.readouterr().out
+        assert "vc argmax" in out and "bez reguły" in out and "quadratic_weighted_kappa" in out
 
 
 # ─────────────────────────────────────────

@@ -7,6 +7,8 @@ Wykresy:
     3. Calibration plot (reliability diagram)
     4. Feature importances (top-N bar)
     5. Training history (loss/error per iteration)
+    6. Reliability diagram per poziom ESI + top-label, z liczebnością binów (plot_reliability)
+    7. Wykres leśny metryk z przedziałami ufności (plot_metric_ci)
 
 Kolory poziomów ESI = kolory TOPSOR (ESI 1 czerwony, …, ESI 5 niebieski),
 przypisane po indeksie klasy 0–4 — nie po nazwie.
@@ -342,3 +344,189 @@ def plot_training_history(
     axes[0].set_title(title, fontsize=13)
     plt.tight_layout()
     return _save_or_show(fig, save_path, show)
+
+
+# ─────────────────────────────────────────
+# Wykres niezawodności (reliability diagram) — panel na każdy poziom ESI + top-label
+# ─────────────────────────────────────────
+# Kolor panelu „top-label” (nie jest poziomem ESI — neutralny grafit)
+TOP_LABEL_COLOR = "#37474F"
+# Kolejne zestawy prawdopodobieństw na jednym wykresie (np. przed / po temperaturze)
+_SET_STYLES: list[tuple[str, str]] = [("-", "o"), ("--", "s"), (":", "^")]
+_INK = "#263238"          # tekst i obwódki znaczników (żółty TOPSOR ginie na białym tle)
+_GRID = "#B0BEC5"
+
+
+def _as_proba_sets(proba: np.ndarray | dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    if isinstance(proba, dict):
+        if not proba:
+            raise ValueError("Pusty słownik prawdopodobieństw")
+        if len(proba) > len(_SET_STYLES):
+            raise ValueError(f"Najwyżej {len(_SET_STYLES)} zestawy prawdopodobieństw na jednym wykresie")
+        return {str(k): np.asarray(v, dtype=float) for k, v in proba.items()}
+    return {"": np.asarray(proba, dtype=float)}
+
+
+def plot_reliability(
+    y_true: np.ndarray,
+    proba: np.ndarray | dict[str, np.ndarray],
+    class_names: list[str] | None = None,
+    path: Path | str | None = None,
+    n_bins: int = 15,
+    *,
+    title: str | None = None,
+    strategy: str = "uniform",
+    min_count: int = 10,
+    show: bool = False,
+):
+    """
+    Wykres niezawodności: panel „top-label” (pewność najbardziej prawdopodobnego poziomu vs
+    trafność) i po jednym panelu jeden-przeciw-reszcie dla każdego poziomu ESI (kolory TOPSOR).
+
+    Pod każdym panelem — liczebność binów (skala log) dla pierwszego zestawu. Idealna
+    kalibracja = przekątna; punkty PONIŻEJ przekątnej = model zbyt pewny siebie.
+
+    Parameters
+    ----------
+    proba : (n, 5) albo {etykieta: (n, 5)} — do 3 zestawów na tych samych panelach
+            (np. {"przed T": p, "po T": apply_temperature(p, T)}); ECE każdego w legendzie.
+    path  : plik PNG (None → bez zapisu).
+    min_count : biny z mniejszą liczbą wierszy nie trafiają na krzywą (szum pojedynczych
+            pacjentów); ECE i histogram liczone ze wszystkich.
+    """
+    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+
+    from src.evaluation.statistics import calibration_error, reliability_table
+
+    if class_names is None:
+        class_names = CLASS_NAMES
+    sets = _as_proba_sets(proba)
+    y = np.asarray(y_true)
+    n_classes = next(iter(sets.values())).shape[1]
+    panels: list[tuple[str, int | None, str]] = [("Najbardziej prawdopodobny poziom (top-label)", None,
+                                                    TOP_LABEL_COLOR)]
+    panels += [(class_names[k] if k < len(class_names) else f"klasa {k}", k,
+                _class_color(k) or TOP_LABEL_COLOR) for k in range(n_classes)]
+
+    n_cols = 3
+    n_rows = int(np.ceil(len(panels) / n_cols))
+    fig = plt.figure(figsize=(5.0 * n_cols, 5.6 * n_rows))
+    outer = GridSpec(n_rows, n_cols, figure=fig, hspace=0.32, wspace=0.28)
+
+    for i, (label, class_idx, color) in enumerate(panels):
+        r, c = divmod(i, n_cols)
+        cell = GridSpecFromSubplotSpec(2, 1, subplot_spec=outer[r, c], height_ratios=[4, 1], hspace=0.08)
+        ax = fig.add_subplot(cell[0])
+        ax_hist = fig.add_subplot(cell[1], sharex=ax)
+        ax.plot([0, 1], [0, 1], linestyle="--", color=_GRID, linewidth=1.2, label="idealna kalibracja")
+        for j, (set_label, p) in enumerate(sets.items()):
+            table = reliability_table(y, p, class_idx=class_idx, n_bins=n_bins, strategy=strategy)
+            if class_idx is None:
+                hits = (p.argmax(axis=1) == y).astype(float)
+                ece = calibration_error(p.max(axis=1), hits, n_bins, strategy)[0]
+            else:
+                ece = calibration_error(p[:, class_idx], (y == class_idx).astype(float), n_bins, strategy)[0]
+            linestyle, marker = _SET_STYLES[j]
+            name = f"{set_label}: ECE = {ece:.3f}" if set_label else f"ECE = {ece:.3f}"
+            curve = table[table["count"] >= min_count]
+            ax.plot(curve["mean_pred"], curve["observed_freq"], linestyle=linestyle, marker=marker,
+                    color=color, markeredgecolor=_INK, markeredgewidth=0.8, markersize=6, linewidth=2,
+                    label=name)
+            if j == 0:
+                widths = (table["bin_high"] - table["bin_low"]).to_numpy()
+                ax_hist.bar(table["bin_low"], table["count"], width=widths * 0.92, align="edge",
+                            color=color, edgecolor=_INK, linewidth=0.4, alpha=0.85)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_title(label, fontsize=11, color=_INK)
+        ax.set_ylabel("odsetek trafień" if class_idx is None else f"odsetek {label}", fontsize=10)
+        ax.grid(alpha=0.3)
+        ax.legend(loc="best", fontsize=8, framealpha=0.9, edgecolor="none")
+        plt.setp(ax.get_xticklabels(), visible=False)
+        ax_hist.set_yscale("log")
+        ax_hist.set_ylabel("n", fontsize=9)
+        ax_hist.set_xlabel("pewność (max p)" if class_idx is None else "przewidywane p", fontsize=10)
+        ax_hist.grid(alpha=0.3, axis="y")
+
+    fig.suptitle(title or "Kalibracja (wykres niezawodności)", fontsize=13, color=_INK, y=0.94)
+    return _save_or_show(fig, path, show)
+
+
+# ─────────────────────────────────────────
+# Wykres leśny (forest plot) metryk z przedziałami ufności
+# ─────────────────────────────────────────
+_GROUP_STYLES: list[tuple[str, str]] = [("#37474F", "o"), ("#00897B", "s"), ("#8E24AA", "D")]
+
+
+def plot_metric_ci(
+    df: pd.DataFrame,
+    path: Path | str | None = None,
+    *,
+    title: str | None = None,
+    highlight: list[str] | None = None,
+    metric_labels: dict[str, str] | None = None,
+    show: bool = False,
+):
+    """
+    Wykres leśny: wartość i przedział ufności każdego modelu / połączenia.
+
+    df : kolumny `label`, `value`, `ci_low`, `ci_high`; opcjonalnie `metric` (osobny panel na
+         każdą metrykę) i `group` (np. 'całość' / 'vc' — przesunięte znaczniki w jednym wierszu,
+         różny kształt i kolor, z legendą). Kolejność wierszy = kolejność etykiet w df (pierwsza u góry).
+    highlight : etykiety wyróżnione pogrubieniem (np. wybrane połączenie).
+    metric_labels : metryka → podpis osi X.
+    """
+    required = {"label", "value", "ci_low", "ci_high"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Brak kolumn {sorted(missing)} w tabeli do wykresu leśnego")
+    data = df.copy()
+    if "metric" not in data.columns:
+        data["metric"] = ""
+    if "group" not in data.columns:
+        data["group"] = ""
+    labels = list(dict.fromkeys(data["label"]))
+    metrics = list(dict.fromkeys(data["metric"]))
+    groups = list(dict.fromkeys(data["group"]))
+    if len(groups) > len(_GROUP_STYLES):
+        raise ValueError(f"Najwyżej {len(_GROUP_STYLES)} grupy na wykresie leśnym")
+    highlight = set(highlight or [])
+    positions = {label: len(labels) - 1 - i for i, label in enumerate(labels)}
+    # Pierwsza grupa u góry wiersza
+    offsets = np.linspace(0.18, -0.18, len(groups)) if len(groups) > 1 else np.array([0.0])
+
+    fig, axes = plt.subplots(1, len(metrics), figsize=(4.2 * len(metrics) + 1.5, 0.45 * len(labels) + 1.6),
+                             sharey=True, squeeze=False)
+    for ax, metric in zip(axes[0], metrics, strict=True):
+        part = data[data["metric"] == metric]
+        for g, group in enumerate(groups):
+            rows = part[part["group"] == group]
+            if rows.empty:
+                continue
+            color, marker = _GROUP_STYLES[g]
+            ypos = np.array([positions[label] for label in rows["label"]]) + offsets[g]
+            values = rows["value"].to_numpy(dtype=float)
+            low = rows["ci_low"].to_numpy(dtype=float)
+            high = rows["ci_high"].to_numpy(dtype=float)
+            # Przedział rysowany wprost od ci_low do ci_high: wartość punktowa metryki obciążonej
+            # (np. ECE) może leżeć poza przedziałem percentylowym — errorbar by tego nie przyjął
+            ok = np.isfinite(low) & np.isfinite(high)
+            ax.hlines(ypos[ok], low[ok], high[ok], color=color, linewidth=1.6)
+            for edge in (low, high):
+                ax.plot(edge[ok], ypos[ok], linestyle="none", marker="|", markersize=8, color=color)
+            ax.plot(values, ypos, linestyle="none", marker=marker, markersize=6, color=color,
+                    label=str(group) if group else None)
+        ax.set_xlabel((metric_labels or {}).get(metric, metric), fontsize=10)
+        ax.grid(alpha=0.3, axis="x")
+    axes[0][0].set_yticks([positions[label] for label in labels])
+    axes[0][0].set_yticklabels(labels)
+    for tick in axes[0][0].get_yticklabels():
+        if tick.get_text() in highlight:
+            tick.set_fontweight("bold")
+    axes[0][0].set_ylim(-0.7, len(labels) - 0.3)
+    if len(groups) > 1:
+        handles, names = axes[0][0].get_legend_handles_labels()
+        fig.legend(handles, names, loc="upper right", fontsize=9, frameon=False, ncol=len(groups))
+    fig.suptitle(title or "Metryki z 95% przedziałami ufności", fontsize=12, color=_INK)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return _save_or_show(fig, path, show)

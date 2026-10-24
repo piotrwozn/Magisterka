@@ -7,11 +7,14 @@
 #   make smoke        — 5–10 min: cały pipeline na próbce (test instalacji)
 #   make all          — nocny przebieg: tuning + trening 6 modeli, ewaluacja, porównanie (wznawialny)
 #   make status       — stan przebiegu z plików-znaczników
+#   make final-report — raport końcowy do pracy na TEST (raz, dla receptury wybranej na VAL)
 #   make test         — testy
 #
 # Zmienne: PROFILE=standard|thorough|quick|smoke  FEATURES=triage|full|triage,full  MODELS=all|lista
 #          RUN_ARGS="--lanes 1 --fail-fast"  (dodatkowe opcje run_all.py)
 # Pojedynczy model ręcznie: make train MODEL=xgboost ARGS="--tune --profile quick"
+# Raport końcowy: make final-report TAG=standard WEIGHTS='{"xgboost":0.4,"catboost":0.3,"ebm":0.3}' \
+#                   REPORT_ARGS="--method geometric --bootstrap 2000"
 
 PYTHON ?= python
 PROFILE ?= standard
@@ -20,11 +23,14 @@ MODELS ?= all
 MODEL ?= xgboost
 ARGS ?=
 RUN_ARGS ?=
+TAG ?= standard
+WEIGHTS ?= equal
+REPORT_ARGS ?=
 
 RUN_ALL = $(PYTHON) scripts/run_all.py --feature-set $(FEATURES) --models $(MODELS) $(RUN_ARGS)
 
 .PHONY: install install-app install-dev check-env all smoke quick thorough status dry-run \
-        convert prepare prepare-site train train-all tune compare eval explain cv demo mlflow \
+        convert prepare prepare-site train train-all tune compare eval explain cv final-report demo mlflow \
         test test-fast lint format clean clean-all
 
 # --- Instalacja ---
@@ -89,6 +95,10 @@ eval:
 
 explain:
 	$(PYTHON) scripts/05_explain.py --model-name $(MODEL) --n-patients 5
+
+# TEST — raz, na końcu: receptura (runy z tagu TAG, wagi, temperatura, reguła) wybrana wcześniej na VAL
+final-report:
+	$(PYTHON) scripts/08_final_report.py --feature-set $(FEATURES) --tag $(TAG) --weights '$(WEIGHTS)' $(REPORT_ARGS)
 
 cv:
 	$(PYTHON) scripts/06_cross_validate.py --model $(MODEL) --feature-set $(FEATURES)

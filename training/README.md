@@ -264,9 +264,10 @@ Podsumowanie i porównanie pokazują **tylko metryki VAL**. Zbiór testowy oceni
 | gdzie | co |
 |---|---|
 | `runs/<czas>_<model>_<zestaw>_<profil>/` | jeden run: `report.md` (metryki, tuning, macierz pomyłek, top cechy), `metrics.json`, `predictions_val.parquet` i `predictions_test.parquet` (`row_id, site, esi, target, vitals_complete, p_esi1…p_esi5, pred_argmax, pred_cost`), `model.joblib`, `run_info.json` (parametry, urządzenie, sprzęt, tuning), `feature_importance.csv`, `DONE.json` |
-| `runs/<run>/figures/` | z ewaluacji: macierze pomyłek (także podgrupa vc), ROC, kalibracja, ważność cech, `metrics_val.json` (z metrykami per oddział) |
+| `runs/<run>/figures/` | z ewaluacji: macierze pomyłek (także podgrupa vc), ROC, kalibracja i wykres niezawodności, ważność cech, `metrics_val.json` (metryki per oddział, `calibration`: ECE, `ci`: 95% przedziały ufności) |
 | `runs/leaderboard.csv` | jeden wiersz na ukończony run, metryki VAL (+ podgrupa vc) |
-| `runs/comparison__<zestaw>__<profil>__<czas>.md` | porównanie modeli na VAL, różnorodność, średnia równowagowa |
+| `runs/comparison__<zestaw>__<profil>__<czas>.md` | porównanie modeli na VAL (z ECE i temperaturą T), różnorodność, średnia równowagowa |
+| `runs/final_report__<zestaw>__<czas>/` | raport końcowy na TEST (punkt 14): `report.md`, `metrics.json`, `recipe.json`, `tables/`, `figures/`, `backend_ensemble_weights.json` |
 | `logs/run_all/<czas>/` | log każdego kroku (`<zestaw>__<model>__train.log`, `…__eval.log`), `preflight.json`, `status.json`, `run_all.log` |
 | `logs/optuna/` | badania Optuny (`optuna_<model>.db`) i wynik każdego badania (`<badanie>.best.json`) |
 | `logs/training/` | szczegółowe logi treningu i historia prób (`*_trials.csv`) |
@@ -320,6 +321,9 @@ final = evaluate(y_test, apply_temperature(blend(P_test, weights), T), rule="cos
 
 Pojedynczy model: `python scripts/04_evaluate.py --run <run> --split test`. Nie wracaj potem do
 strojenia — liczby z testu idą tylko do pracy.
+
+Całość tego kroku — z przedziałami ufności, kalibracją, porównaniem z najlepszym pojedynczym
+modelem i plikiem wag dla backendu — robi jedno polecenie: `scripts/08_final_report.py` (punkt 14).
 
 ## 9. Rozwiązywanie problemów
 
@@ -415,10 +419,12 @@ za mało, by go tak użyć.
 python scripts/02_preprocess.py [--split site]                       # dane → splity + DATA_AUDIT.md
 python scripts/03_train.py --model xgboost --tune --profile quick    # jeden model (tag `quick`)
 python scripts/03_train.py --model all                               # 6 modeli bez tuningu (tag `standard-notune`)
-python scripts/04_evaluate.py --run <run>                            # wykresy i metryki na val
+python scripts/04_evaluate.py --run <run>                            # wykresy, metryki, ECE i 95% CI na val
 python scripts/05_explain.py --model-name xgboost --n-patients 5     # SHAP + kontrola reguł ESI
 python scripts/06_cross_validate.py --model lightgbm                 # k-fold CV na TRAIN
 python scripts/07_compare_runs.py --tag standard                     # porównanie na val
+python scripts/07_compare_runs.py --tag standard --bootstrap 1000     # + 95% przedziały ufności (val)
+python scripts/08_final_report.py --tag standard --weights wagi.json  # raport końcowy na TEST (punkt 14)
 streamlit run app/streamlit_app.py                                   # demo (requirements-app.txt)
 ```
 
@@ -442,3 +448,107 @@ python -m pytest tests -q -m "not slow"      # bez testów w procesach
 
 Testy używają wyłącznie syntetycznych danych w katalogach tymczasowych; nie dotykają `data/`,
 `runs/` ani `logs/`.
+
+## 14. Raport końcowy do pracy (przedziały ufności, kalibracja)
+
+Gdy recepturę masz już wybraną na `val`, jedno polecenie liczy wszystkie liczby do pracy na
+zbiorze **testowym**, z zapisanych predykcji (bez ponownego treningu):
+
+```powershell
+python scripts/07_compare_runs.py --tag standard --bootstrap 1000    # 1. wybór na VAL (z przedziałami)
+python scripts/08_final_report.py --feature-set triage --tag standard --weights wagi.json --temperature fit
+```
+
+`wagi.json` to zwykły plik, np. `{"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}` (może to być też
+`backend_ensemble_weights.json` z wcześniejszego raportu). Na Linuksie JSON można podać wprost:
+`--weights '{"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}'`. W PowerShell lepiej użyć pliku,
+bo PowerShell potrafi zgubić cudzysłowy w JSON-ie. Skrót na Linuksie: `make final-report TAG=standard WEIGHTS='{…}'`.
+
+### Zalecana kolejność
+
+1. **Wybór na VAL.** Porównaj modele (`07_compare_runs.py`, z `--bootstrap 1000` dla przedziałów)
+   i ewentualnie połączenia (`src.ensemble`, punkt 8). Zdecyduj o modelach, wagach, metodzie
+   łączenia (`mean` / `geometric`), temperaturze (`fit` / `none`) i regule decyzyjnej.
+2. **Raz — TEST.** Uruchom `08_final_report.py` z tą recepturą. Skrypt na początku i na końcu
+   wypisuje ostrzeżenie, że test ocenia się raz. Jeśli dla tych samych runów istnieje już raport,
+   wylicza wcześniejsze raporty i zapisuje je w `recipe.json` (`previous_reports`).
+3. **Do pracy** bierzesz tabele z `report.md` (albo `tables/*.csv`) i wykresy z `figures/`.
+   **Do backendu** kopiujesz `backend_ensemble_weights.json` jako `backend/models/ensemble_weights.json`
+   (wagi, metoda, temperatura, reguła — format `backend/app/models/ensemble.py`).
+
+### Co jest w raporcie (`runs/final_report__<zestaw>__<czas>/`)
+
+| sekcja `report.md` | zawartość |
+|---|---|
+| Receptura | runy, wagi, temperatura (połączenia i każdego modelu), reguły, najlepszy pojedynczy model (najniższy log loss na VAL), wynik na VAL dla porównania |
+| Jak czytać | krótka instrukcja do tabel (poniżej to samo szerzej) |
+| 1. Wynik końcowy | połączenie: 15 metryk z 95% CI, cała populacja i podgrupa vc, obie reguły |
+| 2. Połączenie i modele | każdy model (z własną temperaturą z VAL) obok połączenia, z CI; wykresy leśne `forest_test_*.png` |
+| 3. Różnice sparowane | Δ = połączenie − najlepszy pojedynczy model dla QWK, niedotriażowania i log loss: przedział i p |
+| 4. Kalibracja | ECE, MCE, log loss, Brier przed i po temperaturze; ECE idealnie skalibrowanego modelu (szum); wykres `reliability_test_blend.png` |
+| 5. Macierze pomyłek | liczby i % wiersza dla każdej reguły (+ wykresy, także dla podgrupy vc) |
+| 6. Oddziały | połączenie na każdym oddziale z CI |
+| 7. Przyjęcia | AUC pilności względem przyjęcia do szpitala (model vs ESI z triażu) i odsetek przyjęć wg poziomu; gdy kolumny `admitted` nie ma ani w predykcjach, ani w przygotowanym splicie — sekcja pominięta |
+
+Poza tym: `metrics.json` (wszystkie liczby, także porównania połączenia z każdym modelem),
+`recipe.json` (receptura do odtworzenia, commit gita, argumenty) i `backend_ensemble_weights.json`.
+
+### Co znaczą liczby
+
+- **Przedział ufności 95%**, zapis `0.712 [0.701; 0.723]`. Zbiór testowy to jedna próbka
+  pacjentów. Gdyby wylosować inną z tej samej populacji, wynik byłby trochę inny. Przedział
+  pokazuje, jak bardzo. Liczymy go **bootstrapem**: 2000 razy losujemy pacjentów ze zwracaniem
+  (osobno w każdej klasie ESI, więc rzadkie ESI 1 jest w każdym losowaniu), za każdym razem
+  liczymy metrykę i bierzemy 2,5. i 97,5. percentyl. Przedział **nie** obejmuje zmienności samego
+  treningu (inne ziarno, inne hiperparametry). Dla ESI 1 (kilkaset wizyt na teście, w podgrupie
+  vc kilkadziesiąt) przedziały są szerokie i tak należy je opisać.
+- **Porównanie dwóch modeli.** Nakładające się przedziały w tabeli 2 **nie** oznaczają, że modele są
+  równie dobre. O różnicy rozstrzyga sekcja 3: **sparowany bootstrap**, czyli oba modele oceniane
+  na tych samych losowaniach pacjentów. Jeśli przedział Δ nie zawiera 0, różnica jest istotna.
+  `p` to dwustronna p-wartość z tego samego bootstrapu (najmniejsza możliwa to 1/liczba losowań).
+  Dla niedotriażowania i log loss **ujemna** Δ znaczy, że połączenie jest lepsze.
+- **ECE** (expected calibration error) mówi, czy prawdopodobieństwa „mówią prawdę”. Pacjentów
+  dzielimy na grupy według pewności modelu (np. 70–77%) i porównujemy tę pewność z odsetkiem
+  trafień w grupie. ECE to średnia różnica: 0 = idealnie, 0,03 = model myli się średnio o 3 punkty
+  procentowe w ocenie własnej pewności. ECE z grup jest **zawyżone przez szum**: nawet idealnie
+  skalibrowany model ma ECE > 0, tym większe, im mniej pacjentów. Dlatego raport podaje też
+  „ECE idealnie skalibrowanego modelu” przy tej samej liczności i p-wartość testu kalibracji
+  (małe p = kalibracja gorsza, niż wynikałoby z samego szumu). Z tego samego powodu przedział
+  bootstrap ECE bywa przesunięty w górę, a wartość punktowa może leżeć tuż pod nim. ECE modeli
+  porównuj więc parami (Δ), a nie przez nakładanie przedziałów. *ECE per poziom* robi to samo osobno
+  dla każdego poziomu ESI. **MCE** to najgorsza grupa.
+- **Temperatura T** to jeden parametr dopasowany na VAL: prawdopodobieństwa podnosi się do potęgi
+  1/T i normalizuje. T > 1 „uspokaja” zbyt pewny model, T < 1 go wyostrza. Najbardziej
+  prawdopodobny poziom (argmax) się nie zmienia, zmieniają się prawdopodobieństwa, a więc decyzje
+  reguły kosztowej. Uczciwa ocena na VAL to wartości „cross-fit”: T dopasowana na jednej połowie val
+  i oceniana na drugiej.
+- **Podgrupa vc** to pacjenci z kompletem HR, SBP i RR, czyli populacja jak w TOPSOR (punkt 11).
+  Raportuj ją zawsze obok całej populacji.
+
+### Opcje `08_final_report.py`
+
+| opcja | znaczenie |
+|---|---|
+| `--runs RUN …` albo `--feature-set FS --tag TAG [--models a,b]` | jawne runy albo najnowszy ukończony run każdego modelu (filtry jak w 07: `--include-samples`, `--include-untuned`, `--include-weighted`) |
+| `--weights JSON\|plik.json\|optimize\|equal` | wagi połączenia (domyślnie `equal`; `optimize` = minimalny log loss na VAL); model spoza wag ma wagę 0, ale w tabelach jest oceniany osobno |
+| `--method mean\|geometric` | średnia arytmetyczna albo geometryczna prawdopodobieństw |
+| `--temperature fit\|none` | temperatura połączenia dopasowana na VAL (domyślnie `fit`) |
+| `--rule argmax\|cost\|both` | reguły w raporcie (domyślnie obie); `--backend-rule` — reguła w pliku dla backendu (domyślnie `cost` przy `both`) |
+| `--bootstrap N` | liczba losowań (domyślnie 2000); `--alpha 0.05`, `--seed 42` |
+| `--decimal-comma` | przecinek dziesiętny w `report.md` (typografia polska) |
+| `--out DIR`, `--no-plots`, `--n-bins 15` | katalog raportu, bez wykresów, biny ECE |
+
+**Odmowa (kod wyjścia 2)** następuje, gdy runy pochodzą z różnych zestawów cech, wersji albo
+przygotowań danych, gdy ten sam model występuje dwa razy, gdy predykcje val/test mają różne wiersze
+lub etykiety (np. inne `--eval-sample`) albo gdy wagi są błędne (model spoza runów, waga ujemna,
+same zera).
+
+**Czas** (1 rdzeń CPU): bootstrap 1000 losowań × 56 tys. wierszy × wszystkie metryki, obie reguły
+to ~7 s na model i populację. Raport z 6 modelami i `--bootstrap 2000` trwa kilka minut.
+`04_evaluate.py` liczy ECE zawsze, a przedziały ufności z `--bootstrap N` (domyślnie 1000,
+`0` = bez nich; ~10 s na pełnym val). Wyniki zapisuje w `metrics_<split>.json` pod kluczami
+`calibration` i `ci`, a wykres w `reliability_<split>.png`.
+
+Funkcje są też dostępne bezpośrednio: `src.evaluation.statistics` (`bootstrap_ci`,
+`paired_bootstrap_diff`, `ece_top_label`, `ece_classwise`, `reliability_table`,
+`calibration_summary`, `ece_consistency`, `calibrate_on_val`, `crossfit_temperature`).
