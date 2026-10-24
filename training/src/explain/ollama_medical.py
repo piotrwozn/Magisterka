@@ -2,14 +2,17 @@
 Ollama medical reasoning — lokalny LLM generujący wyjaśnienia kliniczne.
 
 Łączy:
-    - Dane pacjenta (vital signs, chief complaint, demografia)
-    - Predykcję ML modelu
-    - SHAP explanation (top features)
-    - MTS rule check
+    - Dane pacjenta (parametry życiowe, skargi główne, demografia, sposób przybycia)
+    - Predykcję modelu (poziom ESI 1–5 + kolor TOPSOR)
+    - Wyjaśnienie SHAP (top cechy)
+    - Regułową weryfikację parametrów życiowych (ESI, punkty A / B / D)
     →
     Wyjaśnienie po polsku w stylu lekarza medycyny ratunkowej:
-        "Pacjent zaklasyfikowany jako Red ze względu na...
+        "Pacjent zaklasyfikowany jako ESI 2 (pomarańczowy) ze względu na...
          Sugerowane badania diagnostyczne:..."
+
+Dane pacjenta w schemacie kanonicznym (triage_vital_*, temperatura w °C, cc_*,
+arrival_*, is_male); stare nazwy (triage_sbp, triage_pulse …) są akceptowane.
 """
 
 from __future__ import annotations
@@ -20,6 +23,8 @@ from typing import Any
 import requests
 
 from src.utils.config import (
+    CLASS_NAMES,
+    CLASS_NAMES_PL,
     OLLAMA_BASE_URL,
     OLLAMA_DEFAULT_MODEL,
     OLLAMA_MAX_TOKENS,
@@ -35,40 +40,43 @@ log = get_logger(__name__)
 # Prompt template
 # ─────────────────────────────────────────
 SYSTEM_PROMPT_PL = """Jesteś doświadczonym lekarzem medycyny ratunkowej pracującym na polskim Szpitalnym Oddziale Ratunkowym (SOR). \
-Specjalizujesz się w protokole Manchester Triage System (MTS). Twoje wyjaśnienia są zwięzłe, profesjonalne, \
+Znasz algorytm triażu Emergency Severity Index (ESI, poziomy 1–5), stosowany w polskich SOR w systemie TOPSOR \
+z kolorami: ESI 1 czerwony (natychmiast), ESI 2 pomarańczowy (do 10 min), ESI 3 żółty (do 60 min), \
+ESI 4 zielony (do 120 min), ESI 5 niebieski (do 240 min). Twoje wyjaśnienia są zwięzłe, profesjonalne, \
 oparte na evidence-based medicine i zawsze ostrożne (bezpieczeństwo pacjenta > efektywność)."""
 
 
 PATIENT_PROMPT_TEMPLATE = """## DANE PACJENTA NA TRIAŻU
 - Wiek: {age}
 - Płeć: {sex}
+- Sposób przybycia: {arrival}
 - Ciśnienie tętnicze: {sbp}/{dbp} mmHg
-- Tętno: {pulse} bpm
-- Częstość oddechów: {resp}/min
-- Saturacja O2: {o2sat}%
-- Temperatura: {temp}°C
+- Tętno: {pulse} /min
+- Częstość oddechów: {resp} /min
+- Saturacja O2: {o2sat}% {o2_device}
+- Temperatura: {temp} °C
 - Skala bólu (0-10): {pain}
-- Główna skarga: {chief_complaint}
+- Skargi główne: {chief_complaint}
 
-## KLASYFIKACJA SYSTEMU AI
-- **Przydzielona kategoria MTS**: {predicted_class} ({predicted_class_pl})
+## KLASYFIKACJA SYSTEMU AI (ESI / TOPSOR)
+- **Przydzielony poziom**: {predicted_class} — {predicted_class_pl}
 - **Pewność predykcji**: {confidence:.1%}
-- **Probabilities (wszystkie klasy)**: {probabilities}
+- **Prawdopodobieństwa (ESI 1–5)**: {probabilities}
 
-## TOP CECHY POPYCHAJĄCE DECYZJĘ (SHAP)
+## TOP CECHY PODNOSZĄCE WYNIK TEGO POZIOMU (SHAP)
 {shap_top_for}
 
 ## CECHY DZIAŁAJĄCE PRZECIW (SHAP)
 {shap_top_against}
 
-## REGUŁOWA WERYFIKACJA MTS
+## REGUŁOWA WERYFIKACJA PARAMETRÓW (ESI)
 {rule_check}
 
 ## TWOJE ZADANIE
 Wyjaśnij zwięźle (max 250 słów, w języku POLSKIM):
 1. **MEDYCZNE UZASADNIENIE** klasyfikacji — odnieś się do konkretnych objawów i parametrów.
 2. **POTENCJALNE ZAGROŻENIA** — na co pielęgniarka triażowa powinna zwrócić uwagę?
-3. **OCENA ZGODNOŚCI** — czy predykcja AI wydaje się klinicznie zasadna? Jeśli nie — dlaczego?
+3. **OCENA ZGODNOŚCI** — czy poziom ESI wskazany przez AI wydaje się klinicznie zasadny? Jeśli nie — dlaczego?
 4. **SUGEROWANE DALSZE POSTĘPOWANIE** — pilne badania diagnostyczne, monitoring.
 
 Format: krótkie sekcje z nagłówkami **pogrubionymi**. Język medyczny, ale zrozumiały.
@@ -144,15 +152,15 @@ class OllamaMedicalExplainer:
         patient_data : dict
             Dane pacjenta (vital signs, chief complaint, demografia).
         predicted_class : str
-            np. 'Orange'
+            np. 'ESI2' (config.CLASS_NAMES)
         predicted_class_pl : str
-            np. 'Pomarańczowy (Bardzo pilny)'
+            np. 'ESI 2 · pomarańczowy (do 10 min)' (config.CLASS_NAMES_PL)
         probabilities : dict
             {class_name: probability}
         shap_explanation : dict, optional
             Z SHAPTriageExplainer.explain_patient().
         rule_check : dict, optional
-            Z mts_rules.rule_based_triage().
+            Z esi_rules.rule_based_triage() (weryfikacja parametrów wg ESI).
 
         Returns
         -------
@@ -190,25 +198,35 @@ class OllamaMedicalExplainer:
 
         # Rule check
         if rule_check:
-            from src.explain.mts_rules import explain_rule_decision
+            from src.explain.esi_rules import explain_rule_decision
             rule_text = explain_rule_decision(rule_check)
         else:
             rule_text = "(brak weryfikacji regułowej)"
 
         confidence = max(probabilities.values()) if probabilities else 0.0
-        proba_str = ", ".join(f"{k}: {v:.1%}" for k, v in probabilities.items())
+        labels = dict(zip(CLASS_NAMES, CLASS_NAMES_PL))
+        proba_str = ", ".join(f"{labels.get(k, k).split(' (')[0]}: {v:.1%}" for k, v in probabilities.items())
 
+        from src.explain.esi_rules import resolve_vital
+
+        def vital(name: str) -> str:
+            value = resolve_vital(patient_data, name)
+            return "brak pomiaru" if value is None else f"{value:g}"
+
+        o2_device = _first(patient_data, "triage_vital_o2_device", "o2_device")
         return PATIENT_PROMPT_TEMPLATE.format(
-            age=patient_data.get("age", "n/a"),
-            sex=patient_data.get("sex", "n/a"),
-            sbp=patient_data.get("triage_sbp", patient_data.get("sbp", "n/a")),
-            dbp=patient_data.get("triage_dbp", patient_data.get("dbp", "n/a")),
-            pulse=patient_data.get("triage_pulse", patient_data.get("pulse", "n/a")),
-            resp=patient_data.get("triage_resp", patient_data.get("resp", "n/a")),
-            o2sat=patient_data.get("triage_o2sat", patient_data.get("o2sat", "n/a")),
-            temp=patient_data.get("triage_temp", patient_data.get("temp", "n/a")),
-            pain=patient_data.get("triage_pain", patient_data.get("pain", "n/a")),
-            chief_complaint=patient_data.get("chief_complaint", "n/a"),
+            age=_fmt_value(patient_data.get("age")),
+            sex=_sex_label(patient_data),
+            arrival=_arrival_label(patient_data),
+            sbp=vital("triage_vital_sbp"),
+            dbp=vital("triage_vital_dbp"),
+            pulse=vital("triage_vital_hr"),
+            resp=vital("triage_vital_rr"),
+            o2sat=vital("triage_vital_o2"),
+            o2_device="(tlenoterapia)" if _is_positive(o2_device) else "",
+            temp=vital("triage_vital_temp"),
+            pain=vital("triage_pain"),
+            chief_complaint=_complaints_label(patient_data),
             predicted_class=predicted_class,
             predicted_class_pl=predicted_class_pl,
             confidence=confidence,
@@ -273,7 +291,7 @@ class OllamaMedicalExplainer:
         """Generuje fallback gdy LLM nie działa."""
         return (
             f"⚠️ Wyjaśnienie medyczne LLM niedostępne (błąd: {error}).\n\n"
-            "Zalecenie: Skorzystaj z wyjaśnienia regułowego (sekcja MTS) i SHAP. "
+            "Zalecenie: skorzystaj z weryfikacji regułowej (parametry życiowe wg ESI) i SHAP. "
             "Aby aktywować wyjaśnienia LLM, uruchom Ollama:\n"
             "    ollama serve\n"
             "    ollama pull mistral"
@@ -327,3 +345,70 @@ class OllamaMedicalExplainer:
                         continue
         except requests.RequestException as e:
             yield self._fallback_explanation(error=str(e))
+
+
+# ─────────────────────────────────────────
+# Helpery — opis pacjenta do promptu
+# ─────────────────────────────────────────
+# Klucze = kolumny one-hot `arrival_<kategoria>` (src.data.yale_schema.ARRIVAL_CATEGORIES)
+ARRIVAL_LABELS_PL: dict[str, str] = {
+    "arrival_ambulance": "zespół ratownictwa medycznego",
+    "arrival_self": "samodzielnie",
+    "arrival_other": "inny (np. policja, wózek)",
+}
+
+
+def _first(data: dict, *keys: str) -> Any:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+    return None
+
+
+def _is_positive(value: Any) -> bool:
+    try:
+        return float(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _fmt_value(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return "n/a" if f != f else f"{f:g}"
+
+
+def _sex_label(data: dict) -> str:
+    if data.get("sex") is not None:
+        return str(data["sex"])
+    is_male = data.get("is_male")
+    if is_male is None or _fmt_value(is_male) == "n/a":
+        return "n/a"
+    return "mężczyzna" if _is_positive(is_male) else "kobieta"
+
+
+def _arrival_label(data: dict) -> str:
+    if data.get("arrival_mode"):
+        return str(data["arrival_mode"])
+    for col, label in ARRIVAL_LABELS_PL.items():
+        if _is_positive(data.get(col)):
+            return label
+    return "n/a"
+
+
+def _complaints_label(data: dict) -> str:
+    """Skargi główne: pole tekstowe `chief_complaint` albo aktywne flagi cc_*."""
+    if data.get("chief_complaint"):
+        return str(data["chief_complaint"])
+    from src.features.engineering import ENGINEERED_FEATURES
+
+    engineered = set(ENGINEERED_FEATURES)
+    active = [
+        k[3:] for k, v in data.items()
+        if k.startswith("cc_") and k not in engineered and _is_positive(v)
+    ]
+    return ", ".join(active) if active else "n/a"

@@ -44,6 +44,24 @@ optuna_studies.db
 *.pt
 *.pth
 
+# ─── Trening (training/) — artefakty generowane lokalnie ───
+# Surowe dane Yale (5v_cleandf.rdata, yale_emmlc_raw.parquet) zostają w repo;
+# splity ESI, modele, predykcje, raporty i badania Optuny odtwarza `python scripts/run_all.py`.
+training/data/processed/esi/
+training/data/processed/*.parquet
+!training/data/processed/yale_emmlc_raw.parquet
+training/runs/
+training/logs/
+training/mlruns/
+training/.venv/
+training/venv/
+training/models/*
+!training/models/.gitkeep
+training/results/figures/*
+training/results/tables/*
+training/results/reports/*
+!training/results/**/.gitkeep
+
 # ─── Dane (poza listingiem katalogu) ───
 data/raw/*.csv
 data/raw/*.RData
@@ -68,6 +86,9 @@ models/*.txt
 models/*.bin
 models/*.pkl
 !models/.gitkeep
+
+# ─── Java (Maven, backend/gateway) ───
+backend/gateway/target/
 
 # ─── OS ───
 .DS_Store

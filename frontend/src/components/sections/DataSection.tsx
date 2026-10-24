@@ -31,14 +31,14 @@ export function DataSection() {
               <h3 className="text-lg font-bold">{t("data.features.title")}</h3>
               <dl className="mt-5 space-y-3">
                 <Row label={t("data.features.original")}>
-                  <CountUp to={293} duration={1.6} />
+                  <CountUp to={214} duration={1.6} />
                 </Row>
                 <Row label={t("data.features.engineered")}>
-                  +<CountUp to={43} duration={1.8} />
+                  +<CountUp to={57} duration={1.8} />
                 </Row>
                 <div className="my-2 h-px bg-border" />
                 <Row label={t("data.features.total")} bold>
-                  <CountUp to={336} duration={2} />
+                  <CountUp to={271} duration={2} />
                 </Row>
               </dl>
               <p className="mt-4 text-xs text-muted-foreground">

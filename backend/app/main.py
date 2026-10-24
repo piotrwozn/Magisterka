@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +26,13 @@ async def lifespan(_app: FastAPI):
     log.info("SOR-AI Backend starting")
     log.info("  models_dir : %s", settings.models_dir)
     log.info("  feature_set: %s", settings.feature_set)
+    log.info("  timezone   : %s", settings.timezone)
     log.info("=" * 60)
+    try:   # arrival_* features use the ED's local time — fail at startup, not per request
+        ZoneInfo(settings.timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise RuntimeError(f"TIMEZONE={settings.timezone!r} is not a known IANA time zone "
+                           f"(Windows: pip install tzdata) — {exc}") from exc
 
     registry.load_from_dir(settings.models_dir)
 
@@ -42,7 +49,11 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="SOR-AI Triage API",
     version="1.0.0",
-    description="ML-powered Manchester Triage decision support",
+    description=(
+        "ML-powered triage decision support: Emergency Severity Index (ESI 1–5), "
+        "TOPSOR colours (red, orange, yellow, green, blue) for display. "
+        "Every category is a class index 0–4 = ESI 1–5."
+    ),
     lifespan=lifespan,
 )
 

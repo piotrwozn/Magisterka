@@ -6,11 +6,13 @@ import { Link } from "react-router-dom";
 
 import { AuroraBackground } from "@/components/animations/AuroraBackground";
 import { CountUp } from "@/components/animations/CountUp";
+import { MetricValue } from "@/components/shared/MetricValue";
 import { MagneticButton } from "@/components/animations/MagneticButton";
 import { Marquee } from "@/components/animations/Marquee";
 import { TextReveal } from "@/components/animations/TextReveal";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { MODELS, RESULTS } from "@/lib/constants";
 
 const NeuralNetworkScene = lazy(() =>
   import("@/components/animations/NeuralNetworkScene").then((m) => ({
@@ -19,15 +21,15 @@ const NeuralNetworkScene = lazy(() =>
 );
 
 const MARQUEE_ITEMS = [
-  "QWK 0.8718",
+  "Emergency Severity Index (ESI 1–5)",
   "·",
-  "Manchester Triage System",
+  "TOPSOR",
   "·",
-  "8× RTX 5090",
+  "Yale EMMLC · 558k",
   "·",
-  "Optuna 5-fold CV",
+  "Optuna k-fold CV",
   "·",
-  "CatBoost · XGBoost · LightGBM · cuML RF · EBM",
+  "XGBoost · LightGBM · CatBoost · RF · EBM · LogReg",
   "·",
   "MedGemma 27B",
   "·",
@@ -104,15 +106,15 @@ export function Hero() {
           >
             <Metric
               label={t("hero.metric1")}
-              value={<CountUp to={0.8718} decimals={4} duration={2.4} />}
+              value={<MetricValue value={RESULTS?.qwk} decimals={4} duration={2.4} />}
             />
             <Metric
               label={t("hero.metric2")}
-              value={<CountUp to={0.06} decimals={2} suffix="%" duration={2.4} />}
+              value={<MetricValue value={RESULTS?.criticalMiss} decimals={2} suffix="%" duration={2.4} />}
             />
             <Metric
               label={t("hero.metric3")}
-              value={<CountUp to={350} suffix=" ms" duration={2.4} />}
+              value={<CountUp to={MODELS.length} duration={2.4} />}
             />
           </motion.div>
 

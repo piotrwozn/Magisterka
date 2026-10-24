@@ -1,30 +1,31 @@
 import { motion } from "framer-motion";
 import { Award, CheckCircle2, Cpu, Hourglass, Loader2, Lock } from "lucide-react";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 
-import { CountUp } from "@/components/animations/CountUp";
 import { TiltCard } from "@/components/animations/TiltCard";
 import { ModelDetailModal } from "@/components/journey/ModelDetailModal";
+import { MetricValue } from "@/components/shared/MetricValue";
 import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { MODELS, type Model } from "@/lib/constants";
-import { cn } from "@/lib/utils";
+import { MODELS, bestModel, type Model } from "@/lib/constants";
+import { cn, formatMetric } from "@/lib/utils";
 
 export function JourneyModelsGrid() {
+  const { t } = useTranslation("sections");
   const [selected, setSelected] = useState<Model | null>(null);
 
-  const trained = MODELS.filter((m) => m.status === "trained");
-  const best = (trained.length > 0 ? trained : MODELS).reduce((a, b) => (a.qwk > b.qwk ? a : b));
+  const best = bestModel(MODELS);
 
   return (
     <>
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
         {MODELS.map((model, idx) => {
-          const isBest = model.id === best.id;
+          const isBest = model.id === best?.id;
           const isTrained = model.status === "trained";
           const isTraining = model.status === "training";
           const isPlanned = model.status === "planned";
-          const isClickable = isTrained;
+          const isClickable = true;    // details (description, notes) also before training
 
           return (
             <motion.div
@@ -80,15 +81,11 @@ export function JourneyModelsGrid() {
                     <div className="flex items-baseline justify-between">
                       <span className="text-xs text-muted-foreground">QWK</span>
                       <span className={cn("text-xl font-bold tabular-nums", isPlanned && "text-muted-foreground")}>
-                        {isTrained
-                          ? <CountUp to={model.qwk} decimals={4} duration={1.6} />
-                          : model.qwk.toFixed(4)
-                        }
-                        {isTraining || isPlanned ? <span className="ml-0.5 text-[10px] text-muted-foreground">est.</span> : null}
+                        <MetricValue value={model.qwk} decimals={4} duration={1.6} />
                       </span>
                     </div>
                     <Progress
-                      value={model.qwk * 100}
+                      value={(model.qwk ?? 0) * 100}
                       className={cn("h-1.5", isPlanned && "opacity-40")}
                     />
                   </div>
@@ -106,7 +103,7 @@ export function JourneyModelsGrid() {
                       </div>
                       <div className="flex flex-col items-center">
                         <span className="text-muted-foreground">UT</span>
-                        <span className="font-bold">{model.undertriage.toFixed(1)}%</span>
+                        <span className="font-bold">{formatMetric(model.undertriage, 1, "%")}</span>
                       </div>
                     </div>
                   )}
@@ -117,14 +114,14 @@ export function JourneyModelsGrid() {
                       <Cpu className="size-2.5" />{model.device}
                     </span>
                     <span className="flex items-center gap-1">
-                      <Hourglass className="size-2.5" />{model.trainTimeMin}m
+                      <Hourglass className="size-2.5" />{formatMetric(model.trainTimeMin, 0, "m")}
                     </span>
                   </div>
 
                   {/* Click hint */}
                   {isClickable && (
                     <div className="absolute inset-x-0 bottom-0 translate-y-full rounded-b-lg bg-primary/90 py-1 text-center text-[10px] font-semibold text-primary-foreground transition-transform duration-200 group-hover:translate-y-0">
-                      Kliknij po szczegóły
+                      {t("models.modal.clickDetails")}
                     </div>
                   )}
                 </Card>

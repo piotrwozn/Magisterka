@@ -11,36 +11,17 @@ import {
   YAxis,
 } from "recharts";
 
-import { CountUp } from "@/components/animations/CountUp";
 import { FadeInOnScroll } from "@/components/animations/FadeInOnScroll";
+import { MetricValue } from "@/components/shared/MetricValue";
 import { SectionHeader } from "@/components/shared/SectionHeader";
 import { Card } from "@/components/ui/card";
-import { MODELS, MTS_CATEGORIES } from "@/lib/constants";
-
-const CONFUSION_MATRIX = [
-  [1480, 32, 2, 0, 0],
-  [38, 8412, 421, 18, 1],
-  [2, 384, 33218, 1842, 12],
-  [0, 11, 1742, 47215, 384],
-  [0, 0, 8, 218, 5680],
-];
-
-const FEATURE_IMPORTANCE = [
-  { feature: "triage_vital_sbp", value: 0.087 },
-  { feature: "triage_vital_hr", value: 0.082 },
-  { feature: "triage_vital_o2", value: 0.071 },
-  { feature: "age_group", value: 0.058 },
-  { feature: "triage_vital_temp", value: 0.052 },
-  { feature: "shock_index", value: 0.048 },
-  { feature: "triage_vital_rr", value: 0.045 },
-  { feature: "cc_chestpain", value: 0.041 },
-  { feature: "cc_respiratory", value: 0.038 },
-  { feature: "mews_score", value: 0.036 },
-];
+import { ESI_LEVELS, MODELS, RESULTS } from "@/lib/constants";
 
 export function ResultsSection() {
-  const { t, i18n } = useTranslation("sections");
-  const isPl = (i18n.resolvedLanguage ?? "pl").startsWith("pl");
+  const { t } = useTranslation("sections");
+  const scored = MODELS.filter((m) => m.qwk !== undefined);
+  const confusion = RESULTS?.confusionMatrix;
+  const importance = RESULTS?.featureImportance;
 
   return (
     <section id="results" className="relative py-24 md:py-32">
@@ -57,28 +38,28 @@ export function ResultsSection() {
           <KpiCard
             icon={TrendingUp}
             label={t("results.kpis.qwk")}
-            value={<CountUp to={0.8718} decimals={4} duration={2} />}
+            value={<MetricValue value={RESULTS?.qwk} decimals={4} />}
             description={t("results.kpis.qwkDesc")}
             color="hsl(199 89% 58%)"
           />
           <KpiCard
             icon={AlertOctagon}
             label={t("results.kpis.undertriage")}
-            value={<CountUp to={2.7} decimals={1} suffix="%" duration={2} />}
+            value={<MetricValue value={RESULTS?.undertriage} decimals={1} suffix="%" />}
             description={t("results.kpis.undertriageDesc")}
             color="hsl(40 96% 56%)"
           />
           <KpiCard
             icon={ShieldCheck}
             label={t("results.kpis.criticalMiss")}
-            value={<CountUp to={0.06} decimals={2} suffix="%" duration={2} />}
+            value={<MetricValue value={RESULTS?.criticalMiss} decimals={2} suffix="%" />}
             description={t("results.kpis.criticalMissDesc")}
             color="hsl(160 70% 50%)"
           />
           <KpiCard
             icon={Activity}
             label={t("results.kpis.overtriage")}
-            value={<CountUp to={23} suffix="%" duration={2} />}
+            value={<MetricValue value={RESULTS?.overtriage} decimals={1} suffix="%" />}
             description={t("results.kpis.overtriageDesc")}
             color="hsl(280 80% 60%)"
           />
@@ -88,10 +69,13 @@ export function ResultsSection() {
           <FadeInOnScroll>
             <Card className="p-6 lg:col-span-2">
               <h3 className="mb-4 text-lg font-bold">{t("results.comparisonTitle")}</h3>
+              {scored.length === 0 ? (
+                <PendingNote text={t("results.pending")} />
+              ) : (
               <div className="h-72">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart
-                    data={MODELS.map((m) => ({ name: m.name, qwk: m.qwk, color: m.color }))}
+                    data={scored.map((m) => ({ name: m.name, qwk: m.qwk, color: m.color }))}
                     margin={{ top: 10, right: 10, left: -10, bottom: 0 }}
                   >
                     <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" />
@@ -110,21 +94,25 @@ export function ResultsSection() {
                       formatter={(v: number) => v.toFixed(4)}
                     />
                     <Bar dataKey="qwk" radius={[8, 8, 0, 0]} animationDuration={1400}>
-                      {MODELS.map((m) => (
+                      {scored.map((m) => (
                         <Cell key={m.id} fill={m.color} />
                       ))}
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
               </div>
+              )}
             </Card>
           </FadeInOnScroll>
 
           <FadeInOnScroll delay={0.1}>
             <Card className="p-6">
               <h3 className="mb-4 text-lg font-bold">{t("results.featureImportanceTitle")}</h3>
+              {!importance || importance.length === 0 ? (
+                <PendingNote text={t("results.pending")} />
+              ) : (
               <div className="space-y-2.5">
-                {FEATURE_IMPORTANCE.map((f, i) => (
+                {importance.map((f, i) => (
                   <div key={f.feature} className="space-y-1">
                     <div className="flex justify-between text-xs">
                       <span className="font-mono">{f.feature}</span>
@@ -136,7 +124,7 @@ export function ResultsSection() {
                       <div
                         className="h-full rounded-full bg-gradient-to-r from-primary to-purple-500"
                         style={{
-                          width: `${(f.value / FEATURE_IMPORTANCE[0]!.value) * 100}%`,
+                          width: `${(f.value / importance[0]!.value) * 100}%`,
                           animation: `slide-up 0.8s ${i * 0.08}s ease-out backwards`,
                         }}
                       />
@@ -144,6 +132,7 @@ export function ResultsSection() {
                   </div>
                 ))}
               </div>
+              )}
             </Card>
           </FadeInOnScroll>
         </div>
@@ -151,32 +140,31 @@ export function ResultsSection() {
         <FadeInOnScroll delay={0.15}>
           <Card className="overflow-hidden p-6">
             <h3 className="mb-5 text-lg font-bold">{t("results.confusionTitle")}</h3>
+            {!confusion ? (
+              <PendingNote text={t("results.pending")} />
+            ) : (
             <div className="overflow-x-auto">
               <table className="mx-auto border-collapse">
                 <thead>
                   <tr>
                     <th className="p-2 text-xs text-muted-foreground"></th>
-                    {MTS_CATEGORIES.map((c) => (
+                    {ESI_LEVELS.map((c) => (
                       <th key={c.id} className="p-2 text-xs">
-                        <span style={{ color: c.color }}>
-                          {isPl ? c.labelPl.slice(0, 3) : c.labelEn.slice(0, 3)}
-                        </span>
+                        <span style={{ color: c.color }}>ESI {c.level}</span>
                       </th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {CONFUSION_MATRIX.map((row, i) => {
+                  {confusion.map((row, i) => {
                     const rowTotal = row.reduce((a, b) => a + b, 0);
                     return (
                       <tr key={i}>
-                        <th className="p-2 text-right text-xs" style={{ color: MTS_CATEGORIES[i]!.color }}>
-                          {isPl
-                            ? MTS_CATEGORIES[i]!.labelPl.slice(0, 3)
-                            : MTS_CATEGORIES[i]!.labelEn.slice(0, 3)}
+                        <th className="p-2 text-right text-xs" style={{ color: ESI_LEVELS[i]!.color }}>
+                          ESI {ESI_LEVELS[i]!.level}
                         </th>
                         {row.map((v, j) => {
-                          const pct = (v / rowTotal) * 100;
+                          const pct = rowTotal > 0 ? (v / rowTotal) * 100 : 0;
                           const isDiag = i === j;
                           return (
                             <td
@@ -184,7 +172,7 @@ export function ResultsSection() {
                               className="border border-border/40 p-2 text-center font-mono text-xs tabular-nums transition-all hover:scale-105"
                               style={{
                                 backgroundColor: isDiag
-                                  ? `${MTS_CATEGORIES[i]!.color}${Math.floor((pct / 100) * 200)
+                                  ? `${ESI_LEVELS[i]!.color}${Math.floor((pct / 100) * 200)
                                       .toString(16)
                                       .padStart(2, "0")}`
                                   : `hsl(var(--muted) / ${Math.min(pct / 50, 1)})`,
@@ -201,13 +189,25 @@ export function ResultsSection() {
                 </tbody>
               </table>
             </div>
-            <p className="mt-4 text-xs text-muted-foreground">
-              Wartości na diagonali = poprawne klasyfikacje. Diagonal accuracy: ~94%. (Wartości ilustracyjne — pełna macierz w raporcie pracy.)
-            </p>
+            )}
+            {confusion && (
+              <p className="mt-4 text-xs text-muted-foreground">
+                Wiersze = prawdziwy poziom ESI, kolumny = predykcja; diagonala = poprawne klasyfikacje
+                ({RESULTS?.source}).
+              </p>
+            )}
           </Card>
         </FadeInOnScroll>
       </div>
     </section>
+  );
+}
+
+function PendingNote({ text }: { text: string }) {
+  return (
+    <div className="flex h-40 items-center justify-center rounded-lg border border-dashed border-border/60 p-6 text-center text-sm text-muted-foreground">
+      {text}
+    </div>
   );
 }
 

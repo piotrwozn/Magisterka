@@ -3,16 +3,22 @@ uvicorn[standard]>=0.30.0
 pydantic>=2.8.0
 pydantic-settings>=2.5.0
 python-dotenv>=1.0.0
+# IANA time zones for zoneinfo (settings.timezone, default Europe/Warsaw) —
+# Windows and slim containers have no system tz database
+tzdata>=2024.1
 
-# ML inference
+# ML inference — the SAME versions as training (training/requirements.txt);
+# pickled estimators are version-sensitive (scikit-learn warns or breaks across
+# minor versions, EBM needs interpret-core to unpickle).
 joblib>=1.4.0
-numpy>=1.26.0
-pandas>=2.2.0
-scikit-learn>=1.5.0
-catboost>=1.2.0
-lightgbm>=4.5.0
-xgboost>=2.1.0
-shap>=0.46.0
+numpy>=2.5.4,<3
+pandas>=3.0.6,<4
+scikit-learn>=1.9.1,<1.10
+xgboost>=3.4.1,<4
+lightgbm>=4.7.0,<5
+catboost>=1.2.10,<1.3
+interpret-core>=0.7.8,<0.8     # EBM artifacts (ExplainableBoostingClassifier)
+shap>=0.54.1,<0.55
 
 # HTTP (Ollama client)
 httpx>=0.27.0

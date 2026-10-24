@@ -1,39 +1,54 @@
 """
-Wizualizacje wyników modelu triażowego.
+Wizualizacje wyników modelu triażowego (5 klas: ESI 1–5).
 
 Wykresy:
     1. Confusion matrix (annotowany heatmap)
-    2. ROC curves per klasa (One-vs-Rest)
+    2. ROC curves per poziom ESI (One-vs-Rest)
     3. Calibration plot (reliability diagram)
     4. Feature importances (top-N bar)
     5. Training history (loss/error per iteration)
+
+Kolory poziomów ESI = kolory TOPSOR (ESI 1 czerwony, …, ESI 5 niebieski),
+przypisane po indeksie klasy 0–4 — nie po nazwie.
+
+Backend: przy imporcie poza notebookiem ustawiany jest nieinteraktywny `Agg`
+(zapis do plików na serwerze/CI bez okien). Nadpisanie: zmienna MPLBACKEND.
 """
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import seaborn as sns
-from sklearn.calibration import calibration_curve
-from sklearn.metrics import auc, confusion_matrix, roc_curve
+import matplotlib
 
-from src.utils.config import CLASS_NAMES, FIGURES_DIR
-from src.utils.logger import get_logger
+if "ipykernel" not in sys.modules and not os.environ.get("MPLBACKEND"):
+    matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import seaborn as sns  # noqa: E402
+from sklearn.calibration import calibration_curve  # noqa: E402
+from sklearn.metrics import auc, confusion_matrix, roc_curve  # noqa: E402
+
+from src.utils.config import CLASS_NAMES, TOPSOR_HEX  # noqa: E402
+from src.utils.logger import get_logger  # noqa: E402
 
 log = get_logger(__name__)
 
 
-# Kolory MTS (visual cue)
-MTS_COLORS = {
-    "Red": "#D32F2F",
-    "Orange": "#F57C00",
-    "Yellow": "#FBC02D",
-    "Green": "#388E3C",
-    "Blue": "#1976D2",
-}
+# ─────────────────────────────────────────
+# Kolory poziomów ESI (TOPSOR)
+# ─────────────────────────────────────────
+# Kolor klasy o indeksie i (0 = ESI 1, …, 4 = ESI 5) — odcienie z config.TOPSOR_HEX
+ESI_COLORS: list[str] = [TOPSOR_HEX[name] for name in CLASS_NAMES]
+
+
+def _class_color(index: int) -> str | None:
+    """Kolor TOPSOR dla indeksu klasy (None poza zakresem → kolor domyślny)."""
+    return ESI_COLORS[index] if 0 <= index < len(ESI_COLORS) else None
 
 
 def _save_or_show(
@@ -66,11 +81,11 @@ def plot_confusion_matrix(
     class_names: list[str] | None = None,
     normalize: str | None = "true",
     save_path: Path | str | None = None,
-    title: str = "Confusion Matrix",
+    title: str = "Macierz pomyłek",
     show: bool = False,
 ):
     """
-    Annotowany confusion matrix.
+    Annotowany confusion matrix (wiersze = prawdziwy poziom ESI, kolumny = predykcja).
 
     Parameters
     ----------
@@ -89,9 +104,9 @@ def plot_confusion_matrix(
     elif normalize == "pred":
         cm_norm = cm.astype(float) / (cm.sum(axis=0, keepdims=True) + 1e-12)
     elif normalize == "all":
-        cm_norm = cm.astype(float) / cm.sum()
+        cm_norm = cm.astype(float) / max(cm.sum(), 1)
     else:
-        cm_norm = cm.astype(float)
+        cm_norm = cm
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
@@ -107,8 +122,8 @@ def plot_confusion_matrix(
         ax=ax,
         annot_kws={"size": 11},
     )
-    ax.set_xlabel("Predykcja MTS", fontsize=12)
-    ax.set_ylabel("Prawdziwa MTS", fontsize=12)
+    ax.set_xlabel("Predykcja (poziom ESI)", fontsize=12)
+    ax.set_ylabel("Prawdziwy poziom ESI", fontsize=12)
 
     title_full = title
     if normalize:
@@ -131,8 +146,8 @@ def plot_roc_curves(
     show: bool = False,
 ):
     """
-    Krzywe ROC dla każdej klasy (OvR).
-    Kluczowe dla Red i Orange — chcemy jak najwyższy AUC.
+    Krzywe ROC dla każdego poziomu ESI (OvR).
+    Kluczowe dla ESI 1 i ESI 2 — chcemy jak najwyższy AUC.
     """
     if class_names is None:
         class_names = CLASS_NAMES
@@ -150,12 +165,10 @@ def plot_roc_curves(
         try:
             fpr, tpr, _ = roc_curve(y_binary, y_proba[:, i])
             roc_auc = auc(fpr, tpr)
-
-            color = MTS_COLORS.get(class_name, None)
             ax.plot(
                 fpr, tpr,
                 label=f"{class_name} (AUC = {roc_auc:.3f})",
-                color=color,
+                color=_class_color(i),
                 linewidth=2,
             )
         except Exception as e:
@@ -187,7 +200,7 @@ def plot_calibration(
     show: bool = False,
 ):
     """
-    Wykres kalibracji (reliability diagram) per klasa.
+    Wykres kalibracji (reliability diagram) per poziom ESI.
     Idealny model: linia y=x.
     """
     if class_names is None:
@@ -207,10 +220,9 @@ def plot_calibration(
             prob_true, prob_pred = calibration_curve(
                 y_binary, y_proba[:, i], n_bins=n_bins, strategy="quantile"
             )
-            color = MTS_COLORS.get(class_name, None)
             ax.plot(
                 prob_pred, prob_true,
-                marker="o", label=class_name, color=color, linewidth=2,
+                marker="o", label=class_name, color=_class_color(i), linewidth=2,
             )
         except Exception as e:
             log.warning(f"Nie udało się narysować kalibracji dla {class_name}: {e}")
@@ -242,10 +254,12 @@ def plot_feature_importances(
     ----------
     importances : pd.DataFrame
         Z kolumnami 'feature' i 'importance'.
+    title : str
+        Fraza "Top N" zostanie zastąpiona faktyczną liczbą cech.
     """
     top = importances.head(top_n).iloc[::-1]  # odwróć dla wykresu poziomego
 
-    fig, ax = plt.subplots(figsize=(10, max(6, top_n * 0.3)))
+    fig, ax = plt.subplots(figsize=(10, max(6, len(top) * 0.3)))
     ax.barh(
         top["feature"],
         top["importance"],
@@ -254,16 +268,13 @@ def plot_feature_importances(
         alpha=0.85,
     )
     ax.set_xlabel("Importance", fontsize=12)
-    ax.set_title(title.replace("N", str(top_n)), fontsize=13)
+    ax.set_title(title.replace("Top N", f"Top {len(top)}"), fontsize=13)
     ax.grid(axis="x", alpha=0.3)
+    ax.margins(x=0.1)  # miejsce na etykiety wartości
 
     # Anotacja wartości
-    for i, (idx, row) in enumerate(top.iterrows()):
-        ax.text(
-            row["importance"], i,
-            f"  {row['importance']:.3f}",
-            va="center", fontsize=9,
-        )
+    for i, value in enumerate(top["importance"]):
+        ax.text(value, i, f"  {value:.3f}", va="center", fontsize=9)
 
     plt.tight_layout()
     return _save_or_show(fig, save_path, show)

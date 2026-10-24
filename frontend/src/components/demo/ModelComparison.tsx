@@ -1,9 +1,9 @@
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 
-import { MTSCategoryBadge } from "@/components/shared/MTSCategoryBadge";
+import { ESILevelBadge } from "@/components/shared/ESILevelBadge";
 import { Card } from "@/components/ui/card";
-import type { MTSCategoryId } from "@/lib/constants";
+import type { EsiLevelId } from "@/lib/constants";
 import type { ModelPrediction } from "@/lib/types";
 
 interface ModelComparisonProps {
@@ -33,8 +33,8 @@ export function ModelComparison({ predictions }: ModelComparisonProps) {
               <span className="font-mono text-xs tabular-nums text-muted-foreground">
                 {(p.confidence * 100).toFixed(0)}%
               </span>
-              <MTSCategoryBadge
-                category={p.category as MTSCategoryId}
+              <ESILevelBadge
+                category={p.category as EsiLevelId}
                 lang={lang}
                 size="sm"
               />

@@ -3,10 +3,10 @@
     "badge": "Praca magisterska · obrona 2027",
     "title": "Wspomaganie decyzji triażowych",
     "titleAccent": "SOR-AI",
-    "subtitle": "Hybrydowy system klasyfikacji wstępnej (MTS) łączący ensemble klasyfikatorów drzewowych z analizą kliniczną notatki pielęgniarskiej przez lokalny model językowy.",
+    "subtitle": "Hybrydowy system wspomagania triażu według Emergency Severity Index (ESI 1–5, kolory TOPSOR) łączący ensemble klasyfikatorów drzewowych z analizą kliniczną notatki pielęgniarskiej przez lokalny model językowy.",
     "metric1": "QWK · zbiór testowy",
     "metric2": "Critical miss rate",
-    "metric3": "Czas inferencji",
+    "metric3": "Modele w ensemblu",
     "ctaPrimary": "Wypróbuj demo",
     "ctaSecondary": "Zobacz wyniki",
     "scrollHint": "przewiń, aby zobaczyć więcej"
@@ -27,21 +27,21 @@
   "data": {
     "title": "Dane treningowe",
     "subtitle": "Yale EMMLC — Emergency Medicine ML Challenge",
-    "description": "Anonimizowany dataset 558 029 wizyt SOR z Yale-New Haven Hospital. Vitalne parametry, demografia, leki, choroby współistniejące, notatki triażowe, 200 typów chief complaint.",
+    "description": "Anonimizowany zbiór 558 027 wizyt SOR z Yale-New Haven Health (3 oddziały). Modele triażowe używają wyłącznie danych dostępnych w chwili triażu i ogólnych (nie amerykańskich): parametry życiowe, wiek, płeć, sposób przybycia, 199 kategorii skarg głównych.",
     "features": {
       "title": "Cechy",
-      "original": "Cechy oryginalne",
+      "original": "Cechy z triażu",
       "engineered": "Cech inżynieryjnych",
       "total": "Łącznie do modelu",
-      "engineeredDesc": "shock index, MEWS, qSOFA, SIRS, interakcje vital × wiek, time-of-day, missing flagi — wszystko obliczane w runtime."
+      "engineeredDesc": "shock index, NEWS2, qSOFA, SIRS, strefa zagrożenia ESI, flagi braków pomiarów, grupy skarg — liczone w runtime tak samo jak w treningu."
     },
     "classes": {
-      "title": "Dystrybucja klas MTS",
-      "imbalanced": "Imbalance 36× (Red vs Blue)"
+      "title": "Rozkład poziomów ESI",
+      "imbalanced": "ESI 1 to tylko 0,9% wizyt (47× rzadziej niż ESI 3)"
     },
     "split": {
-      "title": "Podział temporalny",
-      "description": "80/10/10 train/val/test. 10% najnowszych danych = test set. Bez wycieku z przyszłości."
+      "title": "Podział danych",
+      "description": "80/10/10 train/val/test, stratyfikacja po ESI. Wagi ensembla i reguła decyzyjna wyłącznie na val; test używany raz, na końcu."
     }
   },
   "architecture": {
@@ -55,8 +55,8 @@
     },
     "layer1a": {
       "title": "Warstwa 1A — Tabular ML",
-      "model": "Ensemble 7 modeli + Stacking",
-      "description": "CatBoost, XGBoost, LightGBM, RF, ExtraTrees, HistGBT, EBM. Meta-learner: LogReg. SHAP top-5 dla każdej predykcji.",
+      "model": "Ensemble 6 modeli",
+      "description": "XGBoost, LightGBM, CatBoost, Random Forest, EBM, LogReg. Ważona średnia prawdopodobieństw ESI 1–5 (wagi dobrane na walidacji). SHAP top-5 dla każdej predykcji.",
       "latency": "~50ms"
     },
     "layer1b": {
@@ -74,13 +74,14 @@
     "safetyRules": {
       "title": "Reguły bezpieczeństwa (hardcoded poza LLM)",
       "rule1": "Nigdy nie obniżaj poniżej minimum z modeli",
-      "rule2": "Różnica ≥ 2 stopni → alert lekarski",
-      "rule3": "Confidence < 0.6 → zawsze flaguj"
+      "rule2": "Różnica ≥ 2 poziomów ESI → alert lekarski",
+      "rule3": "Confidence < 0.6 → zawsze flaguj",
+      "rule4": "Reguły ESI: punkt A → ESI 1, wysokie ryzyko / strefa zagrożenia → minimum ESI 2"
     }
   },
   "models": {
     "title": "Modele",
-    "subtitle": "7 modeli, każdy z innym inductive bias",
+    "subtitle": "6 modeli, każdy z innym inductive bias",
     "metrics": {
       "qwk": "QWK",
       "undertriage": "Undertriage",
@@ -89,14 +90,14 @@
       "device": "Sprzęt"
     },
     "bestModel": "Najlepszy model",
-    "tunedWith": "Tuning: Optuna 150 trials, MultivariateTPE, 5-fold CV",
-    "disclaimer": "CatBoost = realne wyniki na test set (holdout). XGBoost = aktualny CV (tuning trwa). Pozostałe modele = szacunki przed treningiem.",
+    "tunedWith": "Tuning: Optuna (MultivariateTPE), k-fold CV, wznawialny po awarii",
+    "disclaimer": "Wyniki ESI zostaną uzupełnione po końcowym treningu (training/runs). „—” = model jeszcze nie wytrenowany.",
     "viewDetails": "Zobacz szczegóły",
     "modal": {
       "performance": "Wydajność",
       "safety": "Bezpieczeństwo kliniczne",
       "hardware": "Sprzęt",
-      "classRecalls": "Recall per kategoria MTS",
+      "classRecalls": "Recall per poziom ESI",
       "params": "Kluczowe hiperparametry",
       "notes": "Notatki",
       "clickDetails": "Kliknij po szczegóły",
@@ -112,7 +113,7 @@
         "aucmacro": "AUC Macro",
         "cohenkappa": "Cohen κ",
         "undertriage": "Undertriage",
-        "criticalmiss": "Critical miss (Red przeoczony)",
+        "criticalmiss": "Critical miss (ESI 1 jako ESI 4–5)",
         "device": "Sprzęt",
         "traintime": "Czas treningu"
       }
@@ -120,21 +121,22 @@
   },
   "results": {
     "title": "Wyniki",
-    "subtitle": "Test set — temporal split, 10% najnowszych danych · 55 802 wizyt",
-    "headline": "Stacking ensemble wygrywa",
+    "subtitle": "Zbiór testowy (holdout) · 55 803 wizyt · wagi i reguła decyzyjna wybrane na walidacji",
+    "headline": "Ensemble modeli ESI",
     "kpis": {
-      "qwk": "QWK (stacking)",
-      "qwkDesc": "Quadratic Weighted Kappa — stacking 3 modeli",
+      "qwk": "QWK (ensemble)",
+      "qwkDesc": "Quadratic Weighted Kappa — ensemble, zbiór testowy",
       "undertriage": "Undertriage rate",
-      "undertriageDesc": "Cel: < 5% · Osiągnięte: 3.8%",
+      "undertriageDesc": "ESI 1–2 jako ESI 3–5 · cel: < 5%",
       "criticalMiss": "Critical miss rate",
-      "criticalMissDesc": "Cel: < 0.1% · Osiągnięte: 0.08%",
+      "criticalMissDesc": "ESI 1 jako ESI 4–5 · cel: < 0,1%",
       "overtriage": "Overtriage rate",
-      "overtriageDesc": "Akceptowalny: < 30% · Osiągnięte: 11.1%"
+      "overtriageDesc": "ESI 4–5 jako ESI 1–2 · akceptowalny: < 30%"
     },
     "comparisonTitle": "Porównanie modeli",
-    "confusionTitle": "Confusion Matrix — CatBoost",
-    "featureImportanceTitle": "Top 20 cech (CatBoost)"
+    "confusionTitle": "Macierz pomyłek — ensemble",
+    "featureImportanceTitle": "Najważniejsze cechy",
+    "pending": "Wyniki pojawią się po końcowym treningu na danych ESI."
   },
   "howItWorks": {
     "title": "Jak to działa",
@@ -149,7 +151,7 @@
     },
     "step3": {
       "title": "Ensemble ML",
-      "description": "7 modeli równolegle przewiduje kategorię. Stacking LogReg łączy predykcje. SHAP wyjaśnia top 5 cech."
+      "description": "6 modeli przewiduje poziom ESI 1–5. Ważona średnia prawdopodobieństw (wagi z walidacji). SHAP wyjaśnia top 5 cech."
     },
     "step4": {
       "title": "Clinical NLP",
@@ -157,11 +159,11 @@
     },
     "step5": {
       "title": "Synteza i konflikty",
-      "description": "Qwen3 32B łączy wyniki. Wykrywa konflikt ML vs NLP. Zasada nadrzędna: eskaluj, nigdy nie obniżaj."
+      "description": "Qwen3 32B łączy wyniki. Wykrywa konflikt ML vs NLP. Reguły ESI i zasada nadrzędna: eskaluj, nigdy nie obniżaj."
     },
     "step6": {
       "title": "Decyzja pielęgniarki",
-      "description": "System sugeruje kategorię + confidence + uzasadnienie. Pielęgniarka zatwierdza lub odrzuca. Wszystko logowane (MDR audyt)."
+      "description": "System sugeruje poziom ESI + pewność + uzasadnienie. Pielęgniarka zatwierdza lub odrzuca. Wszystko logowane (MDR audyt)."
     }
   },
   "demo": {
@@ -182,7 +184,18 @@
       "sbp": "Ciśnienie skurczowe",
       "dbp": "Ciśnienie rozkurczowe",
       "rr": "Oddechy",
-      "o2": "Saturacja"
+      "o2": "Saturacja",
+      "contextTitle": "Kontekst (opcjonalnie)",
+      "sex": "Płeć",
+      "sexUnknown": "Nie podano",
+      "sexMale": "Mężczyzna",
+      "sexFemale": "Kobieta",
+      "arrivalMode": "Przybycie",
+      "arrivalUnknown": "Nie podano",
+      "arrivalAmbulance": "ZRM / karetka",
+      "arrivalSelf": "Transport własny",
+      "arrivalOther": "Inne (np. policja)",
+      "o2Device": "Tlen podawany w triażu"
     },
     "examples": {
       "chestPain": "Ból w klatce piersiowej",
@@ -193,7 +206,7 @@
     },
     "result": {
       "title": "Predykcja",
-      "category": "Kategoria",
+      "category": "Poziom ESI",
       "confidence": "Pewność",
       "processingTime": "Czas analizy",
       "shapTitle": "Top 5 cech wpływu (SHAP)",
@@ -223,15 +236,16 @@
     "events": {
       "idea": "Pomysł i research literatury",
       "dataAnalysis": "Analiza danych Yale EMMLC",
-      "preprocessing": "Preprocessing + feature engineering (336 → +43 cechy)",
-      "firstXGBoost": "Pierwszy XGBoost (QWK 0.84)",
+      "preprocessing": "Preprocessing + feature engineering",
+      "firstXGBoost": "Pierwszy XGBoost (baseline)",
       "optunaTuning": "Optuna tuning + cost-sensitive weights",
       "multiGpu": "Multi-GPU support, CatBoost na A100",
       "quantileDMatrix": "XGBoost QuantileDMatrix refactor (2-3× speedup)",
-      "catboostFinal": "CatBoost final: QWK=0.8752, undertriage 2.7%",
+      "catboostFinal": "Pierwsze pełne treningi CatBoost na GPU",
       "xgboostA5000": "XGBoost na 8× RTX 5090, RF cuML, LightGBM CPU",
       "frontend": "Frontend + integracja z backendem",
-      "defense": "Obrona magisterki"
+      "defense": "Obrona magisterki",
+      "esiNative": "Natywne etykiety ESI 1–5, audyt cech, wznawialny trening"
     }
   },
   "about": {

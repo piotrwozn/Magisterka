@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import { Card } from "@/components/ui/card";
 import type { Model } from "@/lib/constants";
+import { formatMetric } from "@/lib/utils";
 
 interface ModelDetailModalProps {
   model: Model | null;
@@ -86,7 +87,7 @@ export function ModelDetailModal({ model, onClose }: ModelDetailModalProps) {
                   <p className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-widest text-primary">
                     <TrendingUp className="size-3.5" /> {m("performance")}
                   </p>
-                  <MetricRow label={mt("qwk")} value={model.qwk.toFixed(4)} />
+                  <MetricRow label={mt("qwk")} value={formatMetric(model.qwk, 4)} />
                   {model.accuracy !== undefined && (
                     <MetricRow label={mt("accuracy")} value={`${model.accuracy.toFixed(2)}%`} />
                   )}
@@ -106,18 +107,18 @@ export function ModelDetailModal({ model, onClose }: ModelDetailModalProps) {
                   <p className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-widest text-amber-500">
                     <AlertTriangle className="size-3.5" /> {m("safety")}
                   </p>
-                  <MetricRow label={mt("undertriage")} value={`${model.undertriage.toFixed(2)}%`} />
-                  <MetricRow label={mt("criticalmiss")} value={`${model.criticalMiss.toFixed(3)}%`} />
+                  <MetricRow label={mt("undertriage")} value={formatMetric(model.undertriage, 2, "%")} />
+                  <MetricRow label={mt("criticalmiss")} value={formatMetric(model.criticalMiss, 3, "%")} />
                   <div className="mt-3 border-t border-border/40 pt-3">
                     <p className="mb-1 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-widest text-muted-foreground">
                       <Cpu className="size-3" /> {m("hardware")}
                     </p>
                     <MetricRow label={mt("device")} value={model.device} />
-                    <MetricRow label={mt("traintime")} value={`~${model.trainTimeMin} min`} />
+                    <MetricRow label={mt("traintime")} value={formatMetric(model.trainTimeMin, 0, " min")} />
                   </div>
                 </Card>
 
-                {/* ── Recall per klasa MTS ── */}
+                {/* ── Recall per poziom ESI ── */}
                 {model.classRecalls && model.classRecalls.length > 0 && (
                   <Card className="bg-card/60 p-4 sm:col-span-2">
                     <p className="mb-3 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-widest text-muted-foreground">

@@ -40,17 +40,13 @@
     "github": "GitHub",
     "documentation": "Documentation"
   },
-  "mts": {
-    "title": "Manchester Triage System",
-    "red": "Red",
-    "orange": "Orange",
-    "yellow": "Yellow",
-    "green": "Green",
-    "blue": "Blue",
-    "redDesc": "Immediate",
-    "orangeDesc": "Very urgent",
-    "yellowDesc": "Urgent",
-    "greenDesc": "Standard",
-    "blueDesc": "Non-urgent"
+  "esi": {
+    "title": "Emergency Severity Index (ESI)",
+    "subtitle": "5 acuity levels; TOPSOR colours and maximum waiting time",
+    "level1Desc": "Requires a life-saving intervention now",
+    "level2Desc": "High-risk situation or danger-zone vital signs",
+    "level3Desc": "Stable, ≥ 2 resources expected",
+    "level4Desc": "Stable, 1 resource expected",
+    "level5Desc": "Stable, no resources expected"
   }
 }

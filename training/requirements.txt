@@ -1,60 +1,37 @@
 # ============================================================
-# SOR-AI: System Klasyfikacji Triażu MTS oparty na ML
-# Wymagania środowiska Python (>= 3.11)
+# SOR-AI: trening modeli ESI — zależności RDZENIOWE
+# (przygotowanie danych, tuning, trening, ewaluacja, SHAP, run_all.py)
+# Python >= 3.12, 64-bit (testowane: 3.13 i 3.12, Windows 11 / Linux)
+#
+#   pip install -r requirements-lock.txt   ← ZALECANE: dokładnie przetestowane wersje
+#   pip install -r requirements.txt        ← zakresy (gdy lock nie pasuje do platformy)
+#
+# Demo Streamlit, LIME, DiCE: requirements-app.txt; testy i narzędzia: requirements-dev.txt
+# GPU: koła xgboost/catboost mają własne biblioteki CUDA — wystarczy sterownik NVIDIA >= 580
+# (xgboost 3.4 = CUDA 13); CUDA Toolkit NIE jest potrzebny.
 # ============================================================
 
-# --- Core ML ---
-numpy>=1.24
-pandas>=2.0
-polars>=0.20
-scikit-learn>=1.3
-xgboost>=2.0
-lightgbm>=4.0
-catboost>=1.2
-imbalanced-learn>=0.11
-optuna>=3.5
+# --- Dane ---
+numpy>=2.0,<3
+pandas>=2.2,<4
+pyarrow>=14
+scipy>=1.11
+pyreadr>=0.5               # tylko konwersja .rdata → parquet (gdy brak parquet)
+
+# --- Modele ---
+scikit-learn>=1.6,<2       # RF z NaN natywnie; interpret-core 0.7 wymaga >= 1.6
+xgboost>=3.1,<4            # parametr device="cuda" (gpu_id/gpu_hist usunięte w 3.1)
+lightgbm>=4.0,<5
+catboost>=1.2,<2
+interpret-core>=0.7,<0.8   # EBM — bez ciężkich dodatków pakietu `interpret` (dash, plotly, SALib)
+optuna>=4.0,<6             # RDBStorage z pulsem i ponawianiem prób; 6.x usuwa używane API
 joblib>=1.3
+threadpoolctl>=3.5         # limit wątków BLAS (regresja logistyczna)
+psutil>=5.9                # rdzenie fizyczne, RAM, blokady badań Optuny
 
-# --- Deep Learning (opcjonalne — dla branchu BERT) ---
-torch>=2.1
-transformers>=4.35
-tokenizers>=0.15
-accelerate>=0.25
-
-# --- Explainability ---
+# --- Wyjaśnienia, wykresy, logi ---
 shap>=0.44
-lime>=0.2
-dice-ml>=0.11
-interpret>=0.5
-# alibi>=0.9  # opcjonalne, ciężkie zależności
-
-# --- Wczytywanie danych ---
-pyreadr>=0.5          # czytanie plików .RData
-pyarrow>=14.0         # parquet
-fastparquet>=2024.0   # alternatywny silnik parquet
-
-# --- Wizualizacja ---
 matplotlib>=3.8
 seaborn>=0.13
-plotly>=5.18
-
-# --- API / UI ---
-fastapi>=0.104
-uvicorn>=0.24
-streamlit>=1.28
-requests>=2.31        # wywołania API Ollama
-
-# --- Experiment tracking ---
-mlflow>=2.9
-# wandb>=0.16         # alternatywa
-
-# --- Utils ---
-tqdm>=4.66
-pyyaml>=6.0
-python-dotenv>=1.0
-rich>=13.0            # ładny output do konsoli
-typer>=0.9            # CLI helpers
-
-# --- Testy ---
-pytest>=7.4
-pytest-cov>=4.1
+rich>=13
+requests>=2.31             # klient Ollama (src.explain importuje go przy starcie)

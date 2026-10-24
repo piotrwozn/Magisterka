@@ -6,9 +6,9 @@ import { ConfidenceGauge } from "@/components/demo/ConfidenceGauge";
 import { ConflictDetection } from "@/components/demo/ConflictDetection";
 import { ModelComparison } from "@/components/demo/ModelComparison";
 import { ShapWaterfall } from "@/components/demo/ShapWaterfall";
-import { MTSCategoryBadge } from "@/components/shared/MTSCategoryBadge";
+import { ESILevelBadge } from "@/components/shared/ESILevelBadge";
 import { Card } from "@/components/ui/card";
-import { MTS_CATEGORIES, type MTSCategoryId } from "@/lib/constants";
+import { ESI_LEVELS, type EsiLevelId } from "@/lib/constants";
 import type { PredictResponse } from "@/lib/types";
 
 interface PredictionResultProps {
@@ -18,7 +18,7 @@ interface PredictionResultProps {
 export function PredictionResult({ result }: PredictionResultProps) {
   const { t, i18n } = useTranslation("sections");
   const lang = (i18n.resolvedLanguage ?? "pl").slice(0, 2) as "pl" | "en";
-  const cat = MTS_CATEGORIES[result.finalCategory as MTSCategoryId];
+  const cat = ESI_LEVELS[result.finalCategory as EsiLevelId];
 
   return (
     <div className="space-y-4">
@@ -43,7 +43,7 @@ export function PredictionResult({ result }: PredictionResultProps) {
               <p className="text-xs uppercase tracking-wider text-muted-foreground">
                 {t("demo.result.category")}
               </p>
-              {cat && <MTSCategoryBadge category={cat.id} lang={lang} size="lg" showWait />}
+              {cat && <ESILevelBadge category={cat.id} lang={lang} size="lg" showWait />}
               <p className="flex items-center gap-2 text-xs text-muted-foreground">
                 <Clock className="size-3" />
                 {t("demo.result.processingTime")}: {result.processingTimeMs}ms

@@ -74,14 +74,14 @@ def mock_registry() -> ModelRegistry:
     medians_path = backend_root / "models" / "imputation_medians.json"
 
     if medians_path.exists():
-        payload = json.loads(medians_path.read_text())
+        payload = json.loads(medians_path.read_text(encoding="utf-8"))
         medians = payload["medians"]
     else:
-        # Minimal fallback (no real medians on disk)
+        # Minimal fallback (no real medians on disk) — temperature in °C
         medians = {
             "triage_vital_hr": 84.0, "triage_vital_sbp": 131.0,
             "triage_vital_dbp": 80.0, "triage_vital_rr": 18.0,
-            "triage_vital_o2": 98.0, "triage_vital_temp": 98.0,
+            "triage_vital_o2": 98.0, "triage_vital_temp": 36.7,
             "age": 49.0,
         }
 
@@ -89,7 +89,7 @@ def mock_registry() -> ModelRegistry:
 
     reg = ModelRegistry()
     reg.medians = medians
-    reg.feature_set = "triage_only"
+    reg.feature_set = "triage"
     reg.models = {
         "catboost": {
             "model": _make_mock_model(0, 0.85),

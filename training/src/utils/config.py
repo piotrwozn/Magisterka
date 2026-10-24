@@ -1,12 +1,17 @@
 """
 Konfiguracja globalna projektu SOR-AI.
 
-Wszystkie ścieżki, stałe, hiperparametry i progi medyczne MTS
-zdefiniowane w jednym miejscu, by uniknąć rozproszenia "magic numbers".
+Wszystkie ścieżki, stałe, hiperparametry i progi kliniczne zdefiniowane
+w jednym miejscu, by uniknąć rozproszenia "magic numbers".
+
+Etykieta: natywny Emergency Severity Index (ESI 1–5) — ten sam algorytm,
+który polskie SOR-y stosują w systemie TOPSOR (Dz.U. 2021 poz. 1182, § 2 pkt 9).
+Etykieta nie jest mapowana na żadną inną skalę triażu.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 # ─────────────────────────────────────────
@@ -25,6 +30,10 @@ FIGURES_DIR: Path = RESULTS_DIR / "figures"
 TABLES_DIR: Path = RESULTS_DIR / "tables"
 REPORTS_DIR: Path = RESULTS_DIR / "reports"
 
+# Każdy trening zapisuje komplet artefaktów do runs/<run_name>/
+# (model, metryki, predykcje val/test do ręcznego łączenia modeli).
+RUNS_DIR: Path = PROJECT_ROOT / "runs"
+
 LOGS_DIR: Path = PROJECT_ROOT / "logs"
 TRAINING_LOGS_DIR: Path = LOGS_DIR / "training"     # logi z treningu modeli
 EVAL_LOGS_DIR: Path = LOGS_DIR / "evaluation"       # logi z ewaluacji
@@ -32,16 +41,55 @@ EXPERIMENTS_DIR: Path = LOGS_DIR / "experiments"    # JSON-owe metadane eksperym
 
 # MLflow tracking
 MLFLOW_TRACKING_URI: str = f"file://{(PROJECT_ROOT / 'mlruns').as_posix()}"
-MLFLOW_EXPERIMENT_NAME: str = "sor-ai-triage"
+MLFLOW_EXPERIMENT_NAME: str = "sor-ai-triage-esi"
 
-# Pliki danych
+# Surowe dane Yale EMMLC
 RDATA_FILE: Path = DATA_RAW_DIR / "5v_cleandf.rdata"
 RAW_PARQUET: Path = DATA_PROCESSED_DIR / "yale_emmlc_raw.parquet"
-PROCESSED_PARQUET: Path = DATA_PROCESSED_DIR / "yale_emmlc_processed.parquet"
 
-TRAIN_PARQUET: Path = DATA_PROCESSED_DIR / "train.parquet"
-VAL_PARQUET: Path = DATA_PROCESSED_DIR / "val.parquet"
-TEST_PARQUET: Path = DATA_PROCESSED_DIR / "test.parquet"
+# Przygotowane dane ESI (wynik `scripts/02_preprocess.py`)
+ESI_DATA_DIR: Path = DATA_PROCESSED_DIR / "esi"
+TRAIN_PARQUET: Path = ESI_DATA_DIR / "train.parquet"
+VAL_PARQUET: Path = ESI_DATA_DIR / "val.parquet"
+TEST_PARQUET: Path = ESI_DATA_DIR / "test.parquet"
+FEATURE_SETS_JSON: Path = ESI_DATA_DIR / "feature_sets.json"
+DATA_MANIFEST_JSON: Path = ESI_DATA_DIR / "manifest.json"
+
+# Raport z audytu danych (wersjonowany w repo — mały plik tekstowy)
+DATA_AUDIT_MD: Path = PROJECT_ROOT / "DATA_AUDIT.md"
+
+# Wersja logiki przygotowania danych. Zmień, gdy zmieniasz prepare/engineering —
+# trening odmówi użycia splitów przygotowanych starszą wersją.
+DATA_VERSION: str = "esi-v2"
+
+# ─────────────────────────────────────────
+# PATH ENV OVERRIDES (testy end-to-end w katalogu tymczasowym, inne dyski)
+# ─────────────────────────────────────────
+# Czytane RAZ przy imporcie — podprocesy dziedziczą je ze środowiska. Nazwy stałych bez zmian.
+#   SOR_AI_ESI_DATA_DIR → splity ESI, manifest, listy cech (raport z audytu też tam —
+#                         raport innych danych nie nadpisuje wersjonowanego DATA_AUDIT.md),
+#   SOR_AI_RUNS_DIR     → runs/,
+#   SOR_AI_LOGS_DIR     → logs/ (logi treningu, ewaluacji, eksperymentów, badania Optuny).
+def _env_path(var: str) -> Path | None:
+    raw = os.environ.get(var, "").strip()
+    return Path(raw).expanduser().resolve() if raw else None
+
+
+if (_override := _env_path("SOR_AI_ESI_DATA_DIR")) is not None:
+    ESI_DATA_DIR = _override
+    TRAIN_PARQUET = ESI_DATA_DIR / "train.parquet"
+    VAL_PARQUET = ESI_DATA_DIR / "val.parquet"
+    TEST_PARQUET = ESI_DATA_DIR / "test.parquet"
+    FEATURE_SETS_JSON = ESI_DATA_DIR / "feature_sets.json"
+    DATA_MANIFEST_JSON = ESI_DATA_DIR / "manifest.json"
+    DATA_AUDIT_MD = ESI_DATA_DIR / "DATA_AUDIT.md"
+if (_override := _env_path("SOR_AI_RUNS_DIR")) is not None:
+    RUNS_DIR = _override
+if (_override := _env_path("SOR_AI_LOGS_DIR")) is not None:
+    LOGS_DIR = _override
+    TRAINING_LOGS_DIR = LOGS_DIR / "training"
+    EVAL_LOGS_DIR = LOGS_DIR / "evaluation"
+    EXPERIMENTS_DIR = LOGS_DIR / "experiments"
 
 # Utwórz katalogi przy imporcie
 for _dir in [
@@ -65,34 +113,46 @@ for _dir in [
 RANDOM_SEED: int = 42
 
 # ─────────────────────────────────────────
-# KLASYFIKACJA MTS
+# SPRZĘT
 # ─────────────────────────────────────────
-# Mapowanie ESI (Emergency Severity Index) → MTS (Manchester Triage System).
-# Zob. Strategia 2 w TECHNICAL_ANALYSIS.md §6 — to mapowanie BAZOWE,
-# które dodatkowo wzbogaca się o dyskryminatory parametrów życiowych.
-ESI_TO_MTS: dict[int, str] = {
-    1: "Red",      # Immediate / Natychmiastowy
-    2: "Orange",   # Very Urgent / Bardzo pilny
-    3: "Yellow",   # Urgent / Pilny
-    4: "Green",    # Standard / Standardowy
-    5: "Blue",     # Non-Urgent / Niepilny
-}
+# Urządzenie wybiera src.utils.hardware.device_for(biblioteka), czytając zmienne NA BIEŻĄCO:
+#   SOR_AI_DEVICE_XGBOOST / SOR_AI_DEVICE_CATBOOST  >  SOR_AI_DEVICE  >  'auto'
+# Wartości auto | cpu | gpu. 'auto' = próbny trening na GPU (porażka → CPU z ostrzeżeniem),
+# 'gpu' = wymuszenie (porażka → błąd zamiast cichego CPU). Poniższa stała tylko informacyjnie.
+DEVICE: str = os.environ.get("SOR_AI_DEVICE", "auto").lower()
 
-# Zakodowane numerycznie 0–4 (do treningu modeli, kolejność rosnąca pilności = malejąca)
-ESI_TO_MTS_NUMERIC: dict[int, int] = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4}
+# Wątki CPU dla wszystkich modeli: SOR_AI_N_JOBS (> 0) albo liczba FIZYCZNYCH rdzeni
+# (i9-14900K: 24, nie 32 — wątki HT i pętle OpenMP z barierami spowalniają trening).
+# Rozwiązywane przy imporcie: proces nadrzędny (run_all, 03_train.py --n-jobs) ustawia
+# zmienną PRZED importem. Import tutaj (nie na górze pliku): hardware nie importuje config.
+from src.utils.hardware import n_jobs as _resolve_n_jobs  # noqa: E402
 
-# Nazwy klas w kolejności indeksów 0–4 (Red, Orange, Yellow, Green, Blue)
-CLASS_NAMES: list[str] = ["Red", "Orange", "Yellow", "Green", "Blue"]
+N_JOBS: int = _resolve_n_jobs()
+
+# ─────────────────────────────────────────
+# ETYKIETA — ESI (bez mapowania)
+# ─────────────────────────────────────────
+ESI_COL: str = "esi"          # oryginalny poziom ESI 1–5
+TARGET_COL: str = "target"    # indeks klasy 0–4 (0 = ESI 1, ..., 4 = ESI 5)
+N_CLASSES: int = 5
+
+# Nazwy klas w kolejności indeksów 0–4
+CLASS_NAMES: list[str] = ["ESI1", "ESI2", "ESI3", "ESI4", "ESI5"]
+
+# Kolory TOPSOR przypisane poziomom ESI (ESI 1 = czerwony, …, ESI 5 = niebieski)
+TOPSOR_COLORS: list[str] = ["Red", "Orange", "Yellow", "Green", "Blue"]
+TOPSOR_COLORS_PL: list[str] = ["czerwony", "pomarańczowy", "żółty", "zielony", "niebieski"]
+
 CLASS_NAMES_PL: list[str] = [
-    "Czerwony (Natychmiastowy)",
-    "Pomarańczowy (Bardzo pilny)",
-    "Żółty (Pilny)",
-    "Zielony (Standardowy)",
-    "Niebieski (Niepilny)",
+    "ESI 1 · czerwony (natychmiast)",
+    "ESI 2 · pomarańczowy (do 10 min)",
+    "ESI 3 · żółty (do 60 min)",
+    "ESI 4 · zielony (do 120 min)",
+    "ESI 5 · niebieski (do 240 min)",
 ]
 
-# Maksymalny czas oczekiwania (minuty) — zgodnie z protokołem MTS
-MTS_MAX_WAIT_MINUTES: dict[str, int] = {
+# Maksymalny czas do pierwszego kontaktu z lekarzem w TOPSOR (minuty), wg koloru
+TOPSOR_MAX_WAIT_MINUTES: dict[str, int] = {
     "Red": 0,
     "Orange": 10,
     "Yellow": 60,
@@ -100,159 +160,273 @@ MTS_MAX_WAIT_MINUTES: dict[str, int] = {
     "Blue": 240,
 }
 
-# ─────────────────────────────────────────
-# WAGI KLAS (asymetryczne — undertriage > overtriage)
-# ─────────────────────────────────────────
-# Kategoria Red to ~1-2% danych, ale jej pominięcie kosztuje życie.
-# Te wagi forsują model, by NIE pomijał Red/Orange.
-CUSTOM_CLASS_WEIGHTS: dict[int, float] = {
-    0: 10.0,   # Red    — najwyższy priorytet
-    1: 5.0,    # Orange — wysoki priorytet
-    2: 1.0,    # Yellow — baseline
-    3: 2.0,    # Green  — umiarkowany
-    4: 3.0,    # Blue   — umiarkowany (mała klasa)
+# Odcienie kolorów TOPSOR do wykresów i UI (klucz = nazwa klasy z CLASS_NAMES).
+# Wyłącznie prezentacja — etykietą zawsze jest poziom ESI.
+TOPSOR_HEX: dict[str, str] = {
+    "ESI1": "#D32F2F",   # czerwony
+    "ESI2": "#F57C00",   # pomarańczowy
+    "ESI3": "#FBC02D",   # żółty
+    "ESI4": "#388E3C",   # zielony
+    "ESI5": "#1976D2",   # niebieski
 }
 
-# Macierz kosztów dla ordinal cost-sensitive loss.
-# Wiersz = prawdziwa klasa, kolumna = predykcja.
-# Undertriage (predykcja niższej pilności) jest 3× droższy niż overtriage.
+# Klasy wysokiej pilności (do metryk bezpieczeństwa): ESI 1–2
+HIGH_ACUITY_CLASSES: tuple[int, ...] = (0, 1)
+# Klasy niskiej pilności: ESI 4–5
+LOW_ACUITY_CLASSES: tuple[int, ...] = (3, 4)
+
+# ─────────────────────────────────────────
+# WAGI KLAS (opcjonalne — domyślnie trenujemy BEZ wag)
+# ─────────────────────────────────────────
+# Domyślna strategia 'none' daje skalibrowane prawdopodobieństwa, które najlepiej
+# nadają się do ręcznego łączenia modeli. Asymetrię kosztów (niedotriażowanie
+# gorsze niż przetriażowanie) realizuje reguła decyzyjna z macierzy kosztów
+# poniżej — działa tak samo dla pojedynczego modelu i dla ensemble.
+DEFAULT_SAMPLE_WEIGHT_STRATEGY: str = "none"
+
+# Strategia 'custom' — ręczne wagi (rozkład ESI w Yale: ~0.9 / 29 / 42 / 22 / 5 %)
+CUSTOM_CLASS_WEIGHTS: dict[int, float] = {
+    0: 10.0,   # ESI 1 — rzadka, krytyczna
+    1: 2.0,    # ESI 2 — pominięcie = niebezpieczne niedotriażowanie
+    2: 1.0,    # ESI 3 — baseline
+    3: 1.0,    # ESI 4
+    4: 2.0,    # ESI 5 — mała klasa
+}
+
+# ─────────────────────────────────────────
+# MACIERZ KOSZTÓW (decyzja kosztowa na prawdopodobieństwach)
+# ─────────────────────────────────────────
+# koszt[prawda, predykcja] = |p - t|^2 × (UNDER jeśli p > t, OVER jeśli p < t)
+# p > t oznacza przewidzenie NIŻSZEJ pilności niż prawdziwa (niedotriażowanie).
 UNDERTRIAGE_COST_MULTIPLIER: float = 3.0
 OVERTRIAGE_COST_MULTIPLIER: float = 1.0
 
 # ─────────────────────────────────────────
-# PODZIAŁ DANYCH (TEMPORAL SPLIT)
+# PODZIAŁ DANYCH
 # ─────────────────────────────────────────
-# Zob. TECHNICAL_ANALYSIS.md §2.6 — używamy podziału chronologicznego,
-# aby zwalidować model w warunkach zmienności sezonowej.
-TEST_SIZE: float = 0.10            # 10% najnowszych danych = test
-VAL_SIZE_OF_TRAINVAL: float = 0.111  # ~10% z train+val = walidacja
+# Yale EMMLC nie ma roku ani identyfikatora pacjenta — podział chronologiczny
+# nie jest możliwy. Domyślnie: losowy, stratyfikowany po ESI × oddział.
+# Alternatywa: --split site (oddział B = test zewnętrzny; C ma tylko ~20 wizyt ESI 1).
+TEST_SIZE: float = 0.10            # 10% = test (ostateczna ocena)
+VAL_SIZE: float = 0.10             # 10% = walidacja (porównanie / łączenie modeli)
+EARLY_STOPPING_FRACTION: float = 0.10   # 10% TRAIN wydzielone na early stopping
+HOLDOUT_SITE: str = "B"            # oddział trzymany jako test w --split site (675 × ESI 1)
 
 # ─────────────────────────────────────────
-# HIPERPARAMETRY MODELI
+# HIPERPARAMETRY MODELI (domyślne — sensowne bez tuningu)
 # ─────────────────────────────────────────
+# Limity iteracji boostingu są celowo wysokie: przy małym learning_rate i pełnych ~400 tys.
+# wierszy model potrzebuje tysięcy drzew, a trening i tak kończy early stopping. Gdy najlepsza
+# iteracja dojdzie do ≥ 95% limitu, wrapper modelu loguje WARNING (model niedotrenowany).
+# Wątki: N_JOBS (sekcja SPRZĘT). Testy nadpisują je na 1 (tests/conftest.py).
 XGB_DEFAULT_PARAMS: dict = {
     "objective": "multi:softprob",
-    "num_class": 5,
-    "eval_metric": ["mlogloss", "merror"],
-    "max_depth": 8,
+    "num_class": N_CLASSES,
+    "eval_metric": "mlogloss",
+    "tree_method": "hist",
+    "n_estimators": 10_000,
     "learning_rate": 0.05,
-    "n_estimators": 1000,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
+    "max_depth": 8,
     "min_child_weight": 5,
-    "gamma": 0.1,
-    "reg_alpha": 0.1,
+    "subsample": 0.8,
+    "colsample_bytree": 0.7,
+    "reg_alpha": 0.0,
     "reg_lambda": 1.0,
-    "tree_method": "hist",   # 'gpu_hist' jeśli masz GPU
-    "device": "cuda",
+    "max_bin": 256,
+    "early_stopping_rounds": 100,
     "random_state": RANDOM_SEED,
-    "early_stopping_rounds": 50,
-    "n_jobs": -1,
+    "n_jobs": N_JOBS,
+    # "device" ustawiane w runtime: hardware.device_for("xgboost") → "cuda" | "cpu";
+    # po treningu na GPU model przełączany na device="cpu" (predykcja na danych z RAM)
 }
 
 LGBM_DEFAULT_PARAMS: dict = {
     "objective": "multiclass",
-    "num_class": 5,
-    "n_estimators": 1000,
-    "max_depth": 8,
-    "num_leaves": 63,
+    "num_class": N_CLASSES,
+    "n_estimators": 20_000,
     "learning_rate": 0.05,
+    "num_leaves": 127,
+    "max_depth": -1,
+    "min_child_samples": 50,
     "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_samples": 20,
-    "class_weight": "balanced",
+    "subsample_freq": 1,           # bez tego LightGBM ignoruje subsample
+    "colsample_bytree": 0.7,
+    "reg_alpha": 0.0,
+    "reg_lambda": 1.0,
     "random_state": RANDOM_SEED,
-    "n_jobs": -1,
+    "n_jobs": N_JOBS,              # fizyczne rdzenie (-1 = wszystkie wątki logiczne — wolniej)
     "verbosity": -1,
 }
+LGBM_EARLY_STOPPING_ROUNDS: int = 100
 
-RF_DEFAULT_PARAMS: dict = {
-    "n_estimators": 500,
-    "max_depth": 20,
-    "min_samples_split": 10,
-    "min_samples_leaf": 5,
-    "class_weight": "balanced",
-    "random_state": RANDOM_SEED,
-    "n_jobs": -1,
-}
-
-EBM_DEFAULT_PARAMS: dict = {
-    "max_bins": 256,
-    "interactions": 10,
-    "learning_rate": 0.01,
-    "min_samples_leaf": 5,
-    "random_state": RANDOM_SEED,
-}
-
-# CatBoost — multi-threaded CPU (komplementarny boosting do XGB/LGBM).
-# Uwaga: CatBoost używa innych nazw:
-#   - `random_seed`   (nie random_state)
-#   - `thread_count`  (nie n_jobs)
-#   - `iterations`    (nie n_estimators)
-#   - `depth`         (nie max_depth)
-#   - `l2_leaf_reg`   (nie reg_lambda)
-#   - `rsm`           (nie colsample_bylevel)
+# CatBoost — inne nazwy parametrów (iterations, depth, random_seed, thread_count).
+# Postęp (verbose) ustawia wrapper w czasie treningu — fit_estimator() jest cichy.
 CATBOOST_DEFAULT_PARAMS: dict = {
     "loss_function": "MultiClass",
     "eval_metric": "MultiClass",
-    "classes_count": 5,
-    "iterations": 2000,
-    "learning_rate": 0.05,
+    "classes_count": N_CLASSES,
+    "iterations": 20_000,
+    "learning_rate": 0.08,
     "depth": 8,
     "l2_leaf_reg": 3.0,
-    "border_count": 254,             # liczba binów dla cech numerycznych (max quality)
-    "bootstrap_type": "MVS",         # nowoczesny CPU-default w CatBoost
-    "subsample": 0.8,
-    "rsm": 0.8,                       # column sampling per level
-    "grow_policy": "SymmetricTree",  # CatBoost signature — najbardziej stabilny
-    "boosting_type": "Plain",        # szybsza wersja (Ordered tylko dla <50k samples)
+    "border_count": 254,
+    "grow_policy": "SymmetricTree",
     "random_seed": RANDOM_SEED,
-    "thread_count": -1,               # wszystkie rdzenie CPU
-    "task_type": "GPU",
-    "devices": "0",
-    "allow_writing_files": False,    # nie twórz folderu catboost_info/
-    "od_type": "Iter",                # early stopping mode
-    "od_wait": 100,                   # patience
-    "verbose": 100,                   # log co 100 iteracji
+    "thread_count": N_JOBS,
+    "allow_writing_files": False,
+    "od_type": "Iter",
+    "od_wait": 200,
+    # "task_type" ustawiane w runtime: hardware.device_for("catboost") → "GPU" | "CPU"
 }
+# Na GPU CatBoost rezerwuje ułamek WOLNEJ pamięci karty na cały trening (domyślnie 0.95);
+# 0.85 zostawia zapas dla ekranu, gdy karta obsługuje też monitor.
+CATBOOST_GPU_RAM_PART: float = 0.85
 
-# ExtraTrees — maksymalna randomizacja (komplementarna do RF).
-# Większość parametrów jak RF, ale domyślnie bootstrap=False,
-# a criterion może być też 'friedman_mse' / 'mae' / 'poisson'.
-ET_DEFAULT_PARAMS: dict = {
+# Random Forest — jedyny model baggingowy (dywersyfikacja ensemble).
+# Braki obsługiwane natywnie (scikit-learn >= 1.4). Liczby drzew się nie stroi (więcej drzew
+# nigdy nie pogarsza log loss) — 500 na finalny model. min_samples_leaf=5 jest bliżej optimum
+# niż 20, ale model jest większy: przy ~400 tys. wierszy ~1–2 GB w RAM (plik joblib kompresowany).
+RF_DEFAULT_PARAMS: dict = {
     "n_estimators": 500,
-    "max_depth": 20,
-    "min_samples_split": 10,
+    "criterion": "gini",
+    "max_features": "sqrt",
     "min_samples_leaf": 5,
+    "max_samples": 0.5,            # bootstrap z 50% wierszy — szybciej i mniejszy model
+    "bootstrap": True,
     "class_weight": None,
-    "bootstrap": False,
     "random_state": RANDOM_SEED,
-    "n_jobs": -1,
-    "verbose": 1,
+    "n_jobs": N_JOBS,
 }
 
-# HistGradientBoosting — gradient boosting na histogramach (sklearn).
-# Inny inductive bias niż XGB/LGBM/CatBoost.
-HISTGBT_DEFAULT_PARAMS: dict = {
-    "learning_rate": 0.05,
-    "max_iter": 1000,
-    "max_depth": 6,
-    "max_leaf_nodes": 63,
-    "min_samples_leaf": 20,
-    "l2_regularization": 1.0,
-    "max_bins": 255,
-    "early_stopping": "auto",
-    "validation_fraction": 0.1,
-    "n_iter_no_change": 10,
-    "tol": 1e-7,
+# Explainable Boosting Machine — model "glassbox" (interpretowalność, MDR).
+# interactions=0: w wersji wieloklasowej interpret nie wizualizuje interakcji par cech,
+# więc czysty GAM zachowuje pełną interpretowalność (i trenuje się szybciej).
+# outer_bags=14 (domyślne interpret) na finalny model: EBM zrównolegla się tylko po workach,
+# więc 14 worków na 24 rdzeniach kosztuje tyle czasu co 4, a krzywe są gładsze.
+# Do tuningu można podać mniej worków (parametr outer_bags).
+EBM_DEFAULT_PARAMS: dict = {
+    "max_bins": 256,
+    "interactions": 0,
+    "learning_rate": 0.015,
+    "outer_bags": 14,
+    "max_rounds": 5000,
+    "early_stopping_rounds": 100,
+    "random_state": RANDOM_SEED,
+    "n_jobs": N_JOBS,
+}
+
+# Regresja logistyczna (multinomialna) — liniowy punkt odniesienia.
+# Pipeline (logreg_model.py): SimpleImputer(median, add_indicator=True, keep_empty_features=True)
+# → StandardScaler → LogisticRegression; wskaźniki braków zachowują informację "nie zmierzono".
+# Wątki BLAS ograniczane do N_JOBS w czasie treningu.
+LOGREG_DEFAULT_PARAMS: dict = {
+    "C": 1.0,
+    "max_iter": 2000,
+    "tol": 1e-4,
     "random_state": RANDOM_SEED,
 }
 
 # ─────────────────────────────────────────
 # OPTUNA — TUNING
 # ─────────────────────────────────────────
-OPTUNA_N_TRIALS: int = 300
-OPTUNA_TIMEOUT_SECONDS: int | None = None  # bez limitu czasu
+# Budżety tuningu w PROFILACH (03_train.py --profile, run_all.py --profile). Liczba prób i limit
+# czasu dotyczą CAŁEGO badania Optuny: wznowienie po awarii dokańcza tylko brakujące próby i czas.
+# Klucze modelu: n_trials, tune_rows (0 = cały zbiór dopasowania X_fit), n_folds, timeout_s.
+# Klucze profilu: train_sample / eval_sample (None = pełne splity).
+# Szacunki czasu (i9-14900K + RTX 4080 Super, zestaw 'triage', "standard"): ~11–12 h sekwencyjnie,
+# ~7–8 h w dwóch torach (GPU: xgboost → catboost, CPU: reszta); każdy model ma też limit czasu.
+DEFAULT_TUNING_PROFILE: str = "standard"
+TUNE_CV_FOLDS: int = 3                  # foldy CV, gdy tune_model wywołano bez profilu
+
+
+def _budget(n_trials: int, tune_rows: int, n_folds: int, timeout_s: int) -> dict:
+    return {"n_trials": n_trials, "tune_rows": tune_rows, "n_folds": n_folds, "timeout_s": timeout_s}
+
+
+def _uniform_profile(train_sample: int | None, eval_sample: int | None, **budget) -> dict:
+    """Profil testowy: ten sam (mały) budżet dla każdego modelu."""
+    models = ("logreg", "lightgbm", "xgboost", "catboost", "random_forest", "ebm")
+    return {"train_sample": train_sample, "eval_sample": eval_sample,
+            **{m: _budget(**budget) for m in models}}
+
+
+_H = 3600
+TUNING_PROFILES: dict[str, dict] = {
+    # CI / test instalacji: kilka minut na wszystkie modele
+    "smoke": _uniform_profile(6_000, 4_000, n_trials=2, tune_rows=3_000, n_folds=2, timeout_s=120),
+    # Test całego pipeline'u w domu przed nocnym przebiegiem (~20–30 min)
+    "quick": _uniform_profile(60_000, None, n_trials=3, tune_rows=20_000, n_folds=2, timeout_s=300),
+    # Domyślny nocny przebieg. GBDT i logreg strojone na całym X_fit (optimum wielkości liścia
+    # zależy od liczby wierszy); RF i EBM na 150 tys. (ich parametry dobrze się przenoszą).
+    "standard": {
+        "train_sample": None, "eval_sample": None,
+        "logreg": _budget(20, 0, 3, 45 * 60),
+        "lightgbm": _budget(120, 0, 3, 2 * _H),
+        "xgboost": _budget(100, 0, 3, int(3.5 * _H)),
+        "catboost": _budget(60, 0, 3, 4 * _H),
+        "random_forest": _budget(40, 150_000, 3, int(1.5 * _H)),
+        "ebm": _budget(25, 150_000, 3, 4 * _H),
+    },
+    # ≈ 1,7 × próby i czas "standard"; EBM strojony na 250 tys. wierszy
+    "thorough": {
+        "train_sample": None, "eval_sample": None,
+        "logreg": _budget(25, 0, 3, 75 * 60),
+        "lightgbm": _budget(200, 0, 3, int(3.4 * _H)),
+        "xgboost": _budget(170, 0, 3, int(6.0 * _H)),
+        "catboost": _budget(100, 0, 3, int(6.8 * _H)),
+        "random_forest": _budget(70, 150_000, 3, int(2.55 * _H)),
+        "ebm": _budget(40, 250_000, 3, int(6.8 * _H)),
+    },
+}
+
+# Budżet zastępczy, gdy hardware.device_for() zwraca 'cpu' dla biblioteki GPU (brak karty,
+# za stary sterownik, wymuszone SOR_AI_DEVICE_*=cpu). Próba na CPU trwa kilka–kilkanaście razy
+# dłużej, więc mniej wierszy i prób. Profile bez wpisu (smoke, quick) — budżet bez zmian.
+CPU_FALLBACK_BUDGETS: dict[str, dict[str, dict]] = {
+    "standard": {
+        "xgboost": _budget(50, 150_000, 3, 3 * _H),
+        "catboost": _budget(25, 100_000, 3, 4 * _H),
+    },
+    "thorough": {
+        "xgboost": _budget(85, 150_000, 3, int(5.1 * _H)),
+        "catboost": _budget(40, 100_000, 3, int(6.8 * _H)),
+    },
+}
+
+# Wersja przestrzeni hiperparametrów (src/models/tuning.py) — część klucza badania Optuny.
+# PODBIJ przy każdej zmianie zakresów, wyborów albo protokołu foldu danego modelu: stare próby
+# nie zostaną wtedy wymieszane z nowymi (nowe badanie zamiast cichego łączenia).
+SEARCH_SPACE_VERSION: dict[str, int] = {
+    "logreg": 2,
+    "lightgbm": 2,
+    "xgboost": 2,
+    "catboost": 2,
+    "random_forest": 2,
+    "ebm": 2,
+}
+
+# Parametry STAŁE w czasie tuningu (finalny model bierze wartości domyślne z sekcji modeli):
+#   RF: 300 drzew w CV, 500 w finalnym modelu (więcej drzew nie pogarsza log loss),
+#   EBM: 8 worków w CV (3 foldy × 8 = 24 rdzenie), 14 w finalnym; interakcje zawsze 0.
+TUNE_FIXED_PARAMS: dict[str, dict] = {
+    "random_forest": {"n_estimators": 300},
+    "ebm": {"outer_bags": 8, "interactions": 0},
+}
+# Parametry "liczności" skalowane przed finalnym treningiem o sqrt(n_fit / n_fold_train):
+# optimum minimalnej wielkości liścia rośnie ~ √n (pomiar: ×4 danych → ×2 optimum).
+TUNE_SQRT_SCALED_PARAMS: dict[str, list[str]] = {
+    "lightgbm": ["min_child_samples"],
+    "xgboost": ["min_child_weight"],
+}
+# Strażnik rozmiaru RF: próba, której finalny model (500 drzew) miałby > tylu bajtów, jest przerywana
+TUNE_RF_MAX_MODEL_BYTES: float = 1.5e9
+
+OPTUNA_STORAGE_DIR: Path = LOGS_DIR / "optuna"
+OPTUNA_HEARTBEAT_INTERVAL_S: int = 60     # "puls" trwającej próby w bazie SQLite
+OPTUNA_GRACE_PERIOD_S: int = 180          # brak pulsu dłużej → próba FAIL i ponowienie
+OPTUNA_MAX_RETRY: int = 1                 # ile razy ponowić próbę przerwaną awarią procesu
+OPTUNA_MAX_CONSECUTIVE_FAILS: int = 5     # tyle błędów z rzędu → koniec badania
+OPTUNA_PRUNER_STARTUP_TRIALS: int = 5     # MedianPruner: pierwsze próby zawsze do końca
 
 # ─────────────────────────────────────────
 # OLLAMA (LLM medyczny)
@@ -266,7 +440,7 @@ OLLAMA_TIMEOUT_S: int = 120
 # ─────────────────────────────────────────
 # CV (cross-validation)
 # ─────────────────────────────────────────
-CV_N_SPLITS: int = 10
+CV_N_SPLITS: int = 5
 
 # ─────────────────────────────────────────
 # SHAP

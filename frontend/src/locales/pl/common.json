@@ -40,17 +40,13 @@
     "github": "GitHub",
     "documentation": "Dokumentacja"
   },
-  "mts": {
-    "title": "Manchester Triage System",
-    "red": "Czerwony",
-    "orange": "Pomarańczowy",
-    "yellow": "Żółty",
-    "green": "Zielony",
-    "blue": "Niebieski",
-    "redDesc": "Natychmiastowy",
-    "orangeDesc": "Bardzo pilny",
-    "yellowDesc": "Pilny",
-    "greenDesc": "Standardowy",
-    "blueDesc": "Niepilny"
+  "esi": {
+    "title": "Emergency Severity Index (ESI)",
+    "subtitle": "5 poziomów pilności; kolory TOPSOR i maksymalny czas oczekiwania",
+    "level1Desc": "Wymaga natychmiastowej interwencji ratującej życie",
+    "level2Desc": "Sytuacja wysokiego ryzyka lub parametry w strefie zagrożenia",
+    "level3Desc": "Stabilny, przewidywane ≥ 2 zasoby",
+    "level4Desc": "Stabilny, przewidywany 1 zasób",
+    "level5Desc": "Stabilny, bez przewidywanych zasobów"
   }
 }

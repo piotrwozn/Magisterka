@@ -77,6 +77,7 @@ OLLAMA_HOST_DIR=/var/lib/ollama         # change to where Ollama keeps its model
 AUDIT_ENABLED=true
 KAFKA_BOOTSTRAP_SERVERS=kafka:9092
 ALLOWED_ORIGINS=https://sorai-triage.com
+TIMEZONE=Europe/Warsaw                  # ED local time for arrival hour / weekday features
 ```
 
 ### 3. Spring Boot prod profile
@@ -171,7 +172,7 @@ Recommended Prometheus alert rules:
 | ML models (`models/*.joblib`) | once per retraining | rsync to S3 |
 | Imputation medians (`backend/models/imputation_medians.json`) | once per retraining | git commit |
 | Kafka audit topic | continuous | tiered storage to S3 |
-| Optuna study DB (`logs/optuna_studies_*.db`) | once per tuning run | rsync to S3 |
+| Optuna studies (`training/logs/optuna/optuna_<model>.db` + `<study>.best.json`) | once per tuning run | rsync to S3 |
 
 ---
 

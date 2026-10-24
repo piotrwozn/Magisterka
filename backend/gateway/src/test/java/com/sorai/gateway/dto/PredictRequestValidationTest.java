@@ -91,5 +91,40 @@ class PredictRequestValidationTest {
         PredictRequest parsed = mapper.readValue(json, PredictRequest.class);
         assertThat(parsed.vitals().age()).isEqualTo(40);
         assertThat(parsed.clinicalNote()).isEqualTo("ból w klatce");
+        assertThat(parsed.sex()).isNull();
+        assertThat(parsed.arrivalMode()).isNull();
+        assertThat(parsed.o2Device()).isNull();
+    }
+
+    @Test
+    @DisplayName("Optional patient context (sex, arrivalMode, o2Device) round-trips")
+    void optionalContextRoundTrips() throws Exception {
+        String json = """
+                {
+                  "vitals": {"age":40,"temp":36.7,"hr":80,"sbp":120,"dbp":80,"rr":16,"o2":99.0},
+                  "clinicalNote": "",
+                  "sex": "F", "arrivalMode": "ambulance", "o2Device": true
+                }
+                """;
+        PredictRequest parsed = mapper.readValue(json, PredictRequest.class);
+        assertThat(validator.validate(parsed)).isEmpty();
+        assertThat(parsed.sex()).isEqualTo("F");
+        assertThat(parsed.arrivalMode()).isEqualTo("ambulance");
+        assertThat(parsed.o2Device()).isTrue();
+        assertThat(mapper.writeValueAsString(parsed)).contains("\"arrivalMode\":\"ambulance\"");
+    }
+
+    @Test
+    @DisplayName("Unknown optional context is not forwarded (nulls omitted)")
+    void nullContextOmitted() throws Exception {
+        var req = new PredictRequest(new Vitals(40, 36.7, 80, 120, 80, 16, 99.0), "Test");
+        assertThat(mapper.writeValueAsString(req)).doesNotContain("sex").doesNotContain("arrivalMode");
+    }
+
+    @Test
+    @DisplayName("Sex other than M / F is rejected")
+    void invalidSexFails() {
+        var req = new PredictRequest(new Vitals(40, 36.7, 80, 120, 80, 16, 99.0), "Test", "X", null, null);
+        assertThat(validator.validate(req)).isNotEmpty();
     }
 }

@@ -3,10 +3,12 @@ import { ArrowRight, Sparkles, Zap } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { CountUp } from "@/components/animations/CountUp";
+import { MetricValue } from "@/components/shared/MetricValue";
 import { MagneticButton } from "@/components/animations/MagneticButton";
 import { TextReveal } from "@/components/animations/TextReveal";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { MODELS, RESULTS } from "@/lib/constants";
 
 function scrollToAnchor(id: string) {
   const el = document.getElementById(id);
@@ -64,15 +66,15 @@ export function JourneyHero() {
       >
         <Metric
           label={t("hero.metric1")}
-          value={<CountUp to={0.8718} decimals={4} duration={2.2} />}
+          value={<MetricValue value={RESULTS?.qwk} decimals={4} duration={2.2} />}
         />
         <Metric
           label={t("hero.metric2")}
-          value={<CountUp to={0.06} decimals={2} suffix="%" duration={2.2} />}
+          value={<MetricValue value={RESULTS?.criticalMiss} decimals={2} suffix="%" duration={2.2} />}
         />
         <Metric
           label={t("hero.metric3")}
-          value={<CountUp to={350} suffix=" ms" duration={2.2} />}
+          value={<CountUp to={MODELS.length} duration={2.2} />}
         />
       </motion.div>
 

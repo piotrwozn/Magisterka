@@ -101,6 +101,24 @@ class TestPredictEndpoint:
         })
         assert r.status_code == 422
 
+    def test_optional_patient_context_accepted(self, client):
+        r = client.post("/api/v1/predict", json={
+            "vitals": {"age": 40, "temp": 36.7, "hr": 80, "sbp": 120, "dbp": 80, "rr": 16, "o2": 99},
+            "clinicalNote": "", "sex": "F", "arrivalMode": "ambulance", "o2Device": False,
+        })
+        assert r.status_code == 200, r.text
+
+    def test_invalid_sex_rejected(self, client):
+        r = client.post("/api/v1/predict", json={
+            "vitals": {"age": 40, "temp": 36.7, "hr": 80, "sbp": 120, "dbp": 80, "rr": 16, "o2": 99},
+            "sex": "X",
+        })
+        assert r.status_code == 422
+
+    def test_openapi_describes_esi(self, client):
+        description = client.get("/openapi.json").json()["info"]["description"]
+        assert "Emergency Severity Index (ESI 1–5)" in description
+
     def test_root_endpoint(self, client):
         r = client.get("/")
         assert r.status_code == 200

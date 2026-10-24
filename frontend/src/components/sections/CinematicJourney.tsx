@@ -97,7 +97,7 @@ export function CinematicJourney({ chapters }: CinematicJourneyProps) {
     setActiveChapter(flat[idx]!.chapterIndex);
   });
 
-  // ── Scroll to exact stage — targets fadeIn point so text is immediately visible ──
+  // ── Scroll to exact stage — targets fadeIn point so text is visible right away ──
   const scrollToStage = useCallback((idx: number) => {
     if (!ref.current) return;
     const stage = flat[Math.max(0, Math.min(idx, flat.length - 1))];

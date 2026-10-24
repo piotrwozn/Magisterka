@@ -1,15 +1,18 @@
 """
-Metryki ewaluacji dla 5-klasowej klasyfikacji triażu MTS.
+Metryki ewaluacji dla 5-klasowej klasyfikacji ESI (indeks 0–4 = ESI 1–5).
 
 Kluczowe metryki:
     1. QUADRATIC WEIGHTED KAPPA — główna metryka (ordinalna).
-    2. UNDERTRIAGE RATE — KRYTYCZNA metryka bezpieczeństwa.
-       (Red/Orange błędnie zaklasyfikowany jako Yellow/Green/Blue)
-    3. OVERTRIAGE RATE — efektywność oddziału.
-    4. Per-class AUC-ROC — szczególnie Red/Orange.
+    2. UNDERTRIAGE RATE — KRYTYCZNA metryka bezpieczeństwa
+       (ESI 1–2 przewidziane jako ESI 3–5).
+    3. MISTRIAGE — niedo-/przetriażowanie o dowolny poziom (standard w literaturze).
+    4. Per-class AUC-ROC, log loss, Brier — jakość prawdopodobieństw (ważne przy łączeniu modeli).
     5. 5×5 confusion matrix — wizualizacja błędów ordinalnych.
 
-UWAGA: Accuracy jest BEZUŻYTECZNE — 98% accuracy może oznaczać 100% pominięć Red.
+Decyzja: `decide(proba, "argmax")` albo `decide(proba, "cost")` — minimalizacja
+oczekiwanego kosztu z macierzy, w której niedotriażowanie kosztuje 3× więcej.
+
+UWAGA: Accuracy jest mylące — 98% accuracy może oznaczać 100% pominięć ESI 1.
 """
 
 from __future__ import annotations
@@ -27,7 +30,14 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from src.utils.config import CLASS_NAMES
+from src.utils.config import (
+    CLASS_NAMES,
+    HIGH_ACUITY_CLASSES,
+    LOW_ACUITY_CLASSES,
+    N_CLASSES,
+    OVERTRIAGE_COST_MULTIPLIER,
+    UNDERTRIAGE_COST_MULTIPLIER,
+)
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -39,11 +49,11 @@ log = get_logger(__name__)
 def undertriage_rate(
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    high_acuity_classes: tuple[int, ...] = (0, 1),
+    high_acuity_classes: tuple[int, ...] = HIGH_ACUITY_CLASSES,
 ) -> float:
     """
-    Procent pacjentów wymagających pilnej pomocy (Red/Orange) błędnie zaklasyfikowanych
-    jako mniej pilni (Yellow/Green/Blue).
+    Procent pacjentów wymagających pilnej pomocy (ESI 1–2) błędnie zaklasyfikowanych
+    jako mniej pilni (ESI 3–5).
 
     To NAJWAŻNIEJSZA metryka bezpieczeństwa w medycynie ratunkowej:
         Lepiej overtriage zdrowego niż przeoczyć zawał.
@@ -52,7 +62,7 @@ def undertriage_rate(
     ----------
     y_true, y_pred : np.ndarray
     high_acuity_classes : tuple[int]
-        Indeksy klas o wysokiej pilności (domyślnie Red=0, Orange=1).
+        Indeksy klas o wysokiej pilności (domyślnie ESI 1 = 0, ESI 2 = 1).
 
     Returns
     -------
@@ -69,18 +79,18 @@ def undertriage_rate(
 def overtriage_rate(
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    low_acuity_classes: tuple[int, ...] = (3, 4),
+    low_acuity_classes: tuple[int, ...] = LOW_ACUITY_CLASSES,
     threshold_class: int = 1,
 ) -> float:
     """
-    Procent pacjentów Green/Blue błędnie zaklasyfikowanych jako Red/Orange.
+    Procent pacjentów ESI 4–5 błędnie zaklasyfikowanych jako ESI 1–2.
 
     Parameters
     ----------
     low_acuity_classes : tuple[int]
-        Klasy nieurgentne (Green=3, Blue=4).
+        Klasy niskiej pilności (ESI 4 = 3, ESI 5 = 4).
     threshold_class : int
-        Klasy ≤ threshold_class to "high acuity overtriage" (domyślnie ≤ Orange).
+        Predykcje ≤ threshold_class to przetriażowanie do wysokiej pilności (≤ ESI 2).
     """
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
@@ -95,7 +105,7 @@ def critical_miss_rate(
     y_pred: np.ndarray,
 ) -> float:
     """
-    Specjalny przypadek undertriage: Red (0) błędnie zaklasyfikowany jako Green/Blue (3, 4).
+    Specjalny przypadek undertriage: ESI 1 (0) zaklasyfikowany jako ESI 4–5 (3, 4).
     To "missed critical" — najgorszy możliwy błąd.
     """
     y_true = np.asarray(y_true)
@@ -104,6 +114,70 @@ def critical_miss_rate(
     if mask.sum() == 0:
         return float("nan")
     return float((y_pred[mask] >= 3).mean())
+
+
+def mistriage_rates(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    """
+    Błędny triaż o dowolny poziom (definicja z literatury ESI):
+        under = przewidziano NIŻSZĄ pilność (wyższy numer ESI) niż prawdziwa,
+        over  = przewidziano WYŻSZĄ pilność niż prawdziwa.
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return {
+        "mistriage_under": float((y_pred > y_true).mean()),
+        "mistriage_over": float((y_pred < y_true).mean()),
+        "within_one_accuracy": float((np.abs(y_pred - y_true) <= 1).mean()),
+    }
+
+
+# ─────────────────────────────────────────
+# Macierz kosztów i reguła decyzyjna
+# ─────────────────────────────────────────
+def cost_matrix(
+    n_classes: int = N_CLASSES,
+    under: float = UNDERTRIAGE_COST_MULTIPLIER,
+    over: float = OVERTRIAGE_COST_MULTIPLIER,
+) -> np.ndarray:
+    """
+    koszt[t, p] = (p - t)^2 × (under jeśli p > t, over jeśli p < t).
+
+    p > t to niedotriażowanie (niższa pilność niż prawdziwa) — droższe.
+    """
+    t = np.arange(n_classes)[:, None]
+    p = np.arange(n_classes)[None, :]
+    dist2 = (p - t).astype(float) ** 2
+    return np.where(p > t, under * dist2, over * dist2)
+
+
+def decide(proba: np.ndarray, rule: str = "argmax", costs: np.ndarray | None = None) -> np.ndarray:
+    """
+    Prawdopodobieństwa → klasy.
+
+    'argmax' — najbardziej prawdopodobna klasa.
+    'cost'   — klasa minimalizująca oczekiwany koszt (Bayes decision):
+               argmin_p Σ_t P(t | x) · koszt[t, p].
+    """
+    proba = np.asarray(proba, dtype=float)
+    if rule == "argmax":
+        return proba.argmax(axis=1)
+    if rule == "cost":
+        costs = cost_matrix(proba.shape[1]) if costs is None else costs
+        return (proba @ costs).argmin(axis=1)
+    raise ValueError(f"Nieznana reguła decyzyjna: '{rule}' (argmax | cost)")
+
+
+def expected_cost(y_true: np.ndarray, y_pred: np.ndarray, costs: np.ndarray | None = None) -> float:
+    """Średni koszt decyzji wg macierzy kosztów (im mniej, tym bezpieczniej)."""
+    costs = cost_matrix() if costs is None else costs
+    return float(costs[np.asarray(y_true), np.asarray(y_pred)].mean())
+
+
+def brier_score(y_true: np.ndarray, proba: np.ndarray) -> float:
+    """Wieloklasowy Brier score (średnia po wierszach; im mniej, tym lepiej)."""
+    proba = np.asarray(proba, dtype=float)
+    onehot = np.eye(proba.shape[1])[np.asarray(y_true)]
+    return float(((proba - onehot) ** 2).sum(axis=1).mean())
 
 
 # ─────────────────────────────────────────
@@ -156,7 +230,7 @@ def full_evaluation(
     ----------
     y_true, y_pred : np.ndarray
     y_proba : np.ndarray, optional
-        Prawdopodobieństwa per klasa, shape (n, 5).
+        Prawdopodobieństwa per klasa ESI 1–5, shape (n, 5).
     class_names : list[str], optional
     print_report : bool
         Czy wyświetlić classification report.
@@ -191,42 +265,42 @@ def full_evaluation(
         results[_key("f1_macro")] = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
         results[_key("f1_weighted")] = float(f1_score(y_true, y_pred, average="weighted", zero_division=0))
 
-    # 4. AUC-ROC (One-vs-Rest)
+    # 4. AUC-ROC (One-vs-Rest) — liczone dla klas obecnych w y_true, tak żeby mała
+    #    próbka bez np. ESI 1 nie kasowała wszystkich metryk probabilistycznych
     if y_proba is not None:
-        try:
-            # Macro AUC
-            results[_key("auc_macro")] = float(roc_auc_score(
-                y_true, y_proba, multi_class="ovr", average="macro"
-            ))
-            # Per-class AUC
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                auc_per_class = roc_auc_score(y_true, y_proba, multi_class="ovr", average=None)
-            for i, name in enumerate(class_names):
-                if i < len(auc_per_class):
-                    results[_key(f"auc_{name.lower()}")] = float(auc_per_class[i])
+        y_proba = np.asarray(y_proba, dtype=np.float64)
+        labels = list(range(len(class_names)))
+        aucs = []
+        for i, name in enumerate(class_names):
+            positives = y_true == i
+            if positives.any() and not positives.all():
+                auc_i = float(roc_auc_score(positives.astype(int), y_proba[:, i]))
+                results[_key(f"auc_{name.lower()}")] = auc_i
+                aucs.append(auc_i)
+        if aucs:
+            results[_key("auc_macro")] = float(np.mean(aucs))
+        else:
+            log.warning("Nie udało się policzyć AUC-ROC: w y_true jest tylko jedna klasa")
 
-            # Log loss (multi-class)
-            try:
-                results[_key("log_loss")] = float(log_loss(
-                    y_true, y_proba,
-                    labels=list(range(len(class_names))),
-                ))
-            except Exception:
-                pass
-        except (ValueError, IndexError) as e:
-            log.warning(f"Nie udało się policzyć AUC-ROC: {e}")
+        # Log loss + Brier (jakość prawdopodobieństw)
+        y_proba_norm = y_proba / y_proba.sum(axis=1, keepdims=True)
+        results[_key("log_loss")] = float(log_loss(y_true, y_proba_norm, labels=labels))
+        results[_key("brier")] = brier_score(y_true, y_proba_norm)
 
     # 5. METRYKI BEZPIECZEŃSTWA (KRYTYCZNE)
     results[_key("undertriage_rate")] = undertriage_rate(y_true, y_pred)
     results[_key("overtriage_rate")] = overtriage_rate(y_true, y_pred)
     results[_key("critical_miss_rate")] = critical_miss_rate(y_true, y_pred)
+    for name, value in mistriage_rates(y_true, y_pred).items():
+        results[_key(name)] = value
+    results[_key("expected_cost")] = expected_cost(y_true, y_pred)
 
     # 6. Per-class metrics z classification_report
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         report_dict = classification_report(
             y_true, y_pred,
+            labels=list(range(len(class_names))),
             target_names=class_names,
             output_dict=True,
             zero_division=0,
@@ -269,12 +343,14 @@ def _print_evaluation(
     if f"{p}auc_macro" in results:
         log.info(f"  Macro AUC-ROC:            {results[f'{p}auc_macro']:.4f}")
 
-    log.info(f"\n  ─── METRYKI BEZPIECZEŃSTWA ───")
-    log.info(f"  Undertriage rate:         {results[f'{p}undertriage_rate']:.4f}  (Red/Orange → Yellow/Green/Blue)")
-    log.info(f"  Critical miss rate:       {results[f'{p}critical_miss_rate']:.4f}  (Red → Green/Blue)")
-    log.info(f"  Overtriage rate:          {results[f'{p}overtriage_rate']:.4f}  (Green/Blue → Red/Orange)")
+    log.info("\n  ─── METRYKI BEZPIECZEŃSTWA ───")
+    log.info(f"  Undertriage rate:         {results[f'{p}undertriage_rate']:.4f}  (ESI 1–2 → ESI 3–5)")
+    log.info(f"  Critical miss rate:       {results[f'{p}critical_miss_rate']:.4f}  (ESI 1 → ESI 4–5)")
+    log.info(f"  Overtriage rate:          {results[f'{p}overtriage_rate']:.4f}  (ESI 4–5 → ESI 1–2)")
+    log.info(f"  Mistriage under / over:   {results[f'{p}mistriage_under']:.4f} / {results[f'{p}mistriage_over']:.4f}")
+    log.info(f"  Expected cost:            {results[f'{p}expected_cost']:.4f}")
 
-    log.info(f"\n  ─── PER-CLASS ───")
+    log.info("\n  ─── PER-CLASS ───")
     for name in class_names:
         n = name.lower()
         if f"{p}precision_{n}" in results:
@@ -287,7 +363,7 @@ def _print_evaluation(
             )
 
     # Confusion matrix
-    log.info(f"\n  ─── CONFUSION MATRIX (wiersze=true, kolumny=pred) ───")
+    log.info("\n  ─── CONFUSION MATRIX (wiersze=true, kolumny=pred) ───")
     header = "          " + " ".join(f"{n[:6]:>7}" for n in class_names)
     log.info(f"  {header}")
     for i, name in enumerate(class_names):

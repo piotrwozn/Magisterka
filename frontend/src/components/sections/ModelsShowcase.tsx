@@ -2,20 +2,19 @@ import { motion } from "framer-motion";
 import { Award, CheckCircle2, Cpu, Hourglass, Loader2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { CountUp } from "@/components/animations/CountUp";
 import { FadeInOnScroll } from "@/components/animations/FadeInOnScroll";
 import { TiltCard } from "@/components/animations/TiltCard";
+import { MetricValue } from "@/components/shared/MetricValue";
 import { SectionHeader } from "@/components/shared/SectionHeader";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { MODELS } from "@/lib/constants";
-import { cn } from "@/lib/utils";
+import { MODELS, bestModel } from "@/lib/constants";
+import { cn, formatMetric } from "@/lib/utils";
 
 export function ModelsShowcase() {
   const { t } = useTranslation("sections");
-  const trained = MODELS.filter((m) => m.status === "trained");
-  const best = (trained.length > 0 ? trained : MODELS).reduce((a, b) => (a.qwk > b.qwk ? a : b));
+  const best = bestModel(MODELS);
 
   return (
     <section id="models" className="relative py-24 md:py-32">
@@ -30,7 +29,7 @@ export function ModelsShowcase() {
 
         <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {MODELS.map((model, idx) => {
-            const isBest = model.id === best.id;
+            const isBest = model.id === best?.id;
             const isTrained = model.status === "trained";
             const isTraining = model.status === "training";
             return (
@@ -91,30 +90,25 @@ export function ModelsShowcase() {
                       <div className="flex items-baseline justify-between">
                         <span className="text-xs text-muted-foreground">
                           {t("models.metrics.qwk")}
-                          {!isTrained && (
-                            <span className="ml-1 text-[10px] opacity-70">
-                              ({isTraining ? "CV" : "est."})
-                            </span>
-                          )}
                         </span>
                         <span className="text-2xl font-bold tabular-nums">
-                          <CountUp to={model.qwk} decimals={4} duration={1.8} />
+                          <MetricValue value={model.qwk} decimals={4} duration={1.8} />
                         </span>
                       </div>
-                      <Progress value={model.qwk * 100} />
+                      <Progress value={(model.qwk ?? 0) * 100} />
                     </div>
 
                     <div className="grid grid-cols-2 gap-3 border-t border-border pt-3 text-xs">
                       <div>
                         <p className="text-muted-foreground">{t("models.metrics.undertriage")}</p>
                         <p className="mt-0.5 font-mono font-semibold tabular-nums">
-                          {(model.undertriage * 100).toFixed(1)}%
+                          {formatMetric(model.undertriage, 1, "%")}
                         </p>
                       </div>
                       <div>
                         <p className="text-muted-foreground">{t("models.metrics.criticalMiss")}</p>
                         <p className="mt-0.5 font-mono font-semibold tabular-nums">
-                          {(model.criticalMiss * 100).toFixed(2)}%
+                          {formatMetric(model.criticalMiss, 2, "%")}
                         </p>
                       </div>
                     </div>
@@ -126,7 +120,7 @@ export function ModelsShowcase() {
                       </span>
                       <span className="inline-flex items-center gap-1">
                         <Hourglass className="size-3" />
-                        {model.trainTimeMin}m
+                        {formatMetric(model.trainTimeMin, 0, "m")}
                       </span>
                     </div>
                   </CardContent>

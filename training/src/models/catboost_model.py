@@ -1,27 +1,36 @@
 """
 CatBoost — model komplementarny w ensemble.
 
-CatBoost wybrany jako 5. model bazowy z trzech powodów:
-    1. Ordered boosting — redukuje target leakage, lepsza generalizacja
-       na małych klasach (Red, Yellow w naszym przypadku).
+CatBoost wybrany jako model bazowy z trzech powodów:
+    1. Silna regularyzacja — dobra generalizacja na małych klasach
+       (ESI 1, ESI 5).
     2. Inny inductive bias niż XGB/LGBM — Symmetric Trees (oblivious
        decision trees) wprowadzają regularyzację strukturalną, co daje
        mniejszą korelację błędów z XGB/LGBM w ensemble.
-    3. Świetna wydajność CPU multi-threaded — `thread_count=-1` skaluje
-       liniowo do ~16 wątków, potem saturacja.
+    3. Działa na CPU i GPU — urządzenie wybiera `hardware.device_for("catboost")`
+       (SOR_AI_DEVICE_CATBOOST / SOR_AI_DEVICE = auto | cpu | gpu).
 
-Cały trening jest w pełni logowany (per-iteration mlogloss → JSON tracker).
+Na GPU: `gpu_ram_part` = config.CATBOOST_GPU_RAM_PART, bez `rsm`/`colsample_bylevel`
+(na GPU tylko dla trybów pairwise), MVS → Bernoulli (MVS nie działa z MultiClass na GPU).
+Błąd CUDA (sterownik, brak pamięci) → ponowny trening na CPU (baza).
+
+Wątki: budżet modelu (`thread_count` = config.N_JOBS) trafia także do budowy Pool
+i do predict_proba — domyślne -1 CatBoost zajęłoby wszystkie wątki logiczne (zderzenie
+z drugim torem orkiestratora).
+
+Logowanie (tylko fit()): krzywe `train_MultiClass` i `es_MultiClass` → JSON + plik .log.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
-from src.models.base import BaseTriageModel, compute_sample_weights
-from src.utils.config import CATBOOST_DEFAULT_PARAMS
+from src.models.base import BaseTriageModel
+from src.utils.config import CATBOOST_DEFAULT_PARAMS, CATBOOST_GPU_RAM_PART
+from src.utils.hardware import device_for
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -35,16 +44,23 @@ _SKLEARN_TO_CATBOOST_ALIASES: dict[str, str] = {
     "random_state": "random_seed",
 }
 
+# Parametry istniejące tylko na GPU
+_GPU_ONLY_PARAMS: tuple[str, ...] = ("devices", "gpu_ram_part")
+
+
+def _translate_aliases(params: dict[str, Any]) -> dict[str, Any]:
+    """sklearn-style → CatBoost-style (gdy podano oba, wygrywa nazwa CatBoost)."""
+    out = dict(params)
+    for sk_name, cb_name in _SKLEARN_TO_CATBOOST_ALIASES.items():
+        if sk_name in out:
+            value = out.pop(sk_name)
+            out.setdefault(cb_name, value)
+    return out
+
 
 def _normalize_catboost_params(params: dict[str, Any]) -> dict[str, Any]:
     """Tłumaczy sklearn-style nazwy na CatBoost-style i usuwa konflikty."""
-    out = dict(params)
-    for sk_name, cb_name in _SKLEARN_TO_CATBOOST_ALIASES.items():
-        if sk_name in out and cb_name not in out:
-            out[cb_name] = out.pop(sk_name)
-        elif sk_name in out:
-            # Jeśli oba ustawione, preferuj CatBoost-style i odrzuć alias.
-            out.pop(sk_name, None)
+    out = _translate_aliases(params)
 
     # Walidacja: subsample wymaga Bernoulli/MVS/Poisson, NIE Bayesian.
     bootstrap = out.get("bootstrap_type")
@@ -53,11 +69,16 @@ def _normalize_catboost_params(params: dict[str, Any]) -> dict[str, Any]:
     elif bootstrap in ("Bernoulli", "MVS", "Poisson"):
         out.pop("bagging_temperature", None)
 
-    # GPU restrictions
+    # Ograniczenia GPU
     if out.get("task_type") == "GPU":
+        # rsm (alias colsample_bylevel) na GPU tylko dla trybów pairwise
         out.pop("rsm", None)
+        out.pop("colsample_bylevel", None)
         if out.get("bootstrap_type") == "MVS":
             out["bootstrap_type"] = "Bernoulli"
+    else:
+        for key in _GPU_ONLY_PARAMS:
+            out.pop(key, None)
 
     # max_leaves dostępne tylko z Lossguide.
     if out.get("grow_policy") != "Lossguide":
@@ -71,160 +92,108 @@ def _normalize_catboost_params(params: dict[str, Any]) -> dict[str, Any]:
 
 
 class CatBoostTriageModel(BaseTriageModel):
-    """Model CatBoost dla 5-klasowej klasyfikacji triażu MTS (CPU multi-threaded)."""
+    """Model CatBoost dla 5-klasowej klasyfikacji ESI (CPU lub GPU)."""
 
     name = "catboost"
+    display_name = "CatBoost"
+    supports_early_stopping = True
+    iteration_param = "iterations"
 
     def __init__(self, params: dict[str, Any] | None = None):
-        merged = {**CATBOOST_DEFAULT_PARAMS, **(params or {})}
-        merged = _normalize_catboost_params(merged)
-        super().__init__(params=merged)
+        # Aliasy użytkownika (np. random_state z Optuny) nadpisują domyślne random_seed/thread_count
+        merged = {**CATBOOST_DEFAULT_PARAMS, **_translate_aliases(params or {})}
+        if "task_type" not in merged:
+            merged["task_type"] = "GPU" if device_for("catboost") == "gpu" else "CPU"
+        merged["task_type"] = str(merged["task_type"]).upper()
+        if merged["task_type"] == "GPU":
+            merged.setdefault("devices", "0")
+            merged.setdefault("gpu_ram_part", CATBOOST_GPU_RAM_PART)
+        super().__init__(params=_normalize_catboost_params(merged))
 
+    # ──────── Urządzenie ────────
+    def _uses_gpu(self) -> bool:
+        return str(self.params.get("task_type", "CPU")).upper() == "GPU"
+
+    def _switch_to_cpu(self) -> None:
+        self.params = _normalize_catboost_params({**self.params, "task_type": "CPU"})
+
+    def _thread_count(self) -> int:
+        """Budżet wątków modelu (`thread_count`, ≤ liczba CPU tej maszyny); brak / ≤ 0 → -1 (wszystkie)."""
+        try:
+            value = int(self.params.get("thread_count") or -1)
+        except (TypeError, ValueError):
+            return -1
+        if value <= 0:
+            return -1
+        return min(value, os.cpu_count() or value)
+
+    # ──────── Trening ────────
     def _build_model(self):
         from catboost import CatBoostClassifier
-        return CatBoostClassifier(**_normalize_catboost_params(self.params))
 
-    def fit(
-        self,
-        X_train: pd.DataFrame,
-        y_train: np.ndarray | pd.Series,
-        X_val: pd.DataFrame | None = None,
-        y_val: np.ndarray | pd.Series | None = None,
-        sample_weight_strategy: str = "custom",
-        run_id: str | None = None,
-        use_mlflow: bool = False,
-        feature_set: str = "triage_only",
-        verbose: int | bool = 100,
-        early_stopping_rounds: int = 100,
-        **kwargs,
-    ) -> "CatBoostTriageModel":
-        """Trenuje CatBoost z pełnym logowaniem."""
-        from catboost import CatBoostClassifier, Pool
+        params = _normalize_catboost_params(self.params)
+        params["verbose"] = self._verbose_period      # 0 = cicho (fit_estimator)
+        return CatBoostClassifier(**params)
 
-        # 1. Tracking setup
-        self._setup_tracking(run_id=run_id, use_mlflow=use_mlflow)
-        self._log_data_info(X_train, y_train, X_val, y_val, feature_set=feature_set)
+    def _fit_impl(self, X, y, X_es, y_es, sample_weight) -> None:
+        from catboost import Pool
 
-        self.train_logger.info(
-            f"Trenowanie CatBoost (n={len(X_train):,}, features={X_train.shape[1]}, "
-            f"threads={self.params.get('thread_count', -1)})"
-        )
-        self.feature_names = list(X_train.columns)
-
-        # 2. Wagi sampli
-        sample_weights = compute_sample_weights(y_train, strategy=sample_weight_strategy, class_weights=self.optuna_class_weights)
-        self.train_logger.info(
-            f"Wagi sampli: strategia='{sample_weight_strategy}', "
-            f"min={sample_weights.min():.2f}, max={sample_weights.max():.2f}"
-        )
-
-        # 3. Pool-e (natywny format CatBoost — szybszy niż przekazywanie DataFrame)
-        train_pool = Pool(
-            data=X_train,
-            label=np.asarray(y_train),
-            weight=sample_weights,
-            feature_names=self.feature_names,
-        )
-
-        eval_pool = None
-        if X_val is not None and y_val is not None:
-            eval_pool = Pool(
-                data=X_val,
-                label=np.asarray(y_val),
-                feature_names=self.feature_names,
-            )
-
-        # 4. Trenuj — bez własnego log_every (CatBoost loguje natywnie via verbose)
+        self._label_classes = np.unique(y)
         self.model = self._build_model()
-
-        # Podmień verbose w runtime gdy chcemy ciszej (np. podczas Optuny)
-        fit_kwargs = {
-            "eval_set": eval_pool,
-            "verbose_eval": verbose if isinstance(verbose, int) and verbose > 0 else False,
-            "early_stopping_rounds": early_stopping_rounds if eval_pool is not None else None,
-            "use_best_model": eval_pool is not None,
-        }
-        # CatBoost nie akceptuje None dla early_stopping_rounds
-        fit_kwargs = {k: v for k, v in fit_kwargs.items() if v is not None}
-
-        t0 = self._start_timer()
+        # Pool — natywny format CatBoost (szybszy niż przekazywanie DataFrame)
+        threads = self._thread_count()
+        train_pool = Pool(data=X, label=y, weight=sample_weight, feature_names=list(X.columns),
+                          thread_count=threads)
+        fit_kwargs: dict[str, Any] = {}
+        if X_es is not None:
+            fit_kwargs.update(
+                eval_set=Pool(data=X_es, label=y_es, feature_names=list(X.columns), thread_count=threads),
+                early_stopping_rounds=self.es_rounds or int(self.params.get("od_wait", 200)),
+                use_best_model=True,
+            )
         self.model.fit(train_pool, **fit_kwargs)
-        duration = self._stop_timer(t0)
 
-        # 5. Wyciągnij training history → tracker
-        self._extract_evals_result(verbose=verbose)
+    def _after_fit(self, has_es: bool) -> None:
+        # classes_count=5 daje zawsze 5 kolumn, ale klasa nieobecna w treningu dostaje
+        # przypadkowe małe prawdopodobieństwo — zostawiamy tylko klasy z treningu (reszta = 0)
+        self.classes_ = np.asarray(self._label_classes).astype(int)
+        self.actual_device = "gpu" if self._uses_gpu() else "cpu"
+        self.iteration_cap = int(self.params.get("iterations") or 1000)
+        best = self.model.get_best_iteration() if has_es else None   # 0-based
+        self.best_iteration = int(best) + 1 if best is not None else None
 
-        self.classes_ = self.model.classes_
-        self.is_fitted = True
+    def _predict_proba_raw(self, X):
+        proba = np.asarray(self.model.predict_proba(X, thread_count=self._thread_count()))
+        model_classes = np.asarray(self.model.classes_).astype(int)
+        return proba[:, np.searchsorted(model_classes, self.classes_)]
 
-        best_iter = getattr(self.model, "best_iteration_", None)
-        if best_iter is not None:
-            self.train_logger.info(f"Best iteration: {best_iter}")
-            self.tracker.add_note(f"Early stopping na iter {best_iter}")
-            self.tracker.log_metrics({"best_iteration": best_iter})
+    def _eval_history(self) -> list[dict[str, float]]:
+        """{'learn': {...}, 'validation': {...}} → [{'train_MultiClass', 'es_MultiClass'}, ...]."""
+        evals_result = self.model.get_evals_result() if hasattr(self.model, "get_evals_result") else {}
+        if not evals_result:
+            return []
+        rename = {"learn": "train", "validation": "es"}
+        first = next(iter(evals_result.values()))
+        n_iters = len(next(iter(first.values())))
+        history = []
+        for i in range(n_iters):
+            row = {}
+            for set_key, metrics in evals_result.items():
+                set_name = rename.get(set_key, set_key)
+                for metric, values in metrics.items():
+                    if i < len(values):
+                        row[f"{set_name}_{metric}"] = float(values[i])
+            history.append(row)
+        return history
 
-        tree_count = self.model.tree_count_ if hasattr(self.model, "tree_count_") else None
+    def _log_extra_details(self) -> None:
+        tree_count = getattr(self.model, "tree_count_", None)
         if tree_count is not None:
             self.train_logger.info(f"Tree count (final): {tree_count}")
-            self.tracker.log_metrics({"tree_count": tree_count})
-
-        self.train_logger.info(f"Trening CatBoost zakończony w {duration:.1f}s")
-
-        # 6. Finalizuj
-        self._finalize_tracking()
-
-        return self
-
-    def _extract_evals_result(self, verbose: int | bool = 100) -> None:
-        """
-        Wyciąga `evals_result_` z CatBoost i zapisuje do trackera + loggera.
-
-        CatBoost format:
-            {"learn": {"MultiClass": [...]},
-             "validation": {"MultiClass": [...]}}
-        """
-        if not hasattr(self.model, "get_evals_result"):
-            return
-        evals_result = self.model.get_evals_result()
-        if not evals_result:
-            return
-
-        eval_keys = list(evals_result.keys())
-        rename = {}
-        if len(eval_keys) >= 1:
-            rename[eval_keys[0]] = "train"
-        if len(eval_keys) >= 2:
-            rename[eval_keys[1]] = "val"
-
-        first_key = eval_keys[0]
-        first_metric = next(iter(evals_result[first_key].values()))
-        n_iters = len(first_metric)
-
-        log_every = verbose if isinstance(verbose, int) and verbose > 0 else 100
-
-        for i in range(n_iters):
-            metrics = {}
-            for set_key, set_metrics in evals_result.items():
-                set_name = rename.get(set_key, set_key)
-                for metric_name, values in set_metrics.items():
-                    metrics[f"{set_name}_{metric_name}"] = float(values[i])
-            self.tracker.log_iteration(i, metrics)
-
-            if i % log_every == 0 or i == n_iters - 1:
-                metric_str = " | ".join(f"{k}={v:.5f}" for k, v in metrics.items())
-                self.train_logger.info(f"Iter {i:>5} | {metric_str}")
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        if not self.is_fitted:
-            raise RuntimeError("Model nie wytrenowany.")
-        # CatBoost zwraca shape (n,1) dla multiclass — flatten
-        preds = self.model.predict(X)
-        return np.asarray(preds).ravel().astype(int)
-
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        if not self.is_fitted:
-            raise RuntimeError("Model nie wytrenowany.")
-        return self.model.predict_proba(X)
+            self.tracker.log_metrics({"tree_count": int(tree_count)})
+        self.train_logger.info(
+            f"Wątki CPU: {self.params.get('thread_count')}, task_type: {self.params.get('task_type')}"
+        )
 
     # ──────── Pomocnicze ────────
     def get_booster(self):

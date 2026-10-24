@@ -5,26 +5,52 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sor-ai-triage"
 version = "0.1.0"
-description = "SOR-AI: System Klasyfikacji Triażu MTS oparty na ML (praca magisterska)"
+description = "SOR-AI: klasyfikacja ESI (TOPSOR) na SOR oparta na ML (praca magisterska)"
 authors = [
     { name = "Piotr (Magisterka)" }
 ]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 keywords = [
     "triage", "machine-learning", "explainable-ai",
-    "emergency-department", "mts", "esi", "xgboost", "shap"
+    "emergency-department", "esi", "topsor", "xgboost", "shap"
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
+
+# Te same zakresy co requirements.txt (dokładne, przetestowane wersje: requirements-lock.txt)
+dependencies = [
+    "numpy>=2.0,<3",
+    "pandas>=2.2,<4",
+    "pyarrow>=14",
+    "scipy>=1.11",
+    "pyreadr>=0.5",
+    "scikit-learn>=1.6,<2",
+    "xgboost>=3.1,<4",
+    "lightgbm>=4.0,<5",
+    "catboost>=1.2,<2",
+    "interpret-core>=0.7,<0.8",
+    "optuna>=4.0,<6",
+    "joblib>=1.3",
+    "threadpoolctl>=3.5",
+    "psutil>=5.9",
+    "shap>=0.44",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "rich>=13",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.28", "lime>=0.2", "dice-ml>=0.11"]
+dev = ["pytest>=8", "pytest-cov>=4.1", "ruff>=0.5", "black>=24"]
 
 [project.urls]
 Repository = "https://github.com/anomalyco/sor-ai-triage"
@@ -39,11 +65,11 @@ include = ["src*"]
 
 [tool.black]
 line-length = 100
-target-version = ["py311"]
+target-version = ["py312"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "B", "UP"]
@@ -54,7 +80,7 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 addopts = "-ra --strict-markers --tb=short"
 markers = [
-    "slow: testy długo trwające",
+    "slow: testy długo trwające (np. pełny run_all.py w procesach; pomiń: -m \"not slow\")",
     "integration: testy integracyjne",
 ]
 

@@ -1,8 +1,8 @@
 import type { PredictRequest, PredictResponse } from "./types";
 
 /**
- * Realistic mock prediction for demo when backend unavailable.
- * Heuristic: derives category from vitals (SBP, HR, temp, age, O2, RR).
+ * Mock prediction for the demo when the backend is unavailable.
+ * Heuristic: derives an ESI class index (0–4 = ESI 1–5) from vitals and the note.
  */
 export function mockPredict(req: PredictRequest): PredictResponse {
   const v = req.vitals;
@@ -104,16 +104,24 @@ export function mockPredict(req: PredictRequest): PredictResponse {
         probabilities: normalized,
         confidence: normalized[category]! * 0.84,
       },
+      {
+        modelName: "logreg",
+        category: Math.max(0, category - (Math.random() > 0.8 ? 1 : 0)),
+        probabilities: normalized,
+        confidence: normalized[category]! * 0.8,
+      },
     ],
     medgemma: {
       category,
       confidence: 0.82 + Math.random() * 0.13,
       reasoning:
-        category <= 1
-          ? "Parametry życiowe wskazują na stan zagrożenia. Wymagana natychmiastowa interwencja."
-          : category === 2
-            ? "Stabilne parametry z odchyleniami. Wymagana ocena lekarska w ciągu 60 minut."
-            : "Stan stabilny, niski priorytet medyczny.",
+        category === 0
+          ? "ESI 1 — wymagana natychmiastowa interwencja ratująca życie."
+          : category === 1
+            ? "ESI 2 — sytuacja wysokiego ryzyka; ocena lekarska do 10 minut."
+            : category === 2
+              ? "ESI 3 — pacjent stabilny, przewidywane ≥ 2 zasoby; ocena do 60 minut."
+              : "ESI 4–5 — pacjent stabilny, niski priorytet.",
       riskFlags:
         category === 0
           ? ["hipotensja", "tachykardia", "hipoksja"]
@@ -130,7 +138,7 @@ export function mockPredict(req: PredictRequest): PredictResponse {
       { feature: "triage_vital_hr", value: v.hr > 110 ? 0.287 : -0.041, direction: v.hr > 110 ? "positive" : "negative" },
       { feature: "triage_vital_o2", value: v.o2 < 95 ? 0.231 : -0.038, direction: v.o2 < 95 ? "positive" : "negative" },
       { feature: "triage_vital_temp", value: v.temp >= 38 ? 0.184 : -0.022, direction: v.temp >= 38 ? "positive" : "negative" },
-      { feature: "age_group", value: v.age >= 70 ? 0.118 : -0.015, direction: v.age >= 70 ? "positive" : "negative" },
+      { feature: "age", value: v.age >= 70 ? 0.118 : -0.015, direction: v.age >= 70 ? "positive" : "negative" },
     ],
     conflict: (() => {
       const detected = Math.random() > 0.65;

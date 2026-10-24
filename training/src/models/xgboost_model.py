@@ -1,174 +1,125 @@
 """
-XGBoost — główny model produkcyjny.
+XGBoost — gradient boosting (drzewa poziomowe), główny model tabelaryczny.
 
 XGBoost wybrany jako model bazowy z dwóch powodów:
     1. Doskonała wydajność na danych tabularnych (szczególnie z brakami).
     2. TreeSHAP — najszybsza i najdokładniejsza metoda wyjaśnień.
 
-Cały trening jest w pełni logowany:
-    - Per-iteration metrics (mlogloss, merror) → JSON
-    - Logi tekstowe co N iteracji → plik .log
-    - Hiperparametry, statystyki danych, czas treningu → JSON eksperymentu
+Urządzenie: `hardware.device_for("xgboost")` → device="cuda" | "cpu".
+    - XGBoost bez widocznego GPU NIE rzuca błędu, tylko po cichu trenuje na CPU — faktyczne
+      urządzenie odczytywane jest z konfiguracji boostera (`actual_device`, `device_fallback`),
+    - błąd CUDA w trakcie treningu (np. brak pamięci) → ponowny trening na CPU (baza),
+    - po treningu model przełączany na device="cpu": predykcja na danych z RAM bez
+      kopiowania na kartę ("mismatched devices"), a zapisany model działa bez GPU.
+
+Logowanie (tylko fit()): krzywa early stopping `es_mlogloss` → JSON + plik .log.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
-from src.models.base import BaseTriageModel, compute_sample_weights
+from src.models.base import BaseTriageModel
 from src.utils.config import XGB_DEFAULT_PARAMS
+from src.utils.hardware import device_for
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
 
 class XGBoostTriageModel(BaseTriageModel):
-    """Model XGBoost dla 5-klasowej klasyfikacji triażu MTS."""
+    """Model XGBoost dla 5-klasowej klasyfikacji ESI."""
 
     name = "xgboost"
+    display_name = "XGBoost"
+    supports_early_stopping = True
+    iteration_param = "n_estimators"
 
     def __init__(self, params: dict[str, Any] | None = None):
         merged = {**XGB_DEFAULT_PARAMS, **(params or {})}
+        if "device" not in merged:
+            merged["device"] = "cuda" if device_for("xgboost") == "gpu" else "cpu"
         super().__init__(params=merged)
 
-    def _build_model(self):
+    # ──────── Urządzenie ────────
+    def _uses_gpu(self) -> bool:
+        return str(self.params.get("device", "cpu")).lower().startswith(("cuda", "gpu"))
+
+    def _switch_to_cpu(self) -> None:
+        self.params["device"] = "cpu"
+
+    # ──────── Trening ────────
+    def _build_model(self, with_eval_set: bool = True):
         import xgboost as xgb
-        return xgb.XGBClassifier(**self.params)
 
-    def fit(
-        self,
-        X_train: pd.DataFrame,
-        y_train: np.ndarray | pd.Series,
-        X_val: pd.DataFrame | None = None,
-        y_val: np.ndarray | pd.Series | None = None,
-        sample_weight_strategy: str = "custom",
-        run_id: str | None = None,
-        use_mlflow: bool = False,
-        feature_set: str = "triage_only",
-        verbose: int | bool = 100,
-        **kwargs,
-    ) -> "XGBoostTriageModel":
-        """
-        Trenuje XGBoost z pełnym logowaniem.
+        params = dict(self.params)
+        # num_class ustala XGBClassifier z etykiet; jawne 5 przy brakującej klasie psuje
+        # booster po set_params (base_score o złej długości)
+        params.pop("num_class", None)
+        if self.es_rounds is not None:
+            params["early_stopping_rounds"] = self.es_rounds
+        if not with_eval_set:
+            # Early stopping wymaga zbioru ewaluacyjnego
+            params.pop("early_stopping_rounds", None)
+        return xgb.XGBClassifier(**params)
 
-        Parameters
-        ----------
-        X_train, y_train : dane treningowe
-        X_val, y_val : dane walidacyjne (do early stopping)
-        sample_weight_strategy : 'balanced' | 'custom' | 'none'
-        run_id : str, optional
-            Identyfikator eksperymentu (timestamp). Auto jeśli None.
-        use_mlflow : bool
-            Czy logować równolegle do MLflow.
-        feature_set : str
-            Etykieta zestawu cech (do metadanych).
-        verbose : int | bool
-            Co ile rund logować postęp.
-        """
-        # 1. Setup trackingu (logger, JSON eksperymentu)
-        self._setup_tracking(run_id=run_id, use_mlflow=use_mlflow)
-        self._log_data_info(X_train, y_train, X_val, y_val, feature_set=feature_set)
-
-        self.train_logger.info(f"Trenowanie XGBoost (n={len(X_train):,}, features={X_train.shape[1]})")
-        self.feature_names = list(X_train.columns)
-
-        # 2. Wagi sampli
-        sample_weights = compute_sample_weights(y_train, strategy=sample_weight_strategy, class_weights=self.optuna_class_weights)
-        self.train_logger.info(
-            f"Wagi sampli: strategia='{sample_weight_strategy}', "
-            f"min={sample_weights.min():.2f}, max={sample_weights.max():.2f}"
-        )
-
-        # 3. Eval set
-        eval_set = []
-        if X_val is not None and y_val is not None:
-            eval_set = [(X_train, y_train), (X_val, y_val)]
-
-        # 4. Trenuj
-        self.model = self._build_model()
-        t0 = self._start_timer()
-
-        fit_kwargs = {
-            "sample_weight": sample_weights,
-            "verbose": False,  # zastępujemy własnym logowaniem
+    def _fit_impl(self, X, y, X_es, y_es, sample_weight) -> None:
+        # XGBoost wymaga etykiet 0..k-1 — przy brakującej klasie (np. mała próbka bez ESI 1)
+        # kodujemy obecne klasy kolejno, a mapę trzyma self.classes_.
+        self._label_classes = np.unique(y)
+        has_es = X_es is not None
+        self.model = self._build_model(with_eval_set=has_es)
+        fit_kwargs: dict[str, Any] = {
+            "sample_weight": sample_weight,
+            "verbose": self._verbose_period or False,
         }
-        if eval_set:
-            fit_kwargs["eval_set"] = eval_set
+        if has_es:
+            fit_kwargs["eval_set"] = [(X_es, np.searchsorted(self._label_classes, y_es))]
+        self.model.fit(X, np.searchsorted(self._label_classes, y), **fit_kwargs)
 
-        self.model.fit(X_train, y_train, **fit_kwargs)
+    def _after_fit(self, has_es: bool) -> None:
+        self.classes_ = np.asarray(self._label_classes).astype(int)
 
-        duration = self._stop_timer(t0)
+        config = json.loads(self.model.get_booster().save_config())
+        trained_on = str(config["learner"]["generic_param"].get("device", "cpu")).lower()
+        self.actual_device = "cuda" if trained_on.startswith("cuda") else "cpu"
+        if self._uses_gpu() and self.actual_device == "cpu" and self.device_fallback is None:
+            self.device_fallback = (
+                "XGBoost: zażądano device='cuda', ale booster trenował na CPU (brak widocznego GPU; "
+                "koło xgboost >= 3.4 z CUDA 13 wymaga sterownika NVIDIA >= 580)"
+            )
+            log.warning(f"{self.device_fallback} — trening był wolniejszy, wynik jest poprawny")
 
-        # 5. Wyciągnij training history z modelu
-        self._extract_evals_result(verbose=verbose)
+        # Predykcja zawsze na CPU (dane w RAM) i przenośny artefakt
+        self.model.set_params(device="cpu")
 
-        self.classes_ = self.model.classes_
-        self.is_fitted = True
+        self.iteration_cap = int(self.model.get_params().get("n_estimators") or 100)
+        self.best_iteration = None
+        if has_es:
+            try:
+                self.best_iteration = int(self.model.best_iteration) + 1   # liczba drzew w modelu
+            except AttributeError:
+                self.best_iteration = None
 
-        best_iter = getattr(self.model, "best_iteration", None)
-        if best_iter is not None:
-            self.train_logger.info(f"Best iteration: {best_iter}")
-            self.tracker.add_note(f"Early stopping na iter {best_iter}")
-            self.tracker.log_metrics({"best_iteration": best_iter})
-
-        self.train_logger.info(f"Trening XGBoost zakończony w {duration:.1f}s")
-
-        # 6. Finalizuj tracker (zapis JSON)
-        self._finalize_tracking()
-
-        return self
-
-    def _extract_evals_result(self, verbose: int | bool = 100) -> None:
-        """
-        Wyciąga `evals_result_` z XGBoost i zapisuje do trackera + loggera.
-
-        XGBoost przechowuje historię ewaluacji w słowniku:
-            {validation_0: {mlogloss: [...], merror: [...]},
-             validation_1: {mlogloss: [...], merror: [...]}}
-        """
-        evals_result = getattr(self.model, "evals_result_", None)
+    def _eval_history(self) -> list[dict[str, float]]:
+        """{'validation_0': {'mlogloss': [...]}} → [{'es_mlogloss': ...}, ...]."""
+        evals_result = getattr(self.model, "evals_result_", None) or {}
         if not evals_result:
-            return
-
-        # Zmapuj indeksy validation_0/1 → 'train'/'val'
-        eval_set_keys = list(evals_result.keys())
-        rename = {}
-        if len(eval_set_keys) >= 1:
-            rename[eval_set_keys[0]] = "train"
-        if len(eval_set_keys) >= 2:
-            rename[eval_set_keys[1]] = "val"
-
-        # Wyciągnij liczbę iteracji
-        first_key = eval_set_keys[0]
-        first_metric = next(iter(evals_result[first_key].values()))
-        n_iters = len(first_metric)
-
-        log_every = verbose if isinstance(verbose, int) and verbose > 0 else 100
-
+            return []
+        sets = list(evals_result.items())
+        names = ["es"] if len(sets) == 1 else [f"es{i}" for i in range(len(sets))]
+        n_iters = len(next(iter(sets[0][1].values())))
+        history = []
         for i in range(n_iters):
-            metrics = {}
-            for set_key, set_metrics in evals_result.items():
-                set_name = rename.get(set_key, set_key)
+            row = {}
+            for set_name, (_, set_metrics) in zip(names, sets):
                 for metric_name, values in set_metrics.items():
-                    metrics[f"{set_name}_{metric_name}"] = float(values[i])
-            self.tracker.log_iteration(i, metrics)
-
-            if i % log_every == 0 or i == n_iters - 1:
-                metric_str = " | ".join(f"{k}={v:.5f}" for k, v in metrics.items())
-                self.train_logger.info(f"Iter {i:>5} | {metric_str}")
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        if not self.is_fitted:
-            raise RuntimeError("Model nie wytrenowany.")
-        return self.model.predict(X)
-
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        if not self.is_fitted:
-            raise RuntimeError("Model nie wytrenowany.")
-        return self.model.predict_proba(X)
+                    row[f"{set_name}_{metric_name}"] = float(values[i])
+            history.append(row)
+        return history
 
     # ──────── Pomocnicze ────────
     def get_booster(self):

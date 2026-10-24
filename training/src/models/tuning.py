@@ -1,1047 +1,1189 @@
 """
-Hyperparameter tuning z Optuną — maksymalna jakość (czas nieistotny).
+Tuning hiperparametrów Optuną (k-fold CV na zbiorze dopasowania z TRAIN).
 
-Strategia maksymalnej jakości:
-1. 5-fold StratifiedKFold CV (stabilna ocena generalizacji).
-2. Stały seed dla CV — wszystkie triale na tych samych splitach (fair comparison).
-3. Cost-sensitive wagi klas jako hiperparametry Optuny.
-4. MultivariateTPESampler (modeluje korelacje między hiperparametrami).
-5. NopPruner — żaden trial nie jest zabijany przedwcześnie.
-6. n_startup_trials=50 — więcej losowej eksploracji przed bayesowskim ułożeniem TPE.
-7. n_ei_candidates=48 — więcej kandydatów per iteracja TPE.
-8. Storage SQLite domyślnie — wznowienie po crashu / wyłączeniu.
-9. GPU dla XGBoost (CUDA), CPU dla reszty.
-10. Rozszerzone przestrzenie hiperparametrów (DART, GOSS, log-scale regularyzacja).
+Zasady:
+    - Każdy fold trenuje ten sam wrapper modelu co finalny trening
+      (`get_model(...).fit_estimator`): te same parametry domyślne, ten sam wybór CPU/GPU
+      i ten sam powrót GPU → CPU — dostrojone parametry zawsze pasują do `run_training`.
+    - Early stopping (XGBoost / LightGBM / CatBoost) na wycinku EARLY_STOPPING_FRACTION
+      z TRENINGOWEJ części foldu — nigdy na foldzie ocenianym (ten sam protokół co finał).
+    - Domyślny cel: wieloklasowy LOG LOSS (minimalizacja; ważony, gdy trening używa wag).
+      Alternatywa: --tune-metric qwk (wtedy Optuna dobiera też wagi klas).
+    - Foldy stratyfikowane po ESI × oddział (`strata` z run_training), stałe ziarno.
+    - MedianPruner przerywa słabe próby po pierwszych foldach (nigdy po ostatnim);
+      EBM: foldy równolegle (joblib/loky), bez przerywania.
 
-Optymalizujemy QUADRATIC WEIGHTED KAPPA (QWK) — najlepsza metryka dla
-ordinalnej klasyfikacji triażu (penalizuje większe błędy ordinalne mocniej).
+Wznawianie i odporność (nocny przebieg bez nadzoru):
+    - Badanie identyfikuje KONFIGURACJA (model, cechy, cel, wagi, liczba wierszy, foldy, filtr,
+      wersja przestrzeni, odcisk danych, profil) — zapisana w badaniu i sprawdzana przy wczytaniu.
+    - `n_trials` i `timeout` to budżet CAŁEGO badania: wznowienie dokańcza tylko brakujące
+      próby i brakujący czas.
+    - SQLite (RDBStorage) z pulsem: próba przerwana awarią procesu → FAIL + jedno ponowienie.
+    - Błąd próby nie przerywa badania (catch); 5 błędów z rzędu → koniec badania.
+    - Plik blokady (PID) — jedno badanie = jeden proces; nieaktualna blokada jest przejmowana.
+    - Wynik w `logs/optuna/<badanie>.best.json` (zapis atomowy) — czytelny bez Optuny.
+
+Zbiory `val` i `test` nie są używane — tuning widzi wyłącznie TRAIN.
 """
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import inspect
+import json
+import math
+import os
+import re
+import socket
+import time
+import warnings
+from collections.abc import Callable
 from datetime import datetime
-import logging
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import optuna
 import pandas as pd
-from sklearn.metrics import cohen_kappa_score
-from sklearn.model_selection import StratifiedKFold
+from optuna.trial import TrialState
+from sklearn.metrics import cohen_kappa_score, log_loss
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
-from src.models.base import compute_sample_weights
+from src.data.dataset import data_fingerprint
+from src.models import MODEL_REGISTRY, get_model, resolve_model_name
+from src.models.base import ITERATION_CAP_WARN_FRACTION, compute_sample_weights
 from src.utils.config import (
-    EXPERIMENTS_DIR,
-    OPTUNA_N_TRIALS,
-    OPTUNA_TIMEOUT_SECONDS,
+    CLASS_NAMES,
+    EARLY_STOPPING_FRACTION,
+    EBM_DEFAULT_PARAMS,
+    LGBM_DEFAULT_PARAMS,
+    N_CLASSES,
+    OPTUNA_GRACE_PERIOD_S,
+    OPTUNA_HEARTBEAT_INTERVAL_S,
+    OPTUNA_MAX_CONSECUTIVE_FAILS,
+    OPTUNA_MAX_RETRY,
+    OPTUNA_PRUNER_STARTUP_TRIALS,
+    OPTUNA_STORAGE_DIR,
     RANDOM_SEED,
+    RF_DEFAULT_PARAMS,
+    SEARCH_SPACE_VERSION,
     TRAINING_LOGS_DIR,
+    TUNE_CV_FOLDS,
+    TUNE_FIXED_PARAMS,
+    TUNE_RF_MAX_MODEL_BYTES,
 )
-from src.utils.logger import get_logger, get_training_logger
+from src.utils.fileio import write_json_atomic
+from src.utils.logger import close_training_logger, get_logger, get_training_logger
 
 log = get_logger(__name__)
 
+TUNE_METRICS = ("logloss", "qwk")
+FINISHED_STATES = (TrialState.COMPLETE, TrialState.PRUNED)
+
+# Liczba strojonych wymiarów (start TPE: n_startup = max(10, 2·d))
+SEARCH_DIMENSIONS: dict[str, int] = {
+    "xgboost": 9,
+    "lightgbm": 9,
+    "catboost": 7,
+    "random_forest": 4,
+    "ebm": 5,
+    "logreg": 1,
+}
+CLASS_WEIGHT_DIMENSIONS = 4     # cw_esi1, cw_esi2, cw_esi4, cw_esi5 (tylko cel 'qwk')
+
+# Szacunek pamięci jednego węzła drzewa sklearn (Node 64 B + 5 wartości klas × 8 B)
+_RF_BYTES_PER_NODE = 104
+
 
 # ─────────────────────────────────────────
-# Konfiguracja CV (maksymalna jakość)
+# Przestrzenie hiperparametrów (zmiana → podbij SEARCH_SPACE_VERSION w config.py)
 # ─────────────────────────────────────────
-CV_N_SPLITS = 5  # 5-fold zamiast 3-fold dla stabilniejszej oceny
-
-
-# ─────────────────────────────────────────
-# Search spaces per model (rozszerzone)
-# ─────────────────────────────────────────
-def _suggest_xgboost_params(trial: optuna.Trial) -> dict[str, Any]:
-    params = {
-        "n_estimators": trial.suggest_int("n_estimators", 500, 4000, step=100),
-        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
-        "max_depth": trial.suggest_int("max_depth", 4, 14),
-        "min_child_weight": trial.suggest_float("min_child_weight", 1e-6, 50.0, log=True),
+def _suggest_xgboost(trial: optuna.Trial, feature_set: str) -> dict[str, Any]:
+    return {
+        "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.15, log=True),
+        "max_depth": trial.suggest_int("max_depth", 4, 10),
+        # Jednostki hesjanu: przy softmax hesjan ≤ 0.25, więc 200 ≈ ≥ 800 wierszy w liściu
+        "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 200.0, log=True),
         "gamma": trial.suggest_float("gamma", 1e-8, 5.0, log=True),
         "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-        "subsample": trial.suggest_float("subsample", 0.4, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
-        "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.5, 1.0),
-        "colsample_bynode": trial.suggest_float("colsample_bynode", 0.5, 1.0),
-        "max_bin": trial.suggest_int("max_bin", 128, 2048, step=64),
-        "grow_policy": trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"]),
-    }
-
-    return params
-
-
-def _suggest_lightgbm_params(trial: optuna.Trial) -> dict[str, Any]:
-    params = {
-        "boosting_type": trial.suggest_categorical("boosting_type", ["gbdt", "dart"]),
-        "num_leaves": trial.suggest_int("num_leaves", 15, 255),
-        "max_depth": trial.suggest_int("max_depth", 4, 12),
-        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
-        "n_estimators": trial.suggest_int("n_estimators", 500, 2500, step=100),
+        "reg_lambda": trial.suggest_float("reg_lambda", 0.01, 50.0, log=True),
         "subsample": trial.suggest_float("subsample", 0.5, 1.0),
         "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
-        "min_child_samples": trial.suggest_int("min_child_samples", 5, 200),
+        "max_bin": trial.suggest_categorical("max_bin", [128, 256, 512]),
+    }
+
+
+def _suggest_lightgbm(trial: optuna.Trial, feature_set: str) -> dict[str, Any]:
+    return {
+        "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.15, log=True),
+        "num_leaves": trial.suggest_int("num_leaves", 15, 511, log=True),
+        # Małe liście wygrywają (ESI 1 = 0,9%); optimum ~ √n — skalowane przed finałem
+        "min_child_samples": trial.suggest_int("min_child_samples", 5, 1000, log=True),
+        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
         "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
-        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
-        "min_split_gain": trial.suggest_float("min_split_gain", 1e-8, 5.0, log=True),
-        "max_bin": trial.suggest_int("max_bin", 128, 1024, step=64),
-        "feature_fraction_bynode": trial.suggest_float("feature_fraction_bynode", 0.5, 1.0),
-        "extra_trees": trial.suggest_categorical("extra_trees", [True, False]),
-        "path_smooth": trial.suggest_float("path_smooth", 0.0, 1.0),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 30.0, log=True),
+        "min_split_gain": trial.suggest_float("min_split_gain", 1e-8, 1.0, log=True),
+        "path_smooth": trial.suggest_float("path_smooth", 0.0, 10.0),
     }
 
-    if params["boosting_type"] == "dart":
-        params["drop_rate"] = trial.suggest_float("drop_rate", 0.01, 0.4)
-        params["max_drop"] = trial.suggest_int("max_drop", 5, 60)
-        params["uniform_drop"] = trial.suggest_categorical("uniform_drop", [True, False])
 
-    return params
-
-
-def _suggest_rf_params(trial: optuna.Trial) -> dict[str, Any]:
-    bootstrap = trial.suggest_categorical("bootstrap", [True, False])
+def _suggest_catboost(trial: optuna.Trial, feature_set: str) -> dict[str, Any]:
+    # grow_policy zostaje SymmetricTree (z config) — to inny inductive bias niż XGB/LGBM
     params: dict[str, Any] = {
-        "n_estimators": trial.suggest_int("n_estimators", 200, 1500, step=100),
-        "max_depth": trial.suggest_int("max_depth", 8, 30),
-        "min_samples_split": trial.suggest_int("min_samples_split", 2, 50),
-        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 30),
-        "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", 0.2, 0.4, 0.6]),
-        "min_impurity_decrease": trial.suggest_float("min_impurity_decrease", 1e-8, 1e-3, log=True),
-        "min_weight_fraction_leaf": trial.suggest_float("min_weight_fraction_leaf", 0.0, 0.005),
-        "criterion": trial.suggest_categorical("criterion", ["gini", "entropy", "log_loss"]),
-        "bootstrap": bootstrap,
-        "ccp_alpha": trial.suggest_float("ccp_alpha", 1e-8, 1e-3, log=True),
-        "max_leaf_nodes": trial.suggest_categorical("max_leaf_nodes", [None, 500, 1000, 5000, 10000]),
-    }
-    if bootstrap:
-        params["max_samples"] = trial.suggest_float("max_samples", 0.5, 1.0)
-    return params
-
-
-def _suggest_ebm_params(trial: optuna.Trial) -> dict[str, Any]:
-    return {
-        "learning_rate": trial.suggest_float("learning_rate", 0.0005, 0.5, log=True),
-        "max_bins": trial.suggest_int("max_bins", 128, 2048, step=64),
-        "max_interaction_bins": trial.suggest_int("max_interaction_bins", 16, 128, step=8),
-        "interactions": trial.suggest_int("interactions", 0, 20),
-        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 100),
-        "max_rounds": trial.suggest_int("max_rounds", 3000, 20000, step=500),
-        "early_stopping_rounds": trial.suggest_int("early_stopping_rounds", 50, 300, step=10),
-        "outer_bags": trial.suggest_int("outer_bags", 1, 8),
-        "inner_bags": trial.suggest_int("inner_bags", 0, 4),
-        "validation_size": trial.suggest_float("validation_size", 0.1, 0.4),
-        "smoothing_rounds": trial.suggest_int("smoothing_rounds", 10, 200, step=10),
-        "greedy_ratio": trial.suggest_float("greedy_ratio", 1.0, 50.0, log=True),
-    }
-
-
-def _suggest_catboost_params(trial: optuna.Trial) -> dict[str, Any]:
-    """
-    Pełna przestrzeń CatBoost — wszystkie wymiary regularyzacji i struktury drzew.
-
-    Konwencja nazw CatBoost (NIE sklearn):
-      - depth  (max_depth)        - l2_leaf_reg (reg_lambda)
-      - rsm    (colsample_bylevel) - border_count (max_bin)
-      - iterations (n_estimators)  - random_strength (Bayesian regul.)
-    """
-    bootstrap_type = trial.suggest_categorical(
-        "bootstrap_type", ["Bernoulli", "MVS", "Bayesian"]
-    )
-    grow_policy = trial.suggest_categorical(
-        "grow_policy", ["SymmetricTree", "Depthwise", "Lossguide"]
-    )
-
-    params: dict[str, Any] = {
-        "iterations": trial.suggest_int("iterations", 500, 5000, step=100),
-        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.2, log=True),
         "depth": trial.suggest_int("depth", 4, 10),
-        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-8, 30.0, log=True),
-        "random_strength": trial.suggest_float("random_strength", 1e-8, 10.0, log=True),
-        "border_count": trial.suggest_int("border_count", 32, 254, step=2),
-        "rsm": trial.suggest_float("rsm", 0.4, 1.0),
-        "leaf_estimation_iterations": trial.suggest_int("leaf_estimation_iterations", 1, 10),
-        "leaf_estimation_method": trial.suggest_categorical(
-            "leaf_estimation_method", ["Newton", "Gradient"]
-        ),
-        "bootstrap_type": bootstrap_type,
-        "grow_policy": grow_policy,
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 0.5, 30.0, log=True),
+        "random_strength": trial.suggest_float("random_strength", 1e-3, 10.0, log=True),
+        "border_count": trial.suggest_categorical("border_count", [64, 128, 254]),
+        "bootstrap_type": trial.suggest_categorical("bootstrap_type", ["Bernoulli", "Bayesian"]),
     }
-
-    # Conditional params — zależą od bootstrap_type
-    if bootstrap_type in ("Bernoulli", "MVS"):
-        params["subsample"] = trial.suggest_float("subsample", 0.4, 1.0)
-    elif bootstrap_type == "Bayesian":
-        params["bagging_temperature"] = trial.suggest_float("bagging_temperature", 0.0, 10.0)
-
-    # Conditional — grow_policy
-    if grow_policy == "Lossguide":
-        params["max_leaves"] = trial.suggest_int("max_leaves", 16, 256)
-    if grow_policy in ("Depthwise", "Lossguide"):
-        params["min_data_in_leaf"] = trial.suggest_int("min_data_in_leaf", 1, 100)
-
-    return params
-
-
-def _suggest_extra_trees_params(trial: optuna.Trial) -> dict[str, Any]:
-    """
-    Pełna przestrzeń ExtraTrees — 14+ hiperparametrów.
-
-    ExtraTrees różni się od RF:
-      - Domyślnie bootstrap=False (cały dataset)
-      - Splits są losowe, nie best-split — szybszy, większa wariancja
-    """
-    return {
-        "n_estimators": trial.suggest_int("n_estimators", 200, 1500, step=100),
-        "criterion": trial.suggest_categorical("criterion", ["gini", "entropy", "log_loss"]),
-        "max_depth": trial.suggest_int("max_depth", 6, 30),
-        "min_samples_split": trial.suggest_int("min_samples_split", 2, 50),
-        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 15),
-        "max_features": trial.suggest_categorical(
-            "max_features", ["sqrt", "log2", 0.5, 0.7]
-        ),
-        "min_impurity_decrease": trial.suggest_float("min_impurity_decrease", 1e-8, 1e-3, log=True),
-        "min_weight_fraction_leaf": trial.suggest_float("min_weight_fraction_leaf", 0.0, 0.001),
-        "ccp_alpha": trial.suggest_float("ccp_alpha", 1e-8, 1e-3, log=True),
-        "max_leaf_nodes": trial.suggest_categorical(
-            "max_leaf_nodes", [None, 500, 1000, 2500, 5000, 10000]
-        ),
-        "bootstrap": False,
-        "class_weight": None,
-    }
-
-
-def _suggest_hist_gbt_params(trial: optuna.Trial) -> dict[str, Any]:
-    """
-    Pełna przestrzeń HistGradientBoosting — 14+ hiperparametrów.
-
-    HistGBT używa binowania histogramowego (inny inductive bias niż
-    XGB/LGBM/CatBoost). Kluczowe parametry:
-      - max_depth / max_leaf_nodes: kontrola głębokości
-      - l2_regularization: L2 na liściach
-      - max_bins: jakość histogramów (im więcej tym lepiej, ale wolniej)
-      - early_stopping: natywny, z własną walidacją
-    """
-    early_stopping = trial.suggest_categorical("early_stopping", [True, False])
-
-    params: dict[str, Any] = {
-        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
-        "max_iter": trial.suggest_int("max_iter", 200, 2000, step=50),
-        "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 15, 255),
-        "max_depth": trial.suggest_categorical("max_depth", [None, 4, 6, 8, 10, 12, 15]),
-        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 50),
-        "l2_regularization": trial.suggest_float("l2_regularization", 1e-8, 10.0, log=True),
-        "max_bins": trial.suggest_int("max_bins", 128, 255),
-        "early_stopping": early_stopping,
-        "tol": trial.suggest_float("tol", 1e-7, 1e-3, log=True),
-        "scoring": trial.suggest_categorical("scoring", ["loss", "neg_log_loss"]),
-    }
-
-    if early_stopping:
-        params["validation_fraction"] = trial.suggest_float("validation_fraction", 0.05, 0.4)
-        params["n_iter_no_change"] = trial.suggest_int("n_iter_no_change", 5, 50)
+    if params["bootstrap_type"] == "Bernoulli":
+        params["subsample"] = trial.suggest_float("subsample", 0.5, 1.0)
     else:
-        params["validation_fraction"] = None
-        params["n_iter_no_change"] = None
-
+        params["bagging_temperature"] = trial.suggest_float("bagging_temperature", 0.0, 5.0)
     return params
 
 
-SUGGEST_FUNCTIONS: dict[str, callable] = {
-    "xgboost": _suggest_xgboost_params,
-    "lightgbm": _suggest_lightgbm_params,
-    "random_forest": _suggest_rf_params,
-    "extra_trees": _suggest_extra_trees_params,
-    "hist_gbt": _suggest_hist_gbt_params,
-    "ebm": _suggest_ebm_params,
-    "catboost": _suggest_catboost_params,
+def _suggest_random_forest(trial: optuna.Trial, feature_set: str) -> dict[str, Any]:
+    # n_estimators NIE jest strojone (więcej drzew nie pogarsza log loss): 300 w CV, 500 w finale.
+    # Zestaw 'full' (~1000 cech): ułamek 0.3 cech na 400 tys. wierszy to godziny na jeden model.
+    if feature_set == "full":
+        max_features = ["sqrt", "log2", 0.05, 0.1]
+    else:
+        max_features = ["sqrt", "log2", 0.1, 0.2, 0.3]
+    return {
+        "max_features": trial.suggest_categorical("max_features", max_features),
+        # Bezwzględne optimum ≈ 3 (nie skaluje się z n); górna granica 40
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 2, 40, log=True),
+        "max_samples": trial.suggest_float("max_samples", 0.2, 0.8),
+        "criterion": trial.suggest_categorical("criterion", ["gini", "entropy"]),
+    }
+
+
+def _suggest_ebm(trial: optuna.Trial, feature_set: str) -> dict[str, Any]:
+    # interactions = 0 na stałe: wieloklasowy EBM nie pokazuje par cech w wyjaśnieniach,
+    # więc model z parami przewidywałby termami, których wyjaśnienie nie zawiera.
+    return {
+        "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.05, log=True),
+        "max_bins": trial.suggest_categorical("max_bins", [256, 512, 1024]),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 2, 100, log=True),
+        "max_leaves": trial.suggest_int("max_leaves", 2, 4),
+        "smoothing_rounds": trial.suggest_int("smoothing_rounds", 0, 500, step=50),
+    }
+
+
+def _suggest_logreg(trial: optuna.Trial, feature_set: str) -> dict[str, Any]:
+    return {"C": trial.suggest_float("C", 1e-4, 10.0, log=True)}
+
+
+SUGGEST_FUNCTIONS: dict[str, Callable[[optuna.Trial, str], dict[str, Any]]] = {
+    "xgboost": _suggest_xgboost,
+    "lightgbm": _suggest_lightgbm,
+    "catboost": _suggest_catboost,
+    "random_forest": _suggest_random_forest,
+    "ebm": _suggest_ebm,
+    "logreg": _suggest_logreg,
 }
 
 
-# ─────────────────────────────────────────
-# Cost-sensitive wagi klas (hiperparametry)
-# ─────────────────────────────────────────
 def _suggest_class_weights(trial: optuna.Trial) -> dict[int, float]:
-    """Wagi klas jako hiperparametry — każda klasa tunowana przez Optunę."""
+    """Wagi klas jako hiperparametry (tylko przy celu 'qwk')."""
     return {
-        0: trial.suggest_float("cw_red", 2.0, 25.0),       # Red
-        1: trial.suggest_float("cw_orange", 1.0, 15.0),    # Orange
-        2: trial.suggest_float("cw_yellow", 0.5, 10.0),    # Yellow
-        3: trial.suggest_float("cw_green", 0.5, 5.0),      # Green
-        4: trial.suggest_float("cw_blue", 0.5, 10.0),      # Blue
+        0: trial.suggest_float("cw_esi1", 1.0, 30.0, log=True),
+        1: trial.suggest_float("cw_esi2", 0.5, 5.0, log=True),
+        2: 1.0,  # ESI 3 — klasa referencyjna
+        3: trial.suggest_float("cw_esi4", 0.5, 5.0, log=True),
+        4: trial.suggest_float("cw_esi5", 0.5, 10.0, log=True),
     }
 
 
+def n_startup_trials(model_name: str, metric: str = "logloss") -> int:
+    """Liczba losowych prób na start TPE: max(10, 2·d), d = liczba strojonych wymiarów."""
+    d = SEARCH_DIMENSIONS[resolve_model_name(model_name)]
+    if metric == "qwk":
+        d += CLASS_WEIGHT_DIMENSIONS
+    return max(10, 2 * d)
+
+
 # ─────────────────────────────────────────
-# Trening + ewaluacja per model (single fold)
+# Trening jednego foldu
 # ─────────────────────────────────────────
-# Globalny singleton redirectora CatBoost — CatBoost pozwala tylko na
-# jeden log_cout w całym procesie, więc foldy współdzielą ten sam obiekt.
-_CATBOOST_LOG_REDIRECTOR: _CatBoostLogRedirector | None = None
-
-class _CatBoostLogRedirector:
-    """Redirectuje CatBoost verbose output przez Python logging (plik + konsola).
-
-    CatBoost przyjmuje `log_cout=` jako file-like z write()/flush().
-    Zamiast iść na stdout, przekazujemy przez tune_logger — trafia
-    do pliku .log i na konsolę (RichHandler).
-
-    Uwaga: CatBoost wspiera tylko JEDEN log_cout w całym procesie.
-    Dlatego foldy współdzielą ten sam singleton _CATBOOST_LOG_REDIRECTOR.
-    """
-    def __init__(self, logger, fold_idx: int = 0):
-        self.logger = logger
-        self.fold_idx = fold_idx
-        self._buf = ""
-
-    def write(self, msg: str) -> None:
-        self._buf += msg
-        if "\n" in self._buf:
-            for line in self._buf.split("\n"):
-                stripped = line.strip()
-                if stripped:
-                    self.logger.info(f"[Fold {self.fold_idx}] {stripped}")
-            self._buf = ""
-
-    def flush(self) -> None:
-        if self._buf.strip():
-            self.logger.info(f"[Fold {self.fold_idx}] {self._buf.strip()}")
-            self._buf = ""
-
-
-def _get_catboost_log_redirector(logger, fold_idx: int = 0) -> _CatBoostLogRedirector:
-    """Zwraca singleton redirectora dla CatBoost.
-
-    CatBoost pozwala na ustawienie log_cout tylko raz globalnie.
-    Wszystkie foldy współdzielą ten sam obiekt, ale z różnym fold_idx.
-    """
-    global _CATBOOST_LOG_REDIRECTOR
-    if _CATBOOST_LOG_REDIRECTOR is None:
-        _CATBOOST_LOG_REDIRECTOR = _CatBoostLogRedirector(logger, fold_idx)
-    else:
-        # Tylko zaktualizuj fold_idx dla kolejnych wywołań
-        _CATBOOST_LOG_REDIRECTOR.fold_idx = fold_idx
-    return _CATBOOST_LOG_REDIRECTOR
-
-
-def _train_eval_fold(
-    model_name: str,
-    params: dict,
+def _carve_es_slice(
     X_tr: pd.DataFrame,
-    y_tr: pd.Series,
-    X_cv: pd.DataFrame,
-    y_cv: pd.Series,
-    sample_weights: np.ndarray,
-    tune_logger: logging.Logger | None = None,
-    fold_idx: int = 0,
+    y_tr: np.ndarray,
+    sample_weight: np.ndarray | None,
+) -> tuple[pd.DataFrame, np.ndarray, pd.DataFrame, np.ndarray, np.ndarray | None]:
+    """Wycinek early stopping (stratyfikowany po klasie) z TRENINGOWEJ części foldu."""
+    idx = np.arange(len(X_tr))
+    try:
+        fit_idx, es_idx = train_test_split(
+            idx, test_size=EARLY_STOPPING_FRACTION, random_state=RANDOM_SEED, stratify=y_tr
+        )
+    except ValueError:  # klasa z 1 wierszem (mikroskopijna próbka) — bez stratyfikacji
+        fit_idx, es_idx = train_test_split(idx, test_size=EARLY_STOPPING_FRACTION, random_state=RANDOM_SEED)
+    fit_idx, es_idx = np.sort(fit_idx), np.sort(es_idx)
+    w_fit = None if sample_weight is None else np.asarray(sample_weight)[fit_idx]
+    return X_tr.iloc[fit_idx], y_tr[fit_idx], X_tr.iloc[es_idx], y_tr[es_idx], w_fit
+
+
+def fit_predict_fold(
+    model_name: str,
+    params: dict[str, Any],
+    X_tr: pd.DataFrame,
+    y_tr: np.ndarray | pd.Series,
+    X_va: pd.DataFrame,
+    sample_weight: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    Trenuje wrapper modelu na treningowej części foldu i zwraca prawdopodobieństwa dla X_va.
+
+    Modele z early stopping dostają wycinek ES z (X_tr, y_tr) — fold X_va służy wyłącznie
+    do oceny. Błąd GPU → ponowienie na CPU (BaseTriageModel.fit_estimator).
+
+    Returns
+    -------
+    proba : np.ndarray (n_va, 5), float64
+    info : dict — n_train, n_es, best_iteration, iteration_cap, actual_device, device_fallback
+           (+ nodes_per_tree dla Random Forest)
+    """
+    wrapper = get_model(model_name, params=params)
+    y_arr = np.asarray(y_tr).astype(int).ravel()
+    X_es, y_es = None, None
+    X_f, y_f, w_f = X_tr, y_arr, sample_weight
+    if wrapper.supports_early_stopping:
+        X_f, y_f, X_es, y_es, w_f = _carve_es_slice(X_tr, y_arr, sample_weight)
+
+    with warnings.catch_warnings():
+        # interpret ostrzega przy każdym fit o brakach (NaN) — w tuningu to szum
+        warnings.filterwarnings("ignore", message="Missing values detected")
+        wrapper.fit_estimator(X_f, y_f, X_es, y_es, sample_weight=w_f)
+    proba = wrapper.predict_proba(X_va)
+
+    info: dict[str, Any] = {
+        "n_train": int(len(X_f)),
+        "n_es": 0 if X_es is None else int(len(X_es)),
+        "best_iteration": wrapper.best_iteration,
+        "iteration_cap": wrapper.iteration_cap,
+        "actual_device": wrapper.actual_device,
+        "device_fallback": wrapper.device_fallback,
+    }
+    if model_name == "random_forest":
+        trees = getattr(wrapper.model, "estimators_", [])
+        info["nodes_per_tree"] = float(np.mean([t.tree_.node_count for t in trees])) if trees else 0.0
+    return proba, info
+
+
+def _score(
+    metric: str,
+    y_true: np.ndarray | pd.Series,
+    proba: np.ndarray,
+    sample_weight: np.ndarray | None = None,
 ) -> float:
-    """Trenuje model na foldzie i zwraca QWK.
+    """logloss (ważony, gdy podano wagi — ten sam cel co trening z wagami) albo QWK na argmax."""
+    if metric == "logloss":
+        return float(log_loss(y_true, proba, labels=list(range(N_CLASSES)), sample_weight=sample_weight))
+    return float(cohen_kappa_score(y_true, proba.argmax(axis=1), weights="quadratic"))
 
-    tune_logger — opcjonalny (dla CatBoost: redirect per-iteracyjnych logów
-    przez Python logging zamiast stdout)."""
-    if model_name == "xgboost":
-        import xgboost as xgb
-        import time as _time
 
-        # Build train params (NOT XGBClassifier — używamy xgb.train + QuantileDMatrix dla GPU speedup)
-        train_params = dict(params)
-        # n_estimators → num_boost_round (xgb.train style)
-        n_boost_round = int(train_params.pop("n_estimators", 1000))
-        early_stop = int(train_params.pop("early_stopping_rounds", 100))
-        # random_state → seed
-        if "random_state" in train_params and "seed" not in train_params:
-            train_params["seed"] = train_params.pop("random_state")
+def _oof_summary(y_true: np.ndarray, proba: np.ndarray) -> dict[str, float]:
+    """Metryki bezpieczeństwa na predykcjach out-of-fold (zapisywane w próbie Optuny)."""
+    from src.evaluation.metrics import decide, expected_cost, undertriage_rate
 
-        train_params.setdefault("objective", "multi:softprob")
-        train_params.setdefault("num_class", 5)
-        train_params.setdefault("tree_method", "hist")
-        train_params.setdefault("eval_metric", "mlogloss")
-        train_params.setdefault("verbosity", 1)
-        if "device" not in train_params:
-            train_params["device"] = "cuda"
-
-        # QuantileDMatrix — optymalny format dla tree_method=hist + GPU (2-3× szybciej)
-        # max_bin musi być spójny: dtrain, dval i Booster (XGBoost 3.x ref= nie propaguje max_bin)
-        qm_max_bin = int(train_params.get("max_bin", 256))
-        dtrain = xgb.QuantileDMatrix(X_tr, label=np.asarray(y_tr), weight=sample_weights, max_bin=qm_max_bin)
-        dval = xgb.QuantileDMatrix(X_cv, label=np.asarray(y_cv), max_bin=qm_max_bin, ref=dtrain)
-
-        print(f"[Fold {fold_idx}] XGBoost start: {n_boost_round} rounds, device={train_params.get('device')}", flush=True)
-        t0 = _time.time()
-        booster = xgb.train(
-            train_params,
-            dtrain,
-            num_boost_round=n_boost_round,
-            evals=[(dval, "val")],
-            early_stopping_rounds=early_stop,
-            verbose_eval=50,
-        )
-        print(f"[Fold {fold_idx}] XGBoost done: {_time.time()-t0:.1f}s", flush=True)
-
-        y_pred_proba = booster.predict(dval)
-        y_pred = np.argmax(y_pred_proba, axis=1).ravel().astype(int)
-        qwk = cohen_kappa_score(y_cv, y_pred, weights="quadratic")
-        print(f"[Fold {fold_idx}] QWK={qwk:.4f}", flush=True)
-        return qwk
-
-    elif model_name == "lightgbm":
-        import lightgbm as lgb
-
-        if params.get("boosting_type") == "goss":
-            params["boosting_type"] = "gbdt"
-            params["data_sample_strategy"] = "goss"
-
-        params.update({
-            "objective": "multiclass",
-            "num_class": 5,
-            "metric": "multi_logloss",
-            "verbosity": -1,
-            "random_state": RANDOM_SEED,
-        })
-        model = lgb.LGBMClassifier(**params)
-        model.fit(
-            X_tr, y_tr,
-            sample_weight=sample_weights,
-            eval_set=[(X_cv, y_cv)],
-            callbacks=[lgb.early_stopping(100, verbose=True), lgb.log_evaluation(10)],
-        )
-
-    elif model_name == "random_forest":
-        import time as _time
-
-        cuml_gpu_id = params.pop("__cuml_gpu_id", None)
-
-        if cuml_gpu_id is not None:
-            # cuML GPU path
-            import cupy as _cp
-            from cuml.ensemble import RandomForestClassifier as _CuRF
-
-            # Map sklearn-style → cuML-style
-            crit_map = {"gini": 0, "entropy": 1, "log_loss": 1}
-            mf = params.get("max_features", "sqrt")
-            if isinstance(mf, str):
-                cuml_mf = mf
-            else:
-                cuml_mf = float(mf)
-
-            cuml_params = {
-                "n_estimators": int(params.get("n_estimators", 100)),
-                "max_depth": int(params.get("max_depth", 16)),
-                "min_samples_split": int(params.get("min_samples_split", 2)),
-                "min_samples_leaf": int(params.get("min_samples_leaf", 1)),
-                "max_features": cuml_mf,
-                "bootstrap": bool(params.get("bootstrap", True)),
-                "split_criterion": crit_map.get(params.get("criterion", "gini"), 0),
-                "random_state": int(params.get("random_state", RANDOM_SEED)),
-                "n_streams": 1,
-                "n_bins": 128,
-            }
-            if cuml_params["bootstrap"] and "max_samples" in params:
-                cuml_params["max_samples"] = float(params["max_samples"])
-
-            # cuML nie wspiera sample_weight → weighted bootstrap
-            if sample_weights is not None and not np.allclose(sample_weights, sample_weights[0]):
-                probs = sample_weights / sample_weights.sum()
-                rng = np.random.RandomState(RANDOM_SEED + fold_idx)
-                idx = rng.choice(len(X_tr), size=len(X_tr), replace=True, p=probs)
-                X_tr_eff = X_tr.iloc[idx].reset_index(drop=True)
-                y_tr_eff = pd.Series(np.asarray(y_tr)[idx]).reset_index(drop=True)
-            else:
-                X_tr_eff = X_tr
-                y_tr_eff = y_tr
-
-            X_tr_np = X_tr_eff.values.astype("float32")
-            X_cv_np = X_cv.values.astype("float32")
-            y_tr_np = np.asarray(y_tr_eff).astype("int32")
-
-            print(f"[Fold {fold_idx}] cuML RF GPU{cuml_gpu_id} start: {cuml_params['n_estimators']} trees", flush=True)
-            t0 = _time.time()
-            with _cp.cuda.Device(cuml_gpu_id):
-                model = _CuRF(**cuml_params)
-                model.fit(X_tr_np, y_tr_np)
-                y_pred = np.asarray(model.predict(X_cv_np)).ravel().astype(int)
-            print(f"[Fold {fold_idx}] cuML RF done: {_time.time()-t0:.1f}s", flush=True)
-
-            qwk = cohen_kappa_score(y_cv, y_pred, weights="quadratic")
-            print(f"[Fold {fold_idx}] QWK={qwk:.4f}", flush=True)
-            return qwk
-
-        # sklearn CPU path
-        from sklearn.ensemble import RandomForestClassifier
-
-        n_est = params.get("n_estimators", 500)
-        n_j = params.get("n_jobs", 1)
-        print(f"[Fold {fold_idx}] RF start: {n_est} trees, n_jobs={n_j}", flush=True)
-        t0 = _time.time()
-        model = RandomForestClassifier(class_weight=None, **params)
-        model.fit(X_tr, y_tr, sample_weight=sample_weights)
-        print(f"[Fold {fold_idx}] RF done: {_time.time()-t0:.1f}s", flush=True)
-
-    elif model_name == "ebm":
-        import time as _time
-        from interpret.glassbox import ExplainableBoostingClassifier
-
-        params["random_state"] = RANDOM_SEED
-        print(f"[Fold {fold_idx}] EBM start", flush=True)
-        t0 = _time.time()
-        model = ExplainableBoostingClassifier(**params)
-        model.fit(X_tr, y_tr, sample_weight=sample_weights)
-        print(f"[Fold {fold_idx}] EBM done: {_time.time()-t0:.1f}s", flush=True)
-
-    elif model_name == "extra_trees":
-        import time as _time
-        from sklearn.ensemble import ExtraTreesClassifier
-
-        params.pop("class_weight", None)
-        n_est = params.get("n_estimators", 500)
-        n_j = params.get("n_jobs", 1)
-        print(f"[Fold {fold_idx}] ET start: {n_est} trees, n_jobs={n_j}", flush=True)
-        t0 = _time.time()
-        model = ExtraTreesClassifier(class_weight=None, **params)
-        model.fit(X_tr, y_tr, sample_weight=sample_weights)
-        print(f"[Fold {fold_idx}] ET done: {_time.time()-t0:.1f}s", flush=True)
-
-    elif model_name == "hist_gbt":
-        import time as _time
-        from sklearn.ensemble import HistGradientBoostingClassifier
-
-        # Usuń puste parametry które HistGBT by odrzucił
-        for key in ["validation_fraction", "n_iter_no_change"]:
-            if params.get(key) is None:
-                params.pop(key, None)
-        params["verbose"] = 1   # per-iteration logi
-        max_it = params.get("max_iter", 1000)
-        print(f"[Fold {fold_idx}] HistGBT start: max_iter={max_it}", flush=True)
-        t0 = _time.time()
-        model = HistGradientBoostingClassifier(**params)
-        model.fit(X_tr, y_tr, sample_weight=sample_weights)
-        print(f"[Fold {fold_idx}] HistGBT done: {_time.time()-t0:.1f}s", flush=True)
-
-    elif model_name == "catboost":
-        from catboost import CatBoostClassifier, Pool
-
-        from src.models.catboost_model import _normalize_catboost_params
-
-        # _fold_idx to nasz prywatny znacznik — nie idzie do CatBoost
-        fold_idx = params.pop("_fold_idx", 0)
-
-        params = _normalize_catboost_params(params)
-        # GPU restrictions: MVS + rsm nie wspierane dla multiclass na GPU
-        if params.get("bootstrap_type") == "MVS":
-            params["bootstrap_type"] = "Bernoulli"
-        params.pop("rsm", None)
-        params.update({
-            "loss_function": "MultiClass",
-            "eval_metric": "MultiClass",
-            "classes_count": 5,
-            "task_type": "GPU",
-            "allow_writing_files": False,
-            "od_type": "Iter",
-            "od_wait": 100,
-            "boosting_type": "Plain",
-            "verbose": 10,
-            "gpu_ram_part": 0.85,
-        })
-        # devices może być ustawione per-fold (multi-GPU), nie nadpisuj
-        params.setdefault("devices", "0")
-
-        train_pool = Pool(data=X_tr, label=y_tr.values, weight=sample_weights)
-        eval_pool = Pool(data=X_cv, label=y_cv.values)
-
-        model = CatBoostClassifier(**params)
-        fit_kwargs = {"eval_set": eval_pool, "use_best_model": True}
-        # CatBoost nie wspiera ustawiania log_cout z wielu wątków —
-        # verbose=10 idzie na stdout, nohup redirectuje do pliku.
-        model.fit(train_pool, **fit_kwargs)
-
-    else:
-        raise ValueError(f"Brak obsługi tuningu dla: {model_name}")
-
-    y_pred = np.asarray(model.predict(X_cv)).ravel()
-    qwk = cohen_kappa_score(y_cv, y_pred, weights="quadratic")
-    print(f"[Fold {fold_idx}] QWK={qwk:.4f}", flush=True)
-    return qwk
+    pred_argmax = decide(proba, "argmax")
+    pred_cost = decide(proba, "cost")
+    esi1 = y_true == 0
+    out = {
+        "qwk_argmax": float(cohen_kappa_score(y_true, pred_argmax, weights="quadratic")),
+        "qwk_cost": float(cohen_kappa_score(y_true, pred_cost, weights="quadratic")),
+        "expected_cost_cost": expected_cost(y_true, pred_cost),
+        "undertriage_cost": undertriage_rate(y_true, pred_cost),
+        "esi1_recall_cost": float((pred_cost[esi1] == 0).mean()) if esi1.any() else float("nan"),
+    }
+    return {k: (None if isinstance(v, float) and math.isnan(v) else round(float(v), 6)) for k, v in out.items()}
 
 
 # ─────────────────────────────────────────
-# 1-fold feature importance filter (per-model)
+# EBM: foldy równolegle
+# ─────────────────────────────────────────
+def _ebm_fold_workers(params: dict[str, Any], n_folds: int) -> tuple[int, int]:
+    """
+    (liczba równoległych foldów, procesy EBM — worki — na fold).
+
+    EBM zrównolegla się tylko po workach (outer_bags) — przy 8 workach i 24 rdzeniach
+    jeden fold zajmuje 8 rdzeni, więc 3 foldy liczone razem wykorzystują cały CPU.
+    Budżet = n_jobs EBM (config.N_JOBS); < 2 → foldy sekwencyjnie.
+    Pomiar (10k wierszy, 4 rdzenie): worki < rdzenie — foldy równolegle 7,5 s vs sekwencyjnie
+    12 s; worki ≥ rdzenie — remis (±7%); worki jako wątki (stare zachowanie) — 2× wolniej.
+    """
+    total = int(params.get("n_jobs") or 1)
+    if total < 2 or n_folds < 2:
+        return 1, max(total, 1)
+    workers = min(n_folds, total)
+    return workers, max(1, total // workers)
+
+
+def _parallel_infra_errors() -> tuple[type[BaseException], ...]:
+    """Błędy infrastruktury joblib/loky (nie modelu) — po nich foldy liczone sekwencyjnie."""
+    errors: list[type[BaseException]] = [OSError, ImportError]
+    try:
+        from joblib.externals.loky.process_executor import BrokenProcessPool, TerminatedWorkerError
+
+        errors += [BrokenProcessPool, TerminatedWorkerError]
+    except ImportError:
+        pass
+    try:
+        from pickle import PicklingError
+
+        errors.append(PicklingError)
+    except ImportError:
+        pass
+    return tuple(errors)
+
+
+def _fit_predict_fold_worker(
+    model_name: str,
+    params: dict[str, Any],
+    X_tr: pd.DataFrame,
+    y_tr: np.ndarray,
+    X_va: pd.DataFrame,
+    sample_weight: np.ndarray | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    fit_predict_fold w procesie roboczym loky z PROCESAMI dla worków EBM.
+
+    joblib w procesie roboczym po cichu zamienia zagnieżdżony Parallel (worki EBM) na wątki;
+    pętla boostingu interpret jest w Pythonie (GIL), więc wątki są wolniejsze niż sekwencyjnie.
+    parallel_config(backend="loky") przywraca procesy także wewnątrz foldu.
+    """
+    from joblib import parallel_config
+
+    with parallel_config(backend="loky"):
+        return fit_predict_fold(model_name, params, X_tr, y_tr, X_va, sample_weight)
+
+
+def _run_folds_parallel(
+    model_name: str,
+    params: dict[str, Any],
+    jobs: list[tuple[pd.DataFrame, np.ndarray, pd.DataFrame, np.ndarray | None]],
+    n_workers: int,
+) -> list[tuple[np.ndarray, dict[str, Any]]]:
+    """
+    Foldy w osobnych procesach (loky — działa tak samo na Windows i Linux); worki EBM
+    w każdym foldzie też jako procesy (`_fit_predict_fold_worker`).
+    """
+    from joblib import Parallel, delayed
+
+    return Parallel(n_jobs=n_workers, backend="loky", max_nbytes=None)(
+        delayed(_fit_predict_fold_worker)(model_name, params, X_tr, y_tr, X_va, w) for X_tr, y_tr, X_va, w in jobs
+    )
+
+
+# ─────────────────────────────────────────
+# Szybki filtr cech
 # ─────────────────────────────────────────
 def filter_features_by_importance_1fold(
     X: pd.DataFrame,
     y: pd.Series,
     feature_names: list[str],
-    model_name: str = "lightgbm",
+    model_name: str | None = None,
     min_importance: float = 0.0,
-    n_estimators: int | None = None,
 ) -> list[str]:
-    """Szybki 1-fold trening modelu do odrzucenia cech z zerową importance.
-
-    Trenuje ten SAM model co target, na 1 foldzie.
-    Dla modeli bez feature_importances_ (EBM) używa LightGBM jako proxy.
     """
-    # Maksymalne n_estimators per model (szybki filter, nie full tuning)
-    model_max_estimators = {
-        "xgboost": 2000,
-        "lightgbm": 2000,
-        "catboost": 1000,
-        "random_forest": 500,
-        "extra_trees": 500,
-        "hist_gbt": 1000,
-    }
-    alias_map = {"cb": "catboost", "rf": "random_forest", "et": "extra_trees", "hgbt": "hist_gbt"}
-    model_key = alias_map.get(model_name, model_name)
-    if n_estimators is None:
-        n_estimators = model_max_estimators.get(model_key, 1000)
-    log.info(f"n_estimators dla filtra: {n_estimators}")
-    from sklearn.model_selection import StratifiedKFold
+    Odrzuca cechy, których LightGBM (na połowie zbioru) nie użył ani razu.
 
-    skf = StratifiedKFold(n_splits=2, shuffle=True, random_state=RANDOM_SEED)
-    train_idx, _ = next(skf.split(X, y))
+    LightGBM służy jako szybki, uniwersalny filtr niezależnie od modelu docelowego.
+    """
+    import lightgbm as lgb
 
-    X_fold = X.iloc[train_idx]
-    y_fold = y.iloc[train_idx]
-
-    if model_name == "xgboost":
-        import xgboost as xgb
-        log.info(f"=== 1-fold feature importance filter (XGBoost, {n_estimators} trees) ===")
-        model = xgb.XGBClassifier(
-            n_estimators=n_estimators, max_depth=6, learning_rate=0.1,
-            subsample=0.8, colsample_bytree=0.8,
-            tree_method="hist", device="cuda",
-            random_state=RANDOM_SEED, verbosity=0,
-        )
-        model.fit(X_fold, y_fold)
-        importances = model.feature_importances_
-
-    elif model_name == "lightgbm":
-        import lightgbm as lgb
-        log.info(f"=== 1-fold feature importance filter (LightGBM, {n_estimators} trees) ===")
-        model = lgb.LGBMClassifier(
-            n_estimators=n_estimators, max_depth=8, num_leaves=63,
-            learning_rate=0.1, subsample=0.8, colsample_bytree=0.8,
-            random_state=RANDOM_SEED, verbosity=-1, n_jobs=1,
-        )
-        model.fit(X_fold, y_fold)
-        importances = model.feature_importances_
-
-    elif model_name in ("catboost", "cb"):
-        from catboost import CatBoostClassifier
-        log.info(f"=== 1-fold feature importance filter (CatBoost, {n_estimators} trees) ===")
-        model = CatBoostClassifier(
-            n_estimators=n_estimators, max_depth=6, learning_rate=0.1,
-            task_type="GPU", devices="0", verbose=False, random_seed=RANDOM_SEED,
-        )
-        model.fit(X_fold, y_fold, verbose=False)
-        importances = model.feature_importances_
-
-    elif model_name in ("random_forest", "rf"):
-        from sklearn.ensemble import RandomForestClassifier
-        log.info(f"=== 1-fold feature importance filter (RF, {n_estimators} trees) ===")
-        model = RandomForestClassifier(
-            n_estimators=n_estimators, max_depth=10,
-            random_state=RANDOM_SEED, n_jobs=1,
-        )
-        model.fit(X_fold, y_fold)
-        importances = model.feature_importances_
-
-    elif model_name in ("extra_trees", "et"):
-        from sklearn.ensemble import ExtraTreesClassifier
-        log.info(f"=== 1-fold feature importance filter (ExtraTrees, {n_estimators} trees) ===")
-        model = ExtraTreesClassifier(
-            n_estimators=n_estimators, max_depth=10,
-            random_state=RANDOM_SEED, n_jobs=1,
-        )
-        model.fit(X_fold, y_fold)
-        importances = model.feature_importances_
-
-    elif model_name in ("hist_gbt", "hgbt"):
-        from sklearn.ensemble import HistGradientBoostingClassifier
-        log.info(f"=== 1-fold feature importance filter (HistGBT, {n_estimators} iterations) ===")
-        model = HistGradientBoostingClassifier(
-            max_iter=n_estimators, max_depth=6,
-            random_state=RANDOM_SEED,
-        )
-        model.fit(X_fold, y_fold)
-        importances = model.feature_importances_
-
-    else:
-        import lightgbm as lgb
-        log.info(f"=== 1-fold feature importance filter (LightGBM proxy dla {model_name}, {n_estimators} trees) ===")
-        model = lgb.LGBMClassifier(
-            n_estimators=n_estimators, max_depth=8, num_leaves=63,
-            learning_rate=0.1, subsample=0.8, colsample_bytree=0.8,
-            random_state=RANDOM_SEED, verbosity=-1, n_jobs=1,
-        )
-        model.fit(X_fold, y_fold)
-        importances = model.feature_importances_
-
-    kept = [f for f, imp in zip(feature_names, importances) if imp > min_importance]
-    dropped = [f for f, imp in zip(feature_names, importances) if imp <= min_importance]
-
-    log.info(f"Kept: {len(kept)} / {len(feature_names)} features")
+    X_half, _, y_half, _ = train_test_split(
+        X[feature_names], y, train_size=0.5, random_state=RANDOM_SEED, stratify=y
+    )
+    proxy = lgb.LGBMClassifier(
+        objective="multiclass", n_estimators=500, learning_rate=0.1, num_leaves=63,
+        subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+        random_state=RANDOM_SEED, verbosity=-1, n_jobs=LGBM_DEFAULT_PARAMS.get("n_jobs"),
+    )
+    proxy.fit(X_half, y_half)
+    importances = proxy.booster_.feature_importance(importance_type="split")
+    kept = [f for f, imp in zip(feature_names, importances, strict=True) if imp > min_importance]
+    dropped = [f for f in feature_names if f not in set(kept)]
+    log.info(f"Filtr cech (LightGBM, połowa zbioru): zostaje {len(kept)} / {len(feature_names)}")
     if dropped:
-        log.info(f"Dropped ({len(dropped)}): {dropped}")
-
+        log.info(f"Odrzucone ({len(dropped)}): {dropped[:30]}{' …' if len(dropped) > 30 else ''}")
     return kept
 
 
+# ─────────────────────────────────────────
+# Klucz badania (odcisk danych: src.data.dataset.data_fingerprint)
+# ─────────────────────────────────────────
+def _json_ready(value: Any) -> Any:
+    """Wartość zgodna z JSON (porównanie konfiguracji po odczycie z bazy Optuny)."""
+    return json.loads(json.dumps(value, sort_keys=True, default=str))
+
+
+def _config_hash(config: dict[str, Any]) -> str:
+    return hashlib.sha1(json.dumps(config, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:8]
+
+
+def build_study_name(config: dict[str, Any]) -> str:
+    """Czytelna nazwa badania z konfiguracji + skrót całej konfiguracji (unikalność)."""
+    readable = (
+        f"{config['model']}__{config['feature_set']}__{config['metric']}__w-{config['weights']}"
+        f"__n{config['n_rows']}__k{config['n_folds']}__filter{int(bool(config['filter']))}"
+        f"__ss{config['search_space']}__data-{config['data']}__{config['profile']}"
+    )
+    return re.sub(r"[^\w.-]", "_", f"{readable}__{_config_hash(config)}")
+
+
+def _safe_file_stem(name: str) -> str:
+    return re.sub(r"[^\w.-]", "_", name)
+
+
+# ─────────────────────────────────────────
+# Blokada badania (jeden proces na badanie)
+# ─────────────────────────────────────────
+def _process_start_time(pid: int) -> float | None:
+    try:
+        import psutil
+
+        return float(psutil.Process(pid).create_time())
+    except Exception:  # noqa: BLE001 — brak psutil albo procesu
+        return None
+
+
+def _boot_time() -> float | None:
+    """Czas startu systemu (epoch s) — blokada sprzed restartu komputera jest zawsze nieaktualna."""
+    try:
+        import psutil
+
+        return float(psutil.boot_time())
+    except Exception:  # noqa: BLE001 — brak psutil
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ticks = ctypes.windll.kernel32.GetTickCount64
+            ticks.restype = ctypes.c_ulonglong
+            return time.time() - ticks() / 1000.0
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime"):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _process_name(pid: int) -> str | None:
+    """Nazwa/ścieżka programu procesu (do odróżnienia Pythona od procesu z ponownie użytym PID)."""
+    try:
+        import psutil
+
+        return str(psutil.Process(pid).name())
+    except ImportError:
+        pass
+    except Exception:  # noqa: BLE001 — proces zniknął / brak dostępu
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.QueryFullProcessImageNameW.argtypes = (
+                wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            handle = kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return None
+            try:
+                size = wintypes.DWORD(1024)
+                buffer = ctypes.create_unicode_buffer(size.value)
+                if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                    return buffer.value
+                return None
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001
+            return None
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[0].decode("utf-8", "replace") or None
+    except OSError:
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Czy proces o danym PID działa (bez psutil: Windows — OpenProcess, POSIX — kill(pid, 0))."""
+    if pid <= 0:
+        return False
+    try:
+        import psutil
+
+        return bool(psutil.pid_exists(pid))
+    except ImportError:
+        pass
+    if os.name == "nt":
+        # UWAGA: os.kill(pid, 0) na Windows ZABIJA proces — tylko WinAPI
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5             # ACCESS_DENIED = proces istnieje
+        try:
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == 259                    # STILL_ACTIVE
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class StudyLock:
+    """
+    Plik `<badanie>.lock` z PID właściciela. Żywy właściciel → RuntimeError;
+    martwy (awaria, restart komputera) → blokada przejmowana z ostrzeżeniem.
+    """
+
+    def __init__(self, path: Path, study_name: str):
+        self.path = Path(path)
+        self.study_name = study_name
+        self.acquired = False
+
+    def _holder(self) -> dict | None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _holder_alive(self, holder: dict | None) -> bool:
+        if holder is None:                                   # pusty/uszkodzony plik po awarii
+            return False
+        try:
+            pid = int(holder.get("pid", -1))
+        except (TypeError, ValueError):
+            return False
+        if holder.get("host") not in (None, socket.gethostname()):
+            return True                                      # inna maszyna — nie da się sprawdzić
+        if pid == os.getpid():
+            return False                                     # pozostałość w tym samym procesie
+        if not _pid_alive(pid):
+            return False
+        # PID bywa ponownie użyty (zwłaszcza po restarcie Windows) — sprawdź, czy to ten sam proces
+        boot_then, boot_now = holder.get("boot_time"), _boot_time()
+        if boot_then is not None and boot_now is not None and abs(float(boot_then) - boot_now) > 300:
+            return False                                     # blokada sprzed restartu komputera
+        name = _process_name(pid)
+        if name and "python" not in Path(name).name.lower():
+            return False                                     # inny program dostał ten PID
+        recorded, current = holder.get("proc_start"), _process_start_time(pid)
+        if recorded is not None and current is not None and abs(float(recorded) - current) > 1.0:
+            return False                                     # inny proces Pythona z tym PID
+        return True
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "proc_start": _process_start_time(os.getpid()),
+            "boot_time": _boot_time(),
+            "study": self.study_name,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        for _ in range(3):
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                holder = self._holder()
+                if self._holder_alive(holder):
+                    raise RuntimeError(
+                        f"Badanie Optuny '{self.study_name}' jest właśnie używane przez proces "
+                        f"PID {holder.get('pid')} ({holder.get('host')}, od {holder.get('started_at')}). "
+                        f"Jedno badanie = jeden proces. Jeśli ten proces już nie działa, usuń {self.path}."
+                    ) from None
+                log.warning(f"Przejmuję nieaktualną blokadę {self.path.name} "
+                            f"(PID {None if holder is None else holder.get('pid')} nie działa)")
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            self.acquired = True
+            return
+        raise RuntimeError(f"Nie udało się założyć blokady {self.path}")
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+        self.acquired = False
+
+
+# ─────────────────────────────────────────
+# Magazyn Optuny (SQLite z pulsem)
+# ─────────────────────────────────────────
+def _make_storage(storage_path: Path) -> tuple[optuna.storages.BaseStorage, Callable | None]:
+    """
+    RDBStorage z pulsem i ponowieniem przerwanej próby (zgodne z optuna 3.5 – 5.x).
+
+    optuna ≥ 4.9: `heartbeat_stale_trial_callback` + RetryHeartbeatStaleTrialCallback,
+    starsze: `failed_trial_callback` + RetryFailedTrialCallback.
+    """
+    url = f"sqlite:///{Path(storage_path).resolve().as_posix()}"
+    storages = optuna.storages
+    callback_cls = getattr(storages, "RetryHeartbeatStaleTrialCallback", None) \
+        or getattr(storages, "RetryFailedTrialCallback", None)
+    accepted = inspect.signature(storages.RDBStorage.__init__).parameters
+    kwargs: dict[str, Any] = {"engine_kwargs": {"connect_args": {"timeout": 60}}}
+    if "heartbeat_interval" in accepted:
+        kwargs["heartbeat_interval"] = OPTUNA_HEARTBEAT_INTERVAL_S
+        kwargs["grace_period"] = OPTUNA_GRACE_PERIOD_S
+    retry = None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")      # ExperimentalWarning / FutureWarning (zmiany API)
+        if callback_cls is not None:
+            retry = callback_cls(max_retry=OPTUNA_MAX_RETRY)
+            if "heartbeat_stale_trial_callback" in accepted:
+                kwargs["heartbeat_stale_trial_callback"] = retry
+            elif "failed_trial_callback" in accepted:
+                kwargs["failed_trial_callback"] = retry
+            else:
+                retry = None
+        storage = storages.RDBStorage(url, **kwargs)
+    return storage, retry
+
+
+def _fail_orphaned_trials(study: optuna.Study, retry: Callable | None, tune_logger) -> int:
+    """
+    Próby RUNNING po awarii procesu (blokada gwarantuje, że nikt inny ich nie liczy) → FAIL
+    i jedno ponowienie z tymi samymi parametrami (bez czekania na koniec okresu pulsu).
+    """
+    count = 0
+    for trial in study.get_trials(deepcopy=False, states=(TrialState.RUNNING,)):
+        try:
+            storage = study._storage            # noqa: SLF001 — publiczne API nie ma "fail"
+            storage.set_trial_state_values(trial._trial_id, state=TrialState.FAIL)
+            count += 1
+            tune_logger.warning(f"Trial {trial.number:>4}: przerwany przez awarię poprzedniego procesu → FAIL")
+            if retry is not None:
+                retry(study, copy.deepcopy(storage.get_trial(trial._trial_id)))
+        except Exception as exc:  # noqa: BLE001 — porządki nie mogą przerwać tuningu
+            tune_logger.warning(f"Nie udało się oznaczyć próby {trial.number} jako FAIL: {exc}")
+    return count
+
+
+class _StopAfterConsecutiveFails:
+    """Callback: `study.stop()` po N kolejnych próbach FAIL (np. stały błąd środowiska)."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.count = 0
+        self.triggered = False
+
+    def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        self.count = self.count + 1 if trial.state == TrialState.FAIL else 0
+        if self.count >= self.limit:
+            self.triggered = True
+            study.stop()
+
+
+class _ElapsedTracker:
+    """Callback: łączny czas prób badania w user_attrs['elapsed_s'] (przeżywa restart)."""
+
+    def __init__(self, base: float):
+        self.total = float(base)
+
+    def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        if trial.duration is not None:
+            self.total += trial.duration.total_seconds()
+            study.set_user_attr("elapsed_s", round(self.total, 1))
+
+
+def _fold_strata(y: np.ndarray, strata: np.ndarray | None, min_count: int) -> np.ndarray:
+    """
+    Etykiety stratyfikacji: ESI × oddział; kombinacje z < min_count wierszami → samo ESI.
+    """
+    if strata is None:
+        return y
+    s = pd.Series(np.asarray(strata).astype(str))
+    rare = s.map(s.value_counts()) < min_count
+    s = s.where(~rare, "esi" + pd.Series(y).astype(str))
+    if (s.map(s.value_counts()) < min_count).any():
+        return y
+    return s.to_numpy()
+
+
+# ─────────────────────────────────────────
 # Główna funkcja tuningu
 # ─────────────────────────────────────────
 def tune_model(
     model_name: str,
     X_train: pd.DataFrame,
     y_train: np.ndarray | pd.Series,
-    X_val: pd.DataFrame,
-    y_val: np.ndarray | pd.Series,
-    n_trials: int = OPTUNA_N_TRIALS,
-    timeout: int | None = OPTUNA_TIMEOUT_SECONDS,
-    sample_weight_strategy: str = "custom",
-    storage_path: Path | str | None = EXPERIMENTS_DIR / "optuna_studies.db",
+    n_trials: int = 20,
+    metric: str = "logloss",
+    n_folds: int = TUNE_CV_FOLDS,
+    max_rows: int | None = None,
+    sample_weight_strategy: str = "none",
+    timeout: float | None = None,
+    storage_path: Path | str | None = None,
     study_name: str | None = None,
+    *,
+    feature_set: str = "triage",
+    strata: np.ndarray | pd.Series | None = None,
+    do_filter: bool = False,
+    profile: str | None = None,
+    n_final_fit: int | None = None,
+    fixed_params: dict[str, Any] | None = None,
+    data_fp: str | None = None,
 ) -> dict[str, Any]:
     """
-    Optymalizuje hiperparametry modelu maksymalizując QWK przez 5-fold CV.
-
-    Strategia maksymalnej jakości:
-    - 5-fold StratifiedKFold ze STAŁYM seedem (fair comparison między trialami)
-    - Cost-sensitive wagi klas dobierane przez Optunę
-    - MultivariateTPE z 50 trial-ami startowymi
-    - Bez prunera (NopPruner) — żaden trial nie jest zabijany
-    - SQLite storage — wznowienie po przerwie
+    Optuna: k-fold CV na zbiorze dopasowania (część TRAIN).
 
     Parameters
     ----------
-    model_name : str
-        'xgboost' | 'lightgbm' | 'random_forest' | 'ebm'
-    X_train, y_train, X_val, y_val : pd.DataFrame, pd.Series
-        X_val/y_val nieużywane (CV liczone wewnątrz na X_train).
-    n_trials : int
-    timeout : int, optional
-    sample_weight_strategy : str
-        Fallback gdy nie używamy cost-sensitive (np. dla finalnego retreningu).
-    storage_path : Path
-        SQLite dla persistent study.
-    study_name : str, optional
+    n_trials : łączna liczba UKOŃCZONYCH prób (COMPLETE + PRUNED) w badaniu — wznowienie
+        dokańcza brakujące.
+    metric : 'logloss' (minimalizacja, domyślnie) | 'qwk' (maksymalizacja + wagi klas)
+    max_rows : stratyfikowana próbka do tuningu (None = cały zbiór); finalny trening na całości.
+    sample_weight_strategy : wagi przy celu 'logloss' (log loss foldu ważony tymi samymi wagami).
+    timeout : łączny limit czasu badania w sekundach (sumowany między wznowieniami).
+    storage_path : plik SQLite (None = pamięć, bez wznawiania, blokady i best.json).
+    study_name : jawna nazwa badania (domyślnie z konfiguracji); niezgodna konfiguracja → błąd.
+    feature_set, do_filter, profile : części klucza badania (nie zmieniają obliczeń poza RF max_features).
+    strata : etykiety stratyfikacji foldów (np. ESI × oddział), wyrównane z X_train.
+    n_final_fit : liczba wierszy finalnego treningu (strażnik rozmiaru RF; domyślnie len(X_train)).
+    fixed_params : parametry stałe dla każdej próby (nadpisują TUNE_FIXED_PARAMS; część klucza).
+    data_fp : odcisk danych (domyślnie `src.data.dataset.data_fingerprint()` — stały przy
+        ponownym przygotowaniu tych samych danych).
 
-    Returns
-    -------
-    dict z kluczami: best_params, best_value, n_trials, study_name, log_path
+    Raises
+    ------
+    RuntimeError — brak ukończonej próby, badanie zajęte przez inny proces albo niezgodna
+    konfiguracja badania o jawnej nazwie.
     """
-    if model_name not in SUGGEST_FUNCTIONS:
-        raise ValueError(
-            f"Nieznany model: '{model_name}'. Dostępne: {sorted(SUGGEST_FUNCTIONS.keys())}"
-        )
+    model_name = resolve_model_name(model_name)
+    if metric not in TUNE_METRICS:
+        raise ValueError(f"Nieznana metryka tuningu '{metric}'. Dostępne: {TUNE_METRICS}")
+    if n_folds < 2:
+        raise ValueError(f"n_folds musi być ≥ 2 (podano {n_folds})")
+    if n_trials < 1:
+        raise ValueError(f"n_trials musi być ≥ 1 (podano {n_trials})")
 
-    # Logger dedykowany dla tuningu
+    # ── Dane: próbka do tuningu i foldy ──
+    X = X_train.reset_index(drop=True)
+    y = np.asarray(y_train).astype(int).ravel()
+    strata_arr = None if strata is None else np.asarray(strata).ravel()
+    if strata_arr is not None and len(strata_arr) != len(X):
+        raise ValueError(f"len(strata)={len(strata_arr)} ≠ len(X)={len(X)}")
+    if max_rows is not None and 0 < max_rows < len(X):
+        idx, _ = train_test_split(np.arange(len(X)), train_size=max_rows, random_state=RANDOM_SEED,
+                                  stratify=_fold_strata(y, strata_arr, 2))
+        idx = np.sort(idx)
+        X, y = X.iloc[idx].reset_index(drop=True), y[idx]
+        strata_arr = None if strata_arr is None else strata_arr[idx]
+    fold_labels = _fold_strata(y, strata_arr, n_folds)
+    folds = list(StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_SEED).split(X, fold_labels))
+
+    supports_es = MODEL_REGISTRY[model_name].supports_early_stopping
+    mean_fold_rows = float(np.mean([len(tr) for tr, _ in folds]))
+    n_fold_train = int(round(mean_fold_rows * ((1 - EARLY_STOPPING_FRACTION) if supports_es else 1.0)))
+    n_final = int(n_final_fit or len(X_train))
+
+    fixed = {**TUNE_FIXED_PARAMS.get(model_name, {}), **(fixed_params or {})}
+    direction = "minimize" if metric == "logloss" else "maximize"
+    n_startup = n_startup_trials(model_name, metric)
+
+    # ── Klucz badania ──
+    config = _json_ready({
+        "model": model_name,
+        "feature_set": feature_set,
+        "metric": metric,
+        "weights": sample_weight_strategy,
+        "n_rows": int(len(X)),
+        "n_features": int(X.shape[1]),
+        "n_folds": int(n_folds),
+        "filter": bool(do_filter),
+        "search_space": int(SEARCH_SPACE_VERSION[model_name]),
+        "data": data_fp or data_fingerprint(),
+        "profile": profile or "custom",
+        "fixed_params": fixed,
+        "stratified_by": "esi_site" if strata_arr is not None else "esi",
+    })
+    name = study_name or build_study_name(config)
+
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tune_logger, log_path = get_training_logger(
-        model_name=f"{model_name}_tuning",
-        run_id=run_id,
-    )
+    tune_logger, log_path = get_training_logger(model_name=f"{model_name}_tuning", run_id=run_id)
+    tune_logger.info(f"Optuna: {model_name} | cel={metric} | {n_folds}-fold CV | n={len(X):,} "
+                     f"(fold-train ≈ {n_fold_train:,}) | próby={n_trials} | limit czasu="
+                     f"{'brak' if timeout is None else f'{timeout / 60:.0f} min'}")
+    tune_logger.info(f"Badanie: {name}")
 
-    tune_logger.info(f"=== Optuna tuning: {model_name} (MAX QUALITY) ===")
-    tune_logger.info(f"n_trials={n_trials}, timeout={timeout}, CV={CV_N_SPLITS}-fold")
-    tune_logger.info(f"sample_weight_strategy='{sample_weight_strategy}' (fallback only)")
-
-    suggest_fn = SUGGEST_FUNCTIONS[model_name]
-
-    # STAŁY split CV — wszystkie triale ewaluowane na tych samych foldach
-    skf = StratifiedKFold(n_splits=CV_N_SPLITS, shuffle=True, random_state=RANDOM_SEED)
-    cv_splits = list(skf.split(X_train, y_train))
-    tune_logger.info(f"Wygenerowano {len(cv_splits)} stałych splitów CV (seed={RANDOM_SEED})")
-
-    # Pandas Series dla .iloc / .map
-    y_train_series = pd.Series(y_train).reset_index(drop=True)
-    X_train_reset = X_train.reset_index(drop=True)
-
-    # ─── Funkcja celu ───
-    def objective(trial: optuna.Trial) -> float:
-        params = suggest_fn(trial)
-        params["random_state"] = RANDOM_SEED
-
-        # Cost-sensitive wagi klas (hiperparametry Optuny)
-        class_weight_map = _suggest_class_weights(trial)
-
-        try:
-            if model_name == "xgboost":
-                # Multi-GPU: foldy równolegle, każdy na innym GPU
-                import os
-                from joblib import Parallel, delayed
-
-                # Wykryj liczbę GPU
-                n_gpus = 0
-                try:
-                    import subprocess
-                    result = subprocess.run(
-                        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    n_gpus = len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
-                except Exception:
-                    pass
-
-                if n_gpus >= CV_N_SPLITS:
-                    available_cpus = len(os.sched_getaffinity(0))
-                    n_jobs_per_fold = max(1, available_cpus // (CV_N_SPLITS * 2))
-
-                    fold_args = []
-                    for fold_idx, (tr_idx, cv_idx) in enumerate(cv_splits):
-                        X_tr = X_train_reset.iloc[tr_idx]
-                        X_cv = X_train_reset.iloc[cv_idx]
-                        y_tr = y_train_series.iloc[tr_idx]
-                        y_cv = y_train_series.iloc[cv_idx]
-                        sw = y_tr.map(class_weight_map).values
-                        fold_params = dict(params)
-                        fold_params["n_jobs"] = n_jobs_per_fold
-                        fold_params["device"] = f"cuda:{fold_idx}"
-                        fold_args.append((model_name, fold_params, X_tr, y_tr, X_cv, y_cv, sw, None, fold_idx))
-
-                    qwk_scores = Parallel(n_jobs=CV_N_SPLITS, backend="threading")(
-                        delayed(_train_eval_fold)(*args) for args in fold_args
-                    )
-                else:
-                    # Pojedyncze GPU — foldy sekwencyjnie
-                    qwk_scores = []
-                    for fold_idx, (tr_idx, cv_idx) in enumerate(cv_splits):
-                        X_tr = X_train_reset.iloc[tr_idx]
-                        X_cv = X_train_reset.iloc[cv_idx]
-                        y_tr = y_train_series.iloc[tr_idx]
-                        y_cv = y_train_series.iloc[cv_idx]
-                        sw = y_tr.map(class_weight_map).values
-                        fold_params = dict(params)
-                        fold_params["n_jobs"] = max(1, os.cpu_count() // 2)
-                        qwk = _train_eval_fold(
-                            model_name, fold_params, X_tr, y_tr, X_cv, y_cv, sw,
-                            tune_logger, fold_idx,
-                        )
-                        qwk_scores.append(qwk)
-            elif model_name == "catboost":
-                # Multi-GPU: foldy równolegle, każdy na innym GPU
-                import os
-                from joblib import Parallel, delayed
-
-                n_gpus = 0
-                try:
-                    import subprocess
-                    result = subprocess.run(
-                        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    n_gpus = len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
-                except Exception:
-                    pass
-
-                if n_gpus >= CV_N_SPLITS:
-                    available_cpus = len(os.sched_getaffinity(0))
-                    n_jobs_per_fold = max(1, available_cpus // (CV_N_SPLITS * 2))
-
-                    fold_args = []
-                    for fold_idx, (tr_idx, cv_idx) in enumerate(cv_splits):
-                        X_tr = X_train_reset.iloc[tr_idx]
-                        X_cv = X_train_reset.iloc[cv_idx]
-                        y_tr = y_train_series.iloc[tr_idx]
-                        y_cv = y_train_series.iloc[cv_idx]
-                        sw = y_tr.map(class_weight_map).values
-                        fold_params = dict(params)
-                        fold_params["task_type"] = "GPU"
-                        fold_params["devices"] = str(fold_idx)
-                        fold_params["_fold_idx"] = fold_idx
-                        fold_args.append((model_name, fold_params, X_tr, y_tr, X_cv, y_cv, sw, None, fold_idx))
-
-                    qwk_scores = Parallel(n_jobs=CV_N_SPLITS, backend="threading")(
-                        delayed(_train_eval_fold)(*args) for args in fold_args
-                    )
-                else:
-                    # Pojedyncze GPU — foldy sekwencyjnie
-                    qwk_scores = []
-                    for fold_idx, (tr_idx, cv_idx) in enumerate(cv_splits):
-                        X_tr = X_train_reset.iloc[tr_idx]
-                        X_cv = X_train_reset.iloc[cv_idx]
-                        y_tr = y_train_series.iloc[tr_idx]
-                        y_cv = y_train_series.iloc[cv_idx]
-                        sw = y_tr.map(class_weight_map).values
-                        fold_params = dict(params)
-                        fold_params["task_type"] = "GPU"
-                        fold_params["_fold_idx"] = fold_idx
-                        qwk = _train_eval_fold(
-                            model_name, fold_params, X_tr, y_tr, X_cv, y_cv, sw,
-                            tune_logger,
-                        )
-                        qwk_scores.append(qwk)
-
-            elif model_name == "lightgbm":
-                import os
-                from joblib import Parallel, delayed
-
-                # LightGBM GPU (OpenCL) nie działa na WSL i jest wolny na NVIDIA.
-                # Zawsze CPU — foldy równoległe z OMP capped.
-                available_cpus = len(os.sched_getaffinity(0))
-                omp_per_fold = max(1, min(available_cpus // CV_N_SPLITS, 64))
-                os.environ["OMP_NUM_THREADS"] = str(omp_per_fold)
-                for var in ["MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"]:
-                    os.environ[var] = "1"
-                fold_args = []
-                for fold_idx, (tr_idx, cv_idx) in enumerate(cv_splits):
-                    X_tr = X_train_reset.iloc[tr_idx]
-                    X_cv = X_train_reset.iloc[cv_idx]
-                    y_tr = y_train_series.iloc[tr_idx]
-                    y_cv = y_train_series.iloc[cv_idx]
-                    sw = y_tr.map(class_weight_map).values
-                    fold_params = dict(params)
-                    fold_params["n_jobs"] = omp_per_fold
-                    fold_args.append((model_name, fold_params, X_tr, y_tr, X_cv, y_cv, sw, tune_logger, fold_idx))
-                qwk_scores = Parallel(n_jobs=CV_N_SPLITS, backend="threading")(
-                    delayed(_train_eval_fold)(*args) for args in fold_args
-                )
-
-            elif model_name == "random_forest":
-                import os
-                from joblib import Parallel, delayed
-
-                n_gpus = 0
-                try:
-                    import subprocess
-                    result = subprocess.run(
-                        ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    n_gpus = len(result.stdout.strip().split("\n")) if result.stdout.strip() else 0
-                except Exception:
-                    pass
-
-                cuml_available = False
-                try:
-                    import cuml  # noqa: F401
-                    cuml_available = True
-                except ImportError:
-                    pass
-
-                use_gpu = n_gpus > 0 and cuml_available
-
-                if use_gpu:
-                    fold_args = []
-                    for fold_idx, (tr_idx, cv_idx) in enumerate(cv_splits):
-                        X_tr = X_train_reset.iloc[tr_idx]
-                        X_cv = X_train_reset.iloc[cv_idx]
-                        y_tr = y_train_series.iloc[tr_idx]
-                        y_cv = y_train_series.iloc[cv_idx]
-                        sw = y_tr.map(class_weight_map).values
-                        fold_params = dict(params)
-                        fold_params["__cuml_gpu_id"] = fold_idx if n_gpus >= CV_N_SPLITS else 0
-                        fold_args.append((model_name, fold_params, X_tr, y_tr, X_cv, y_cv, sw, None, fold_idx))
-
-                    if n_gpus >= CV_N_SPLITS:
-                        qwk_scores = Parallel(n_jobs=CV_N_SPLITS, backend="threading")(
-                            delayed(_train_eval_fold)(*args) for args in fold_args
-                        )
-                    else:
-                        qwk_scores = [_train_eval_fold(*args) for args in fold_args]
-                else:
-                    available_cpus = len(os.sched_getaffinity(0))
-                    omp_per_fold = max(1, min(available_cpus // CV_N_SPLITS, 64))
-                    for var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"]:
-                        os.environ[var] = "1"
-                    fold_args = []
-                    for fold_idx, (tr_idx, cv_idx) in enumerate(cv_splits):
-                        X_tr = X_train_reset.iloc[tr_idx]
-                        X_cv = X_train_reset.iloc[cv_idx]
-                        y_tr = y_train_series.iloc[tr_idx]
-                        y_cv = y_train_series.iloc[cv_idx]
-                        sw = y_tr.map(class_weight_map).values
-                        fold_params = dict(params)
-                        fold_params["n_jobs"] = omp_per_fold
-                        fold_args.append((model_name, fold_params, X_tr, y_tr, X_cv, y_cv, sw, None, fold_idx))
-                    qwk_scores = Parallel(n_jobs=CV_N_SPLITS, backend="loky")(
-                        delayed(_train_eval_fold)(*args) for args in fold_args
-                    )
-
-            else:
-                import os
-                from joblib import Parallel, delayed
-                available_cpus = len(os.sched_getaffinity(0))
-                omp_per_fold = max(1, min(available_cpus // CV_N_SPLITS, 64))
-                for var in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"]:
-                    os.environ[var] = "1"
-                fold_args = []
-                for fold_idx, (tr_idx, cv_idx) in enumerate(cv_splits):
-                    X_tr = X_train_reset.iloc[tr_idx]
-                    X_cv = X_train_reset.iloc[cv_idx]
-                    y_tr = y_train_series.iloc[tr_idx]
-                    y_cv = y_train_series.iloc[cv_idx]
-                    sw = y_tr.map(class_weight_map).values
-                    fold_params = dict(params)
-                    fold_params["n_jobs"] = omp_per_fold
-                    fold_args.append((model_name, fold_params, X_tr, y_tr, X_cv, y_cv, sw, None, fold_idx))
-                qwk_scores = Parallel(n_jobs=CV_N_SPLITS, backend="loky")(
-                    delayed(_train_eval_fold)(*args) for args in fold_args
-                )
-
-            qwk_mean = float(np.mean(qwk_scores))
-            qwk_std = float(np.std(qwk_scores))
-
-            tune_logger.info(
-                f"Trial {trial.number:>4}: QWK={qwk_mean:.4f} (±{qwk_std:.4f}), "
-                f"folds={[f'{s:.3f}' for s in qwk_scores]}"
-            )
-            return qwk_mean
-
-        except Exception as e:
-            tune_logger.error(f"Trial {trial.number} błąd: {type(e).__name__}: {e}")
-            return -1.0
-
-    # ─── Konfiguracja Optuny (MAX QUALITY) ───
-    sampler = optuna.samplers.TPESampler(
-        seed=RANDOM_SEED,
-        multivariate=True,          # modeluje korelacje między hiperparametrami
-        group=True,                  # grupuje conditional params (np. DART-only)
-        n_startup_trials=50,         # 50 losowych prób przed bayesowskim TPE
-        n_ei_candidates=48,          # 2x więcej kandydatów per iteracja (default=24)
-        warn_independent_sampling=False,
-    )
-    pruner = optuna.pruners.NopPruner()  # żaden trial nie jest zabijany przedwcześnie
-
+    lock: StudyLock | None = None
+    storage: Any = None
+    retry = None
+    storage_dir: Path | None = None
     if storage_path is not None:
-        storage_url = f"sqlite:///{Path(storage_path).resolve().as_posix()}"
-    else:
-        storage_url = None
+        storage_dir = Path(storage_path).parent
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        lock = StudyLock(storage_dir / f"{_safe_file_stem(name)}.lock", name)
 
-    if study_name is None:
-        study_name = f"{model_name}_max_quality_{run_id}"
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    try:
+        if lock is not None:
+            lock.acquire()
+            storage, retry = _make_storage(Path(storage_path))
 
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=sampler,
-        pruner=pruner,
-        storage=storage_url,
-        study_name=study_name,
-        load_if_exists=True,
-    )
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=OPTUNA_PRUNER_STARTUP_TRIALS, n_warmup_steps=0)
+        study = optuna.create_study(direction=direction, storage=storage, study_name=name,
+                                    load_if_exists=True, pruner=pruner)
 
-    # ─── Optymalizacja ───
-    study.optimize(
-        objective,
-        n_trials=n_trials,
-        timeout=timeout,
-        show_progress_bar=False,
-        gc_after_trial=True,
-    )
+        # ── Zgodność konfiguracji ──
+        stored = study.user_attrs.get("config")
+        if stored is None and study.trials:
+            raise RuntimeError(
+                f"Badanie '{name}' ma {len(study.trials)} prób, ale nie ma zapisanej konfiguracji "
+                f"(utworzone starszą wersją kodu). Użyj innej nazwy albo usuń badanie z {storage_path}."
+            )
+        if stored is not None and stored != config:
+            diff = sorted(k for k in set(stored) | set(config) if stored.get(k) != config.get(k))
+            raise RuntimeError(
+                f"Badanie '{name}' ma inną konfigurację niż bieżący tuning (różnice: {diff}). "
+                f"Próby nie zostaną wymieszane — zmień nazwę badania albo usuń je z {storage_path}."
+            )
+        if stored is None:
+            study.set_user_attr("config", config)
+        study.set_user_attr("n_trials_target", int(n_trials))
+        study.set_user_attr("timeout_s", None if timeout is None else float(timeout))
 
-    tune_logger.info("=== Tuning zakończony ===")
-    tune_logger.info(f"Best QWK:    {study.best_value:.4f}")
-    tune_logger.info(f"Best params: {study.best_params}")
-    tune_logger.info(f"Trials:      {len(study.trials)}")
+        n_before = len(study.trials)          # ponowienia osieroconych prób liczą się do tej sesji
+        if lock is not None:
+            _fail_orphaned_trials(study, retry, tune_logger)
 
-    # Zapisz historię tuningu jako CSV
-    history_csv = TRAINING_LOGS_DIR / f"{model_name}_tuning" / f"{run_id}_trials.csv"
-    history_csv.parent.mkdir(parents=True, exist_ok=True)
-    study.trials_dataframe().to_csv(history_csv, index=False)
-    tune_logger.info(f"Historia trials zapisana: {history_csv}")
+        # ── Budżet: brakujące próby i czas ──
+        n_done = len(study.get_trials(deepcopy=False, states=FINISHED_STATES))
+        remaining = max(0, int(n_trials) - n_done)
+        elapsed_before = float(study.user_attrs.get("elapsed_s", 0.0) or 0.0)
+        time_left = None if timeout is None else max(0.0, float(timeout) - elapsed_before)
+        if n_done:
+            tune_logger.info(f"Wznowienie: {n_done} ukończonych prób, {elapsed_before / 60:.1f} min — "
+                             f"zostało {remaining} prób"
+                             + ("" if time_left is None else f", {time_left / 60:.1f} min"))
 
-    return {
-        "best_params": study.best_params,
-        "best_value": study.best_value,
-        "n_trials": len(study.trials),
-        "study_name": study_name,
-        "log_path": str(log_path),
-        "history_csv": str(history_csv),
-    }
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   # ExperimentalWarning (multivariate/group w starszej optunie)
+            # Ziarno zależne od liczby prób w badaniu: wznowienie nie powtarza losowych prób startowych
+            study.sampler = optuna.samplers.TPESampler(
+                seed=RANDOM_SEED + len(study.trials), multivariate=True, group=True,
+                n_startup_trials=n_startup,
+            )
+
+        objective = _make_objective(
+            model_name=model_name, X=X, y=y, folds=folds, metric=metric, feature_set=feature_set,
+            sample_weight_strategy=sample_weight_strategy, fixed=fixed, n_final=n_final,
+            tune_logger=tune_logger,
+        )
+        fail_stopper = _StopAfterConsecutiveFails(OPTUNA_MAX_CONSECUTIVE_FAILS)
+        elapsed = _ElapsedTracker(elapsed_before)
+        session_start = time.time()
+        timed_out = False
+        if remaining > 0 and (time_left is None or time_left > 0):
+            study.optimize(
+                objective,
+                # Bezpiecznik liczby podejść; właściwy limit to MaxTrialsCallback (ukończone próby)
+                n_trials=3 * remaining + OPTUNA_MAX_CONSECUTIVE_FAILS,
+                timeout=time_left,
+                gc_after_trial=True,
+                catch=(Exception,),
+                callbacks=[
+                    optuna.study.MaxTrialsCallback(int(n_trials), states=FINISHED_STATES),
+                    elapsed, fail_stopper,
+                ],
+            )
+            # Czas ścienny sesji (z narzutem próbkowania) — limit czasu Optuny liczy właśnie go
+            session_wall = time.time() - session_start
+            timed_out = time_left is not None and session_wall >= time_left
+            study.set_user_attr("elapsed_s", round(max(elapsed.total, elapsed_before + session_wall), 1))
+        n_session = len(study.trials) - n_before
+
+        # ── Podsumowanie ──
+        trials = study.get_trials(deepcopy=False)
+        counts = {state: sum(t.state == state for t in trials)
+                  for state in (TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL)}
+        n_complete, n_pruned, n_fail = (counts[TrialState.COMPLETE], counts[TrialState.PRUNED],
+                                        counts[TrialState.FAIL])
+        n_finished = n_complete + n_pruned
+        elapsed_total = float(study.user_attrs.get("elapsed_s", elapsed.total) or 0.0)
+        if fail_stopper.triggered:
+            stopped_reason = "consecutive_failures"
+            tune_logger.error(f"{OPTUNA_MAX_CONSECUTIVE_FAILS} prób z rzędu zakończyło się błędem — "
+                              f"przerywam badanie (szczegóły błędów w logu i w user_attrs prób)")
+        elif n_finished >= n_trials:
+            stopped_reason = "n_trials"
+        elif timed_out or (timeout is not None and elapsed_total >= timeout - 1e-6):
+            stopped_reason = "timeout"
+        else:
+            stopped_reason = "max_attempts"
+
+        if n_complete == 0:
+            errors = [t.user_attrs.get("error") for t in trials if t.state == TrialState.FAIL]
+            last_error = next((e for e in reversed(errors) if e), None)
+            raise RuntimeError(
+                f"Optuna ({model_name}): brak ukończonej próby w badaniu '{name}' "
+                f"(przerwane: {n_pruned}, błędy: {n_fail})"
+                + (f"; ostatni błąd: {last_error}" if last_error else "")
+            )
+
+        best = study.best_trial
+        best_iters = [b for b in (best.user_attrs.get("best_iter") or []) if b is not None]
+        cap = best.user_attrs.get("iteration_cap")
+        hit_cap = bool(cap and best_iters and max(best_iters) >= ITERATION_CAP_WARN_FRACTION * cap)
+        if hit_cap:
+            tune_logger.warning(f"Najlepsza próba: najlepsza iteracja {max(best_iters)} ≥ "
+                                f"{ITERATION_CAP_WARN_FRACTION:.0%} limitu {cap} — limit iteracji zbyt niski")
+        best_value_std = best.user_attrs.get("cv_std")
+        tune_logger.info(f"Najlepszy {metric}: {best.value:.5f}"
+                         + (f" (±{best_value_std:.5f})" if best_value_std is not None else "")
+                         + f" — próba {best.number}")
+        tune_logger.info(f"Najlepsze parametry: {best.params}")
+        tune_logger.info(f"Próby: ukończone {n_complete}, przerwane {n_pruned}, błędy {n_fail} | "
+                         f"łączny czas {elapsed_total / 60:.1f} min | koniec: {stopped_reason}")
+
+        history_csv = TRAINING_LOGS_DIR / f"{model_name}_tuning" / f"{run_id}_trials.csv"
+        try:
+            history_csv.parent.mkdir(parents=True, exist_ok=True)
+            study.trials_dataframe().to_csv(history_csv, index=False, encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001 — historia to tylko diagnostyka
+            tune_logger.warning(f"Nie zapisano historii prób: {exc}")
+
+        summary_attrs = ("qwk_argmax", "qwk_cost", "expected_cost_cost", "undertriage_cost",
+                         "esi1_recall_cost", "actual_device", "device_fallback", "fold_scores")
+        result: dict[str, Any] = {
+            "study_name": name,
+            "metric": metric,
+            "direction": direction,
+            "best_params": dict(best.params),
+            "best_value": float(best.value),
+            "best_value_std": best_value_std,
+            "best_trial": int(best.number),
+            "best_trial_attrs": {k: best.user_attrs.get(k) for k in summary_attrs},
+            "best_iter": best_iters or None,
+            "iteration_cap": cap,
+            "hit_cap": hit_cap,
+            "n_trials": n_finished,
+            "n_trials_target": int(n_trials),
+            "n_complete": n_complete,
+            "n_pruned": n_pruned,
+            "n_fail": n_fail,
+            "n_trials_session": n_session,
+            "n_startup_trials": n_startup,
+            "n_rows": int(len(X)),
+            "n_folds": int(n_folds),
+            "n_fold_train": n_fold_train,
+            "n_final_fit": n_final,
+            "timeout_s": None if timeout is None else float(timeout),
+            "elapsed_s": round(elapsed_total, 1),
+            "stopped_reason": stopped_reason,
+            "budget_exhausted": bool(n_finished >= n_trials
+                                     or (timeout is not None and elapsed_total >= timeout - 1e-6)),
+            "search_space_version": int(SEARCH_SPACE_VERSION[model_name]),
+            "fixed_params": fixed,
+            "config": config,
+            "storage": None if storage_path is None else str(storage_path),
+            "log_path": str(log_path),
+            "history_csv": str(history_csv),
+            "class_weight_keys": [f"cw_{c.lower()}" for c in CLASS_NAMES],
+            "best_json": None,
+        }
+        if storage_dir is not None:
+            best_json = storage_dir / f"{_safe_file_stem(name)}.best.json"
+            payload = {**result, "best_json": str(best_json),
+                       "written_at": datetime.now().isoformat(timespec="seconds")}
+            write_json_atomic(best_json, payload)
+            result["best_json"] = str(best_json)
+            tune_logger.info(f"Wynik tuningu: {best_json}")
+        return result
+    finally:
+        if storage is not None:
+            # Zamknij połączenia SQLite (Windows blokuje otwarty plik bazy)
+            try:
+                storage.remove_session()
+                storage.engine.dispose()
+            except Exception:  # noqa: BLE001 — sprzątanie nie może przykryć właściwego błędu
+                pass
+        if lock is not None:
+            lock.release()
+        close_training_logger(tune_logger)
+
+
+def _make_objective(
+    *,
+    model_name: str,
+    X: pd.DataFrame,
+    y: np.ndarray,
+    folds: list[tuple[np.ndarray, np.ndarray]],
+    metric: str,
+    feature_set: str,
+    sample_weight_strategy: str,
+    fixed: dict[str, Any],
+    n_final: int,
+    tune_logger,
+) -> Callable[[optuna.Trial], float]:
+    """Funkcja celu Optuny (zamknięcie na danych i foldach)."""
+    suggest = SUGGEST_FUNCTIONS[model_name]
+    weighted_score = metric == "logloss" and sample_weight_strategy != "none"
+    state = {"parallel": model_name == "ebm"}
+    n_folds = len(folds)
+
+    def fold_inputs(tr: np.ndarray, va: np.ndarray, class_weights: dict[int, float] | None):
+        y_tr = y[tr]
+        w_tr = None
+        if class_weights is not None or sample_weight_strategy != "none":
+            w_tr = compute_sample_weights(y_tr, strategy=sample_weight_strategy, class_weights=class_weights)
+        w_va = compute_sample_weights(y[va], strategy=sample_weight_strategy) if weighted_score else None
+        return y_tr, w_tr, w_va
+
+    def evaluate(trial: optuna.Trial, params: dict[str, Any], class_weights: dict[int, float] | None) -> float:
+        scores: list[float] = []
+        iters: list[int | None] = []
+        devices: list[str] = []
+        fallback: str | None = None
+        oof_y: list[np.ndarray] = []
+        oof_p: list[np.ndarray] = []
+        cap: int | None = None
+
+        def record(i: int, va: np.ndarray, proba: np.ndarray, info: dict, w_va) -> None:
+            nonlocal fallback, cap
+            scores.append(_score(metric, y[va], proba, w_va))
+            iters.append(info.get("best_iteration"))
+            devices.append(str(info.get("actual_device")))
+            fallback = fallback or info.get("device_fallback")
+            cap = info.get("iteration_cap") or cap
+            oof_y.append(y[va])
+            oof_p.append(proba)
+            trial.set_user_attr("fold_scores", [round(s, 6) for s in scores])
+            trial.set_user_attr("best_iter", iters)
+            trial.set_user_attr("n_fold_train", info.get("n_train"))
+
+        n_workers, threads = _ebm_fold_workers({**EBM_DEFAULT_PARAMS, **params}, n_folds) \
+            if model_name == "ebm" else (1, 0)
+        results = None
+        if state["parallel"] and n_workers >= 2:
+            # EBM: wszystkie foldy naraz (bez przerywania po foldzie)
+            jobs, w_vas = [], []
+            for tr, va in folds:
+                y_tr, w_tr, w_va = fold_inputs(tr, va, class_weights)
+                jobs.append((X.iloc[tr], y_tr, X.iloc[va], w_tr))
+                w_vas.append(w_va)
+            try:
+                results = _run_folds_parallel(model_name, {**params, "n_jobs": threads}, jobs, n_workers)
+            except _parallel_infra_errors() as exc:
+                state["parallel"] = False
+                tune_logger.warning(f"EBM: równoległe foldy nie działają ({type(exc).__name__}: {exc}) — "
+                                    f"dalej foldy sekwencyjnie")
+                results = None
+            if results is not None:
+                for i, ((_, va), (proba, info), w_va) in enumerate(zip(folds, results, w_vas, strict=True)):
+                    record(i, va, proba, info, w_va)
+
+        if results is None:
+            for i, (tr, va) in enumerate(folds):
+                y_tr, w_tr, w_va = fold_inputs(tr, va, class_weights)
+                proba, info = fit_predict_fold(model_name, params, X.iloc[tr], y_tr, X.iloc[va], w_tr)
+                record(i, va, proba, info, w_va)
+
+                if model_name == "random_forest" and i == 0:
+                    _rf_size_guard(trial, info, n_final, tune_logger)
+
+                mean_so_far = float(np.mean(scores))
+                trial.report(mean_so_far, step=i)
+                # Po ostatnim foldzie nie przerywamy — w pełni oceniona próba zachowuje wynik
+                if i < n_folds - 1 and trial.should_prune():
+                    tune_logger.info(f"Trial {trial.number:>4}: przerwany po foldzie {i + 1} "
+                                     f"({metric}={mean_so_far:.5f})")
+                    raise optuna.TrialPruned()
+
+        value = float(np.mean(scores))
+        std = float(np.std(scores))
+        trial.set_user_attr("cv_std", round(std, 6))
+        trial.set_user_attr("actual_device", ",".join(sorted(set(devices))))
+        trial.set_user_attr("iteration_cap", cap)
+        if fallback:
+            trial.set_user_attr("device_fallback", str(fallback)[:300])
+        for key, val in _oof_summary(np.concatenate(oof_y), np.vstack(oof_p)).items():
+            trial.set_user_attr(key, val)
+        iters_txt = "" if not any(b is not None for b in iters) else f" | iteracje {iters}"
+        tune_logger.info(f"Trial {trial.number:>4}: {metric}={value:.5f} (±{std:.5f}){iters_txt} {params}")
+        return value
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {**fixed, **suggest(trial, feature_set)}
+        class_weights = _suggest_class_weights(trial) if metric == "qwk" else None
+        try:
+            return evaluate(trial, params, class_weights)
+        except optuna.TrialPruned:
+            raise
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            trial.set_user_attr("error", message[:500])
+            tune_logger.warning(f"Trial {trial.number:>4}: BŁĄD — {message[:300]}")
+            raise
+
+    return objective
+
+
+def _rf_size_guard(trial: optuna.Trial, info: dict, n_final: int, tune_logger) -> None:
+    """Przerywa próbę RF, której finalny model (500 drzew na pełnych danych) byłby za duży."""
+    nodes = float(info.get("nodes_per_tree") or 0.0)
+    n_train = max(int(info.get("n_train") or 1), 1)
+    n_trees = int(RF_DEFAULT_PARAMS.get("n_estimators") or 500)
+    projected = nodes * (n_final / n_train) * n_trees * _RF_BYTES_PER_NODE
+    trial.set_user_attr("rf_projected_bytes", float(projected))
+    if projected > TUNE_RF_MAX_MODEL_BYTES:
+        trial.set_user_attr("pruned_size", float(projected))
+        tune_logger.info(f"Trial {trial.number:>4}: przerwany — finalny RF miałby ~{projected / 1e9:.1f} GB "
+                         f"(limit {TUNE_RF_MAX_MODEL_BYTES / 1e9:.1f} GB)")
+        raise optuna.TrialPruned()
+
+
+__all__ = [
+    "OPTUNA_STORAGE_DIR",
+    "SEARCH_DIMENSIONS",
+    "SUGGEST_FUNCTIONS",
+    "StudyLock",
+    "build_study_name",
+    "data_fingerprint",
+    "filter_features_by_importance_1fold",
+    "fit_predict_fold",
+    "n_startup_trials",
+    "tune_model",
+    "write_json_atomic",
+]
