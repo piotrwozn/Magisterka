@@ -211,7 +211,8 @@ def main(argv: list[str] | None = None) -> int:
     print("\n=== Punkt odniesienia: równowagowa średnia modeli (VAL) ===")
     print(baseline.round(4).to_string(index=False))
     if ci_all is not None:
-        print(f"\n=== 95% przedziały ufności na VAL (bootstrap {args.bootstrap}×, stratyfikowany po ESI) ===")
+        print(f"\n=== 95% przedziały ufności na VAL (QWK: bootstrap {args.bootstrap}×, stratyfikowany po ESI; "
+              f"undertriage: Clopper–Pearson z k/n) ===")
         print(ci_all.to_string(index=False))
         if ci_vc is not None:
             print("\n--- podgrupa vc ---")
@@ -242,9 +243,10 @@ def main(argv: list[str] | None = None) -> int:
         lines += [
             f"## 95% przedziały ufności na VAL (bootstrap {args.bootstrap}×)",
             "",
-            "Bootstrap percentylowy, losowanie osobno w każdej klasie ESI; te same losowania dla wszystkich "
-            "modeli. Nakładające się przedziały NIE dowodzą braku różnicy — do porównania dwóch modeli "
-            "służy sparowany bootstrap (`src.evaluation.statistics.paired_bootstrap_diff`, raport 08).",
+            "QWK: bootstrap percentylowy, losowanie osobno w każdej klasie ESI; te same losowania dla "
+            "wszystkich modeli. Undertriage (odsetek pacjentów): dokładny przedział Clopper–Pearsona "
+            "z liczebności k/n. Nakładające się przedziały NIE dowodzą braku różnicy — do porównania dwóch "
+            "modeli służy sparowany bootstrap (`src.evaluation.statistics.paired_bootstrap_diff`, raport 08).",
             "",
             _md_table(ci_all),
             "",

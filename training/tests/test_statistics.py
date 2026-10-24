@@ -3,8 +3,9 @@ Testy statystyki na zapisanych predykcjach (`src.evaluation.statistics`) i nowyc
 (`plot_reliability`, `plot_metric_ci`).
 
 Wszystko na syntetycznych prawdopodobieństwach: zgodność z `full_evaluation`, wagi bootstrapu
-= jawne losowanie, pokrycie przedziałów w symulacji, warstwy ESI, porównania parami,
-ECE i temperatura.
+= jawne losowanie, pokrycie przedziałów w symulacji (także rzadkich zdarzeń — przedział
+Clopper–Pearsona), warstwy ESI, porównania parami (spójność p z przedziałem przy remisach w 0),
+odrzucanie NaN, ECE i temperatura.
 """
 
 from __future__ import annotations
@@ -18,7 +19,9 @@ from src.ensemble import apply_temperature, evaluate
 from src.evaluation.statistics import (
     CI_COLUMNS,
     DEFAULT_CI_METRICS,
+    PROPORTION_METRICS,
     _AucPrep,
+    _paired_summary,
     _Prepared,
     bootstrap_auc,
     bootstrap_ci,
@@ -26,7 +29,9 @@ from src.evaluation.statistics import (
     bootstrap_samples,
     calibrate_on_val,
     calibration_summary,
+    check_proba,
     ci_to_dict,
+    clopper_pearson,
     crossfit_temperature,
     ece_classwise,
     ece_consistency,
@@ -264,17 +269,147 @@ class TestPaired:
         assert set(res.ci("c", "argmax")["metric"]) == {"quadratic_weighted_kappa", "log_loss"}
 
     def test_p_value_consistent_with_ci(self):
-        """Odsetki (dyskretne Δ z remisami w 0): przedział bez zera ⇔ p < alpha (z dokładnością do brzegu)."""
+        """Odsetki (dyskretne Δ z remisami w 0): przedział bez zera ⇔ p < alpha ⇔ wniosek A/B — dokładnie."""
         y, good = noisy_model(3000, quality=2.0, seed=14)
         _, other = noisy_model(3000, quality=1.9, seed=15)
-        table = paired_bootstrap_diffs(y, good, other, ["undertriage_rate", "critical_miss_rate"],
+        table = paired_bootstrap_diffs(y, good, other, ["undertriage_rate", "critical_miss_rate", "accuracy"],
                                        ["argmax", "cost"], n_boot=400)
         for row in table.itertuples():
             excludes = not (row.ci_low <= 0 <= row.ci_high)
-            if excludes:
-                assert row.p_two_sided <= 0.06
+            assert excludes == (row.p_two_sided < 0.05), row
+            assert excludes == (row.better != "brak istotnej różnicy"), row
+
+    def test_ties_at_zero_p_not_below_alpha(self):
+        """10 losowań Δ < 0, 20 z Δ = 0, 970 z Δ > 0: przedział zawiera 0 → p ≥ alpha (nie 0,04)."""
+        d = np.random.default_rng(0).permutation(np.r_[np.full(10, -0.01), np.zeros(20), np.full(970, 0.01)])
+        out = _paired_summary(0.01, d, 0.05, "undertriage_rate")
+        assert out["ci_low"] <= 0.0 <= out["ci_high"]
+        assert out["p_two_sided"] >= 0.05
+        assert out["better"] == "brak istotnej różnicy"
+        clear = np.r_[np.full(5, -0.01), np.zeros(10), np.full(985, 0.01)]     # 15 ≤ 0 < c = 25
+        out = _paired_summary(0.01, clear, 0.05, "quadratic_weighted_kappa")
+        assert out["ci_low"] > 0 and out["p_two_sided"] < 0.05 and out["better"] == "A"
+
+    @pytest.mark.parametrize("n_boot", [200, 401, 1000, 1999])
+    def test_p_and_verdict_from_same_tails(self, n_boot):
+        """Losowe dyskretne rozkłady Δ z remisami: przedział bez zera ⇔ p < alpha ⇔ wniosek A/B."""
+        rng = np.random.default_rng(n_boot)
+        for _ in range(300):
+            shift = rng.integers(-4, 5)
+            d = (rng.integers(-3, 4, size=n_boot) + shift * rng.random()).round()
+            d[rng.random(n_boot) < rng.random() * 0.3] = np.nan          # część losowań nieokreślona
+            for alpha in (0.05, 0.1):
+                out = _paired_summary(float(np.nanmean(d)), d, alpha, "log_loss")
+                excludes = not (out["ci_low"] <= 0 <= out["ci_high"])
+                assert excludes == (out["p_two_sided"] < alpha), (out, alpha)
+                assert excludes == (out["better"] != "brak istotnej różnicy"), out
+
+
+# ─────────────────────────────────────────
+# Odsetki rzadkich zdarzeń: przedział Clopper–Pearsona z k/n
+# ─────────────────────────────────────────
+def _rare_event_data(n_esi1: int, seed: int, p_miss: float = 0.02, p_hit: float = 0.10,
+                     n_other: int = 62) -> tuple[np.ndarray, np.ndarray]:
+    """ESI 1: z prawd. p_miss decyzja ESI 4 (krytyczne pominięcie), p_hit — ESI 1, reszta — ESI 2."""
+    rng = np.random.default_rng(seed)
+    y = np.r_[np.zeros(n_esi1, dtype=int), rng.choice([1, 2, 3, 4], size=n_other)]
+    u = rng.random(n_esi1)
+    pred = y.copy()
+    pred[:n_esi1] = np.where(u < p_miss, 3, np.where(u < p_miss + p_hit, 0, 1))
+    proba = np.full((len(y), N_CLASSES), 0.01)
+    proba[np.arange(len(y)), pred] = 0.96
+    return y, proba
+
+
+class TestRareEventIntervals:
+    def test_clopper_pearson_matches_scipy(self):
+        from scipy.stats import binomtest
+
+        for k, n in ((0, 38), (1, 38), (5, 10), (37, 38), (38, 38), (120, 5000)):
+            ref = binomtest(k, n).proportion_ci(confidence_level=0.95, method="exact")
+            low, high = clopper_pearson(k, n)
+            assert low == pytest.approx(ref.low, abs=1e-9) and high == pytest.approx(ref.high, abs=1e-9)
+        assert clopper_pearson(0, 38)[1] == pytest.approx(0.0925, abs=5e-4)
+        assert all(np.isnan(clopper_pearson(0, 0)))
+        with pytest.raises(ValueError):
+            clopper_pearson(5, 3)
+
+    def test_zero_events_upper_bound_positive(self):
+        """0 krytycznych pominięć na 38 ESI 1: górna granica ~9,3%, nie [0; 0] jak z bootstrapu."""
+        y, proba = _rare_event_data(38, seed=0, p_miss=0.0, p_hit=1.0)
+        metrics = ["critical_miss_rate", "recall_esi1", "undertriage_rate", "quadratic_weighted_kappa"]
+        df = bootstrap_ci(y, proba, metrics, n_boot=100).set_index("metric")
+        miss = df.loc["critical_miss_rate"]
+        assert miss["value"] == 0.0 and miss["ci_low"] == 0.0
+        assert miss["ci_high"] == pytest.approx(clopper_pearson(0, 38)[1]) and miss["ci_high"] > 0.09
+        assert (miss["k"], miss["n"], miss["ci_method"]) == (0, 38, "clopper-pearson")
+        recall = df.loc["recall_esi1"]                                    # 38/38 → dolna granica < 1
+        assert recall["value"] == 1.0 and recall["ci_high"] == 1.0 and recall["ci_low"] < 0.91
+        qwk = df.loc["quadratic_weighted_kappa"]
+        assert qwk["ci_method"] == "bootstrap-percentile" and np.isnan(qwk["k"])
+        old = bootstrap_ci(y, proba, ["critical_miss_rate"], n_boot=100, proportion_ci="bootstrap")
+        assert old.loc[0, "ci_high"] == 0.0 and old.loc[0, "ci_method"] == "bootstrap-percentile"
+        out = ci_to_dict(df.reset_index())
+        assert out["critical_miss_rate"]["k"] == 0 and out["critical_miss_rate"]["n"] == 38
+        assert out["quadratic_weighted_kappa"]["k"] is None
+
+    def test_rare_event_coverage(self):
+        """Prawdziwe 2% krytycznych pominięć i 10% czułości ESI 1 przy 38 ESI 1: pokrycie ≥ ~95%."""
+        reps = 300
+        hits = {"critical_miss_rate": 0, "recall_esi1": 0}
+        boot_hits = 0
+        truth = {"critical_miss_rate": 0.02, "recall_esi1": 0.10}
+        for r in range(reps):
+            y, proba = _rare_event_data(38, seed=1000 + r)
+            df = bootstrap_ci(y, proba, list(truth), n_boot=10, seed=r).set_index("metric")
+            for m, t in truth.items():
+                hits[m] += int(df.loc[m, "ci_low"] <= t <= df.loc[m, "ci_high"])
+            old = bootstrap_ci(y, proba, ["critical_miss_rate"], n_boot=200, seed=r, proportion_ci="bootstrap")
+            boot_hits += int(old.loc[0, "ci_low"] <= 0.02 <= old.loc[0, "ci_high"])
+        for m, h in hits.items():
+            assert h / reps >= 0.92, (m, h / reps)
+        assert boot_hits / reps < 0.8                       # percentyle bootstrapu: wyraźnie za wąskie
+
+    def test_counts_for_all_proportions(self):
+        y, p = noisy_model(2000, seed=30)
+        df = bootstrap_ci(y, p, rule="cost", n_boot=20).set_index("metric")
+        for m in DEFAULT_CI_METRICS:
+            row = df.loc[m]
+            if m in PROPORTION_METRICS:
+                assert row["ci_method"] == "clopper-pearson"
+                assert row["value"] == pytest.approx(row["k"] / row["n"])
+                assert row["ci_low"] <= row["value"] <= row["ci_high"]
             else:
-                assert row.p_two_sided >= 0.04
+                assert row["ci_method"] == "bootstrap-percentile"
+        assert df.loc["accuracy", "n"] == len(y)
+        assert df.loc["critical_miss_rate", "n"] == int((y == 0).sum())
+        with pytest.raises(ValueError, match="proportion_ci"):
+            bootstrap_ci(y, p, n_boot=5, proportion_ci="wilson")
+
+
+# ─────────────────────────────────────────
+# Niepoprawne prawdopodobieństwa
+# ─────────────────────────────────────────
+class TestInvalidProba:
+    @pytest.mark.parametrize("bad_row", [[np.nan] * 5, [0.0] * 5, [0.5, np.inf, 0.1, 0.1, 0.1],
+                                         [0.6, -0.1, 0.2, 0.2, 0.1]])
+    def test_rejected_everywhere(self, bad_row):
+        y, p = noisy_model(100, seed=31)
+        p = p.copy()
+        p[7] = bad_row
+        for call in (lambda: bootstrap_ci(y, p, n_boot=5), lambda: point_metrics(y, p),
+                     lambda: ece_top_label(y, p), lambda: ece_classwise(y, p),
+                     lambda: reliability_table(y, p), lambda: calibration_summary(y, p),
+                     lambda: paired_bootstrap_diff(y, p, noisy_model(100, seed=32)[1], n_boot=5)):
+            with pytest.raises(ValueError, match="1 z 100 wierszy"):
+                call()
+
+    def test_valid_rows_normalized(self):
+        p = np.array([[2.0, 1.0, 1.0, 0.0, 0.0], [0.2, 0.2, 0.2, 0.2, 0.2]])
+        np.testing.assert_allclose(check_proba(p).sum(axis=1), 1.0)
+        assert check_proba(p)[0, 0] == pytest.approx(0.5)
+        with pytest.raises(ValueError, match="macierzy"):
+            check_proba(np.ones(5))
 
 
 class TestBootstrapAuc:

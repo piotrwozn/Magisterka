@@ -841,8 +841,12 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
         f"(bootstrap percentylowy: {n_boot} losowań pacjentów ze zwracaniem, osobno w każdej klasie ESI, "
         f"więc rzadkie ESI 1 jest w każdym losowaniu). Przedział pokazuje, o ile wynik mógłby się różnić na "
         f"innej próbce pacjentów z tej samej populacji; nie obejmuje zmienności samego treningu.",
-        "- Odsetki pacjentów (niedotriażowanie, czułość…) w procentach; QWK, AUC, log loss, Brier, ECE "
-        "i koszt jako liczby. ↑ — im więcej, tym lepiej; ↓ — im mniej, tym lepiej.",
+        "- Odsetki pacjentów (trafność, niedotriażowanie, czułość…) w procentach, z **dokładnym przedziałem "
+        "Clopper–Pearsona** z liczebności, a nie z bootstrapu. Przy rzadkich zdarzeniach bootstrap daje "
+        "przedział za wąski (0 zdarzeń → [0; 0]); Clopper–Pearson przy 0/38 daje [0; 9,3%]. Przy metrykach "
+        "ESI podano też liczebność **k/n** (np. `(0/38)` = 0 krytycznych pominięć na 38 pacjentów ESI 1). "
+        "QWK, AUC, log loss, Brier, ECE i koszt jako liczby (bootstrap). ↑ — im więcej, tym lepiej; "
+        "↓ — im mniej, tym lepiej.",
         "- **Porównanie modeli**: nakładające się przedziały w tabeli 2 NIE oznaczają braku różnicy. "
         "O różnicy rozstrzyga tabela 3 (sparowany bootstrap: oba modele na tych samych losowaniach).",
         "- **ECE** (expected calibration error) — średnia różnica między deklarowaną pewnością modelu "
@@ -855,8 +859,8 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
         "parami na tych samych pacjentach.",
         "- **Reguły**: *argmax* — najbardziej prawdopodobny poziom; *koszt* — poziom o najmniejszym "
         "oczekiwanym koszcie (niedotriażowanie 3× droższe, koszt rośnie z kwadratem odległości).",
-        "- ESI 1 jest rzadkie — przedziały czułości ESI 1 i krytycznych pominięć są szerokie; "
-        "„—” oznacza metrykę nieokreśloną (np. brak ESI 1 w podgrupie).",
+        "- ESI 1 jest rzadkie — przedziały czułości ESI 1 i krytycznych pominięć są szerokie (nawet przy "
+        "0 zdarzeń górna granica jest > 0); „—” oznacza metrykę nieokreśloną (np. brak ESI 1 w podgrupie).",
         "",
     ]
 

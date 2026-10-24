@@ -12,7 +12,8 @@ Wykonuje:
     5. Kalibrację (zawsze): ECE top-label i per poziom ESI, MCE, pewność − trafność
        (całość i podgrupa vc) + wykres niezawodności `reliability_<split>.png`.
     6. Przedziały ufności 95% (bootstrap percentylowy stratyfikowany po ESI, `--bootstrap N`,
-       domyślnie 1000, 0 = wyłączone) dla obu reguł — całość i podgrupa vc.
+       domyślnie 1000, 0 = wyłączone; odsetki pacjentów — dokładny przedział Clopper–Pearsona
+       z liczebności k/n) dla obu reguł — całość i podgrupa vc.
     7. Wykresy: macierze pomyłek (całość i podgrupa vc), krzywe ROC, kalibracja, ważność cech.
     8. Zapis do runs/<run>/figures/ (wykresy + metrics_<split>.json z kluczami "metrics",
        "subgroups", "calibration" i "ci"); dla modelu spoza runs/ — do results/figures/<model>_eval_<czas>/.
@@ -85,6 +86,8 @@ CI_SUMMARY_METRICS = [
     "quadratic_weighted_kappa", "undertriage_rate", "critical_miss_rate", "overtriage_rate",
     "recall_esi1", "expected_cost", "auc_macro", "log_loss", "ece",
 ]
+# Odsetki rzadkich zdarzeń — w tabeli także liczebność k/n
+COUNT_METRICS = frozenset({"critical_miss_rate", "recall_esi1"})
 BOOTSTRAP_SEED = 42
 BOOTSTRAP_ALPHA = 0.05
 # Losowania „idealnie skalibrowanego” modelu — wartość odniesienia ECE (szum przy tej liczności)
@@ -285,19 +288,21 @@ def bootstrap_section(
     alpha: float = BOOTSTRAP_ALPHA,
 ) -> dict[str, Any] | None:
     """
-    95% przedziały ufności (bootstrap percentylowy, losowanie w każdej klasie ESI osobno) dla obu
-    reguł decyzyjnych — całość i podgrupa vc. n_boot ≤ 0 → None.
+    95% przedziały ufności (bootstrap percentylowy, losowanie w każdej klasie ESI osobno; odsetki
+    pacjentów — dokładny przedział Clopper–Pearsona z k/n) dla obu reguł decyzyjnych — całość
+    i podgrupa vc. n_boot ≤ 0 → None.
 
     Returns
     -------
-    {"n_boot", "alpha", "seed", "stratified", "method", "duration_s",
-     "all": {reguła: {metryka: {value, ci_low, ci_high, se, n_valid}}}, "vc": … | None}
+    {"n_boot", "alpha", "seed", "stratified", "method", "proportions", "duration_s",
+     "all": {reguła: {metryka: {value, ci_low, ci_high, se, n_valid, k, n, ci_method}}}, "vc": … | None}
     """
     if n_boot <= 0:
         return None
     start = time.perf_counter()
     out: dict[str, Any] = {"n_boot": int(n_boot), "alpha": alpha, "seed": seed, "stratified": True,
-                           "method": "percentile", "all": None, "vc": None}
+                           "method": "percentile", "proportions": "clopper-pearson (k/n)", "all": None,
+                           "vc": None}
     res = bootstrap_samples(y, {"model": proba}, DECISION_RULES, n_boot=n_boot, alpha=alpha, seed=seed)
     out["all"] = {rule: ci_to_dict(res.ci("model", rule)) for rule in DECISION_RULES}
     if vc_mask is not None and vc_mask.any():
@@ -313,7 +318,10 @@ def _ci_cell(ci: dict[str, Any] | None, rule: str, metric: str) -> str:
     row = ((ci or {}).get(rule) or {}).get(metric)
     if not row:
         return "—"
-    return format_ci(row["value"], row["ci_low"], row["ci_high"], digits=4)
+    text = format_ci(row["value"], row["ci_low"], row["ci_high"], digits=4)
+    if metric in COUNT_METRICS and row.get("k") is not None and row.get("n") is not None:
+        text += f" ({row['k']}/{row['n']})"
+    return text
 
 
 def print_ci_table(ci: dict[str, Any] | None, calibration: dict[str, Any] | None, split: str) -> None:
@@ -330,8 +338,9 @@ def print_ci_table(ci: dict[str, Any] | None, calibration: dict[str, Any] | None
     if not ci:
         return
     groups = [("all", "")] + ([("vc", "vc ")] if ci.get("vc") else [])
-    width = 26
-    print(f"\n=== {split.upper()}: 95% przedziały ufności (bootstrap {ci['n_boot']}×, stratyfikowany po ESI) ===")
+    width = 34
+    print(f"\n=== {split.upper()}: 95% przedziały ufności (bootstrap {ci['n_boot']}×, stratyfikowany po ESI; "
+          f"odsetki: Clopper–Pearson, (k/n) = zdarzenia / pacjenci) ===")
     decision = [m for m in CI_SUMMARY_METRICS if m not in PROBA_METRICS]
     header = " ".join(f"{prefix + rule:>{width}s}" for _, prefix in groups for rule in DECISION_RULES)
     print(f"{'metryka':26s} {header}")

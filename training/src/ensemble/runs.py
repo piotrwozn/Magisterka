@@ -214,9 +214,11 @@ def aligned_probas(
                     f"wiersz po wierszu")
 
     frames: dict[str, pd.DataFrame] = {}
+    run_names: dict[str, str] = {}
     for run in runs:
         key = run.model if sum(r.model == run.model for r in runs) == 1 else run.name
         frames[key] = run.predictions(split).set_index("row_id").sort_index()
+        run_names[key] = run.name
     ids = [set(df.index) for df in frames.values()]
     common = set.intersection(*ids)
     if any(len(i) != len(common) for i in ids):
@@ -230,7 +232,7 @@ def aligned_probas(
         if not np.array_equal(df["target"].to_numpy(), y):
             raise ValueError(f"Run '{key}' ma inne etykiety niż '{first_key}' dla tych samych row_id — "
                              f"runy pochodzą z różnych przygotowań danych")
-    probas = {k: _normalize(_checked_proba(df, k, split)) for k, df in frames.items()}
+    probas = {k: _normalize(_checked_proba(df, run_names[k], split)) for k, df in frames.items()}
     if not return_vc:
         return y, probas
     vc_mask = None
@@ -254,15 +256,16 @@ def aligned_meta(runs: list[Run], split: str = "val") -> pd.DataFrame:
     return df[[c for c in META_COLUMNS if c in df.columns]].copy()
 
 
-def _checked_proba(df: pd.DataFrame, key: str, split: str) -> np.ndarray:
+def _checked_proba(df: pd.DataFrame, run_name: str, split: str) -> np.ndarray:
     """p_esi1..p_esi5 runa; NaN / nieskończoność / wartości ujemne / zerowa suma wiersza → ValueError."""
     proba = df[PROBA_COLS].to_numpy(dtype=float)
     bad = ~np.isfinite(proba).all(axis=1) | (proba < 0).any(axis=1)
     bad |= ~(np.where(bad, 1.0, proba.sum(axis=1)) > 0)
     if bad.any():
         examples = ", ".join(str(i) for i in df.index[bad][:5])
-        raise ValueError(f"Run '{key}' ({split}): {int(bad.sum()):,} z {len(proba):,} wierszy ma prawdopodobieństwa "
-                         f"NaN / nieskończone / ujemne albo o zerowej sumie (row_id: {examples}) — popraw predykcje")
+        raise ValueError(f"Run '{run_name}' ({split}): {int(bad.sum()):,} z {len(proba):,} wierszy ma "
+                         f"prawdopodobieństwa NaN / nieskończone / ujemne albo o zerowej sumie "
+                         f"(row_id: {examples}) — popraw predykcje")
     return proba
 
 

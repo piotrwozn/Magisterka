@@ -459,8 +459,12 @@ python scripts/07_compare_runs.py --tag standard --bootstrap 1000    # 1. wybór
 python scripts/08_final_report.py --feature-set triage --tag standard --weights wagi.json --temperature fit
 ```
 
-`wagi.json` to zwykły plik, np. `{"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}` (może to być też
-`backend_ensemble_weights.json` z wcześniejszego raportu). Na Linuksie JSON można podać wprost:
+`wagi.json` to zwykły plik, np. `{"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}`. Może to być też
+`backend_ensemble_weights.json` z wcześniejszego raportu — wtedy skrypt przejmuje z niego również
+metodę łączenia (`method`), regułę dla backendu (`rule`) i to, czy jest temperatura. Opcja podana
+jawnie i sprzeczna z plikiem (np. `--method mean` przy `"method": "geometric"`) kończy się odmową.
+Samą wartość T skrypt zawsze dopasowuje na nowo na VAL i ostrzega, gdy wyszła inna niż w pliku.
+Na Linuksie JSON można podać wprost:
 `--weights '{"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}'`. W PowerShell lepiej użyć pliku,
 bo PowerShell potrafi zgubić cudzysłowy w JSON-ie. Skrót na Linuksie: `make final-report TAG=standard WEIGHTS='{…}'`.
 
@@ -470,8 +474,10 @@ bo PowerShell potrafi zgubić cudzysłowy w JSON-ie. Skrót na Linuksie: `make f
    i ewentualnie połączenia (`src.ensemble`, punkt 8). Zdecyduj o modelach, wagach, metodzie
    łączenia (`mean` / `geometric`), temperaturze (`fit` / `none`) i regule decyzyjnej.
 2. **Raz — TEST.** Uruchom `08_final_report.py` z tą recepturą. Skrypt na początku i na końcu
-   wypisuje ostrzeżenie, że test ocenia się raz. Jeśli dla tych samych runów istnieje już raport,
-   wylicza wcześniejsze raporty i zapisuje je w `recipe.json` (`previous_reports`).
+   wypisuje ostrzeżenie, że test ocenia się raz. Każde uruchomienie trafia do rejestru
+   `runs/final_reports.jsonl` (niezależnie od `--out`). Jeśli dla tych samych runów był już raport,
+   skrypt go wylicza (z informacją, czy receptura była ta sama) i zapisuje w `recipe.json`
+   (`previous_reports`).
 3. **Do pracy** bierzesz tabele z `report.md` (albo `tables/*.csv`) i wykresy z `figures/`.
    **Do backendu** kopiujesz `backend_ensemble_weights.json` jako `backend/models/ensemble_weights.json`
    (wagi, metoda, temperatura, reguła — format `backend/app/models/ensemble.py`).
@@ -500,12 +506,21 @@ Poza tym: `metrics.json` (wszystkie liczby, także porównania połączenia z ka
   pokazuje, jak bardzo. Liczymy go **bootstrapem**: 2000 razy losujemy pacjentów ze zwracaniem
   (osobno w każdej klasie ESI, więc rzadkie ESI 1 jest w każdym losowaniu), za każdym razem
   liczymy metrykę i bierzemy 2,5. i 97,5. percentyl. Przedział **nie** obejmuje zmienności samego
-  treningu (inne ziarno, inne hiperparametry). Dla ESI 1 (kilkaset wizyt na teście, w podgrupie
-  vc kilkadziesiąt) przedziały są szerokie i tak należy je opisać.
+  treningu (inne ziarno, inne hiperparametry).
+- **Odsetki pacjentów** (trafność, niedotriażowanie, przetriażowanie, krytyczne pominięcia,
+  czułość ESI 1 i ESI 1–2) mają **dokładny przedział Clopper–Pearsona** z liczebności, a nie
+  przedział z bootstrapu. Losowanie w klasach ESI ustala mianownik (np. liczbę pacjentów ESI 1), więc
+  bootstrap odsetka tylko powtarza zaobserwowaną proporcję: przy 0 zdarzeń daje „przedział” [0; 0],
+  a przy kilku zdarzeniach — za wąski. Clopper–Pearson przy 0 krytycznych pominięć na 38 pacjentów
+  ESI 1 daje [0; 9,3%] i tyle niepewności rzeczywiście jest. Dlatego przy metrykach ESI raport podaje
+  też liczebność, np. `0.0% [0.0; 9.3] (0/38)`. Dla ESI 1 (kilkaset wizyt na teście, w podgrupie vc
+  kilkadziesiąt, na oddziale czasem kilka) przedziały są szerokie i tak należy je opisać.
 - **Porównanie dwóch modeli.** Nakładające się przedziały w tabeli 2 **nie** oznaczają, że modele są
   równie dobre. O różnicy rozstrzyga sekcja 3: **sparowany bootstrap**, czyli oba modele oceniane
   na tych samych losowaniach pacjentów. Jeśli przedział Δ nie zawiera 0, różnica jest istotna.
-  `p` to dwustronna p-wartość z tego samego bootstrapu (najmniejsza możliwa to 1/liczba losowań).
+  `p` to dwustronna p-wartość z tego samego bootstrapu: 2 × odsetek losowań, w których Δ wypadła
+  po „drugiej” stronie zera (losowania z Δ dokładnie 0 liczą się do obu stron — ostrożnie). Jest
+  zgodna z przedziałem: przedział bez zera ⇔ p < 0,05. Najmniejsza możliwa p to 1/liczba losowań.
   Dla niedotriażowania i log loss **ujemna** Δ znaczy, że połączenie jest lepsze.
 - **ECE** (expected calibration error) mówi, czy prawdopodobieństwa „mówią prawdę”. Pacjentów
   dzielimy na grupy według pewności modelu (np. 70–77%) i porównujemy tę pewność z odsetkiem
@@ -530,9 +545,9 @@ Poza tym: `metrics.json` (wszystkie liczby, także porównania połączenia z ka
 | opcja | znaczenie |
 |---|---|
 | `--runs RUN …` albo `--feature-set FS --tag TAG [--models a,b]` | jawne runy albo najnowszy ukończony run każdego modelu (filtry jak w 07: `--include-samples`, `--include-untuned`, `--include-weighted`) |
-| `--weights JSON\|plik.json\|optimize\|equal` | wagi połączenia (domyślnie `equal`; `optimize` = minimalny log loss na VAL); model spoza wag ma wagę 0, ale w tabelach jest oceniany osobno |
-| `--method mean\|geometric` | średnia arytmetyczna albo geometryczna prawdopodobieństw |
-| `--temperature fit\|none` | temperatura połączenia dopasowana na VAL (domyślnie `fit`) |
+| `--weights JSON\|plik.json\|optimize\|equal` | wagi połączenia (domyślnie `equal`; `optimize` = minimalny log loss na VAL); model spoza wag ma wagę 0, ale w tabelach jest oceniany osobno; z pliku w formacie backendu przejmowane są też `method`, `rule` i (nie)obecność temperatury |
+| `--method mean\|geometric` | średnia arytmetyczna albo geometryczna prawdopodobieństw (domyślnie z pliku wag, inaczej `mean`) |
+| `--temperature fit\|none` | temperatura połączenia dopasowana na VAL (domyślnie z pliku wag, inaczej `fit`) |
 | `--rule argmax\|cost\|both` | reguły w raporcie (domyślnie obie); `--backend-rule` — reguła w pliku dla backendu (domyślnie `cost` przy `both`) |
 | `--bootstrap N` | liczba losowań (domyślnie 2000); `--alpha 0.05`, `--seed 42` |
 | `--decimal-comma` | przecinek dziesiętny w `report.md` (typografia polska) |
@@ -540,8 +555,10 @@ Poza tym: `metrics.json` (wszystkie liczby, także porównania połączenia z ka
 
 **Odmowa (kod wyjścia 2)** następuje, gdy runy pochodzą z różnych zestawów cech, wersji albo
 przygotowań danych, gdy ten sam model występuje dwa razy, gdy predykcje val/test mają różne wiersze
-lub etykiety (np. inne `--eval-sample`) albo gdy wagi są błędne (model spoza runów, waga ujemna,
-same zera).
+lub etykiety (np. inne `--eval-sample`), gdy w predykcjach są prawdopodobieństwa NaN / nieskończone /
+ujemne albo wiersz o zerowej sumie (komunikat podaje run i liczbę złych wierszy), gdy wagi są błędne
+(model spoza runów, waga ujemna, same zera) albo gdy jawna opcja (`--method`, `--temperature`,
+`--rule`, `--backend-rule`) jest sprzeczna z plikiem wag w formacie backendu.
 
 **Czas** (1 rdzeń CPU): bootstrap 1000 losowań × 56 tys. wierszy × wszystkie metryki, obie reguły
 to ~7 s na model i populację. Raport z 6 modelami i `--bootstrap 2000` trwa kilka minut.

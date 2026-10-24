@@ -321,6 +321,18 @@ class TestAlignedProbas:
         with pytest.raises(ValueError):
             aligned_meta([], "val")
 
+    @pytest.mark.parametrize("bad_row", [[np.nan] * 5, [0.0] * 5, [0.5, np.inf, 0.1, 0.1, 0.1],
+                                         [0.6, -0.1, 0.2, 0.2, 0.1]])
+    def test_invalid_probabilities_raise(self, tmp_path, bad_row):
+        """NaN / nieskończoność / ujemne / zerowa suma wiersza → ValueError z nazwą runa i liczbą wierszy."""
+        y = _true_labels()
+        p = _make_proba(y, 2.0, seed=5)
+        p[[3, 9]] = bad_row
+        write_run(tmp_path, "20260109_000200_ebm_triage", "ebm", {"val": p}, y)
+        run = load_run(tmp_path / "20260109_000200_ebm_triage")
+        with pytest.raises(ValueError, match=r"20260109_000200_ebm_triage.*2 z 300 wierszy"):
+            aligned_probas([run], "val")
+
     def test_different_data_versions_raise(self, runs_dir):
         y = _true_labels()
         old = write_run(runs_dir, "20260109_000100_ebm_triage", "ebm", {"val": _make_proba(y, 2.0, 9)}, y,
