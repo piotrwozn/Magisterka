@@ -45,6 +45,7 @@ STABILNE API (używają go testy CORE i ESI — zmiany tylko zgodne wstecz)
     do /api/show i /api/tags (domyślnie family "fake", parameter_size "1B", …).
 
     exam_oracle(answer_key, p_correct=…) — gotowa odpowiedź dla testów egzaminów (zob. niżej).
+    triage_responder(answer_key, skill=…) — „model” dla wszystkich części (egzaminy + esi + tools).
 
 Endpointy
     POST /api/chat    — nieznany model → 404 {"error": "model '…' not found"}; stream=true →
@@ -54,13 +55,16 @@ Endpointy
     GET  /api/tags    — {"models": [{name, model, digest, details}]}
 
 Uruchomienie samodzielne (ręczny test CLI): python -m tests.fake_ollama --models fake-a,fake-b
-[--exam-csv plik.csv] [--port 11500]  → wypisuje adres i działa do Ctrl+C.
+[--exam-csv plik.csv] [--port 11500]  → wypisuje adres i działa do Ctrl+C. Każdy model to
+triage_responder (kolejne modele coraz słabsze), więc przebieg `12_llm_bakeoff.py run --base-url …`
+przechodzi przez wszystkie trzy części bez prawdziwej Ollamy.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -431,6 +435,92 @@ def exam_oracle(answer_key: dict[str, str], p_correct: float = 0.8, p_correct_ab
     return respond
 
 
+_DECISION_RE = re.compile(r"Decyzja systemu: ESI (\d)")
+_RULE_RE = re.compile(r"Reguły bezpieczeństwa ESI: (?:rozważ )?ESI (\d)")
+
+
+def _tool_names(req: dict[str, Any]) -> list[str]:
+    return [str((t.get("function") or {}).get("name")) for t in req.get("tools") or [] if isinstance(t, dict)]
+
+
+def _users(req: dict[str, Any]) -> list[str]:
+    return [str(m.get("content", "")) for m in req.get("messages") or []
+            if isinstance(m, dict) and m.get("role") == "user"]
+
+
+def triage_responder(answer_key: dict[str, str], skill: float = 0.8, seed: int = 0,
+                     thinking: bool = False) -> Callable[[dict[str, Any]], Reply]:
+    """
+    „Model” do ręcznego przebiegu wszystkich części porównania (egzaminy + esi + tools).
+    skill ∈ [0, 1] steruje jakością: trafność egzaminów (exam_oracle), a w częściach esi/tools —
+    zgodność poziomu z decyzją, posłuszeństwo (narzędzie vs tekst), zmyślone pomiary i narzędzia,
+    sugestie eskalacji. Losowość deterministyczna: hash(seed, pierwsza wiadomość użytkownika).
+    """
+    exam = exam_oracle(answer_key, p_correct=skill, p_correct_abstain=max(0.0, skill - 0.15), seed=seed,
+                       thinking=thinking)
+
+    def unit(text: str, salt: str) -> float:
+        h = hashlib.sha256(f"{seed}|{salt}|{text}".encode("utf-8")).hexdigest()
+        return int(h[:8], 16) / 0xFFFFFFFF
+
+    def explanation(prompt: str, factor: str | None, extra: str = "") -> dict[str, Any]:
+        level = int(_DECISION_RE.search(prompt).group(1))
+        if unit(prompt, "level") > skill + 0.15:
+            level = min(5, level + 1)                                  # przekręcony poziom
+        hr = re.search(r"tętno (\d+)/min", prompt)
+        hr_val = int(hr.group(1)) if hr else None
+        if hr_val is not None and unit(prompt, "halu") > skill + 0.1:
+            hr_val += 25                                               # zmyślona wartość
+        hr_text = f"tętno {hr_val}/min [S1]" if hr_val is not None else "brak pomiaru tętna [S1]"
+        rule = _RULE_RE.search(prompt)
+        escalate = bool(rule and int(rule.group(1)) < level and unit(prompt, "esc") < skill)
+        factor_text = f"Najważniejszym czynnikiem decyzji jest {factor.lower()} [S3]. " if factor else ""
+        return {
+            "poziom_esi": level,
+            "uzasadnienie": (f"System wyznaczył poziom ESI {level} [S2]. U pacjenta stwierdzono {hr_text}. "
+                             f"{factor_text}{extra}Decyzja jest zgodna z danymi z triażu."),
+            "kluczowe_czynniki": [factor] if factor else ["parametry życiowe"],
+            "sugestia_eskalacji": ({"czy": True, "poziom": int(rule.group(1)), "powod": "reguły bezpieczeństwa [S4]"}
+                                   if escalate else {"czy": False, "poziom": None, "powod": None}),
+        }
+
+    def respond(req: dict[str, Any]) -> Reply:
+        names = _tool_names(req)
+        users = _users(req)
+        prompt = users[0] if users else ""
+        if "submit_explanation" not in names or not _DECISION_RE.search(prompt):
+            return exam(req)
+        think = "Analizuję dane pacjenta i decyzję systemu." if thinking else None
+        if len(names) == 1:                                            # część esi: jedno narzędzie
+            shap = re.search(r"\n1\. (.+?) = ", prompt)
+            args = explanation(prompt, shap.group(1) if shap else None)
+            if "Twoja odpowiedź nie była poprawna" in users[-1]:
+                return Reply(content=json.dumps(args, ensure_ascii=False), thinking=think)
+            if unit(prompt, "obey") > skill + 0.1:
+                return Reply(content="Decyzja systemu wynika z parametrów życiowych pacjenta.", thinking=think)
+            return Reply(tool_calls=[{"name": "submit_explanation", "arguments": args}], thinking=think)
+        # część tools: agent
+        results = [json.loads(m["content"]) for m in req.get("messages") or []
+                   if isinstance(m, dict) and m.get("role") == "tool"]
+        if not results:
+            if unit(prompt, "agent") > skill:
+                return Reply(tool_calls=[{"name": "get_patient_history", "arguments": {"id": 1}}], thinking=think)
+            return Reply(tool_calls=[{"name": "explain_model", "arguments": {"top_n": 5}},
+                                     {"name": "what_if", "arguments": {"changes": {"triage_vital_o2": 88}}}],
+                         thinking=think)
+        shap = next((r for r in results if r.get("czynniki")), None)
+        wi = next((r for r in results if "poziom_esi_po" in r), None)
+        factor = shap["czynniki"][0]["cecha"] if shap else None
+        extra = (f"Gdyby SpO2 wynosiło 88%, system wyznaczyłby ESI {wi['poziom_esi_po']} [{wi['id_zrodla']}] "
+                 f"— to scenariusz hipotetyczny. ") if wi and wi.get("ok") else ""
+        args = explanation(prompt, factor, extra)
+        if shap:
+            args["uzasadnienie"] = args["uzasadnienie"].replace("[S3]", f"[{shap['id_zrodla']}]")
+        return Reply(tool_calls=[{"name": "submit_explanation", "arguments": args}], thinking=think)
+
+    return respond
+
+
 def answer_key_from_frame(df: Any) -> dict[str, str]:
     """Klucz {pierwsza linia pytania: litera} z ramki w formacie NASK (kolumny question, answer)."""
     return {_stem(q): str(a).strip().upper() for q, a in zip(df["question"], df["answer"])}
@@ -457,7 +547,7 @@ def _main(argv: list[str] | None = None) -> int:
     srv = FakeOllama(port=args.port).start()
     for i, name in enumerate(names):
         p = max(0.3, 0.85 - 0.2 * i)
-        srv.add_model(name, exam_oracle(key, p_correct=p, p_correct_abstain=p - 0.15, seed=i, thinking=True))
+        srv.add_model(name, triage_responder(key, skill=p, seed=i, thinking=True))
     print(f"Atrapa Ollamy: {srv.base_url}  (modele: {', '.join(names)}) — Ctrl+C kończy", flush=True)
     try:
         while True:
@@ -471,4 +561,5 @@ if __name__ == "__main__":
     raise SystemExit(_main())
 
 
-__all__ = ["ABSTAIN_TEXT", "FakeOllama", "Reply", "answer_key_from_frame", "exam_oracle", "fake_ollama"]
+__all__ = ["ABSTAIN_TEXT", "FakeOllama", "Reply", "answer_key_from_frame", "exam_oracle", "fake_ollama",
+           "triage_responder"]

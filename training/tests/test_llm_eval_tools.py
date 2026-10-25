@@ -240,19 +240,22 @@ def _dispatch_responder(req: dict[str, Any]) -> Reply:
     return good_responder(req)
 
 
-def test_cli_runs_esi_and_tools_parts(llm_esi_env, env_paths, tmp_path):
+def _load_cli():
     import importlib.util
     import sys
 
     from tests.test_llm_eval_esi import PROJECT_ROOT
 
     script = PROJECT_ROOT / "scripts" / "12_llm_bakeoff.py"
-    if not script.exists():
-        pytest.skip("brak scripts/12_llm_bakeoff.py")
     spec = importlib.util.spec_from_file_location("llm_bakeoff_cli_for_esi_tests", script)
     cli = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = cli
     spec.loader.exec_module(cli)
+    return cli
+
+
+def test_cli_runs_esi_and_tools_parts(llm_esi_env, env_paths, tmp_path):
+    cli = _load_cli()
     out = tmp_path / "run"
     with FakeOllama() as srv:
         srv.add_model("m-one:cloud", _dispatch_responder)
@@ -271,3 +274,67 @@ def test_cli_runs_esi_and_tools_parts(llm_esi_env, env_paths, tmp_path):
                  .splitlines()}
     assert {"esi", "tools"} <= raw_parts                       # surowe odpowiedzi w pliku przebiegu
     assert (out / "ratings" / "ratings.html").exists() and (out / "key.json").exists()
+
+
+def test_cli_all_three_parts_rank_models(llm_esi_env, env_paths, tmp_path):
+    """Pełny przebieg CLI (exams + esi + tools) na triage_responder: raport ze wszystkimi sekcjami i wyborem."""
+    from tests.fake_ollama import answer_key_from_frame, triage_responder
+    from tests.test_llm_eval_exams import make_nask_frame
+
+    cli = _load_cli()
+    frame = make_nask_frame(n_per_edition=20)
+    exam_csv = tmp_path / "nask.csv"
+    frame.to_csv(exam_csv, index=False, encoding="utf-8")
+    key = answer_key_from_frame(frame)
+    strong, weak = "glm-5.3:cloud", "gpt-oss:120b-cloud"
+    out = tmp_path / "run"
+    with FakeOllama() as srv:
+        srv.add_model(strong, triage_responder(key, skill=0.95, seed=0, thinking=True))
+        srv.add_model(weak, triage_responder(key, skill=0.35, seed=1))
+        code = cli.main(["run", "--models", f"{strong},{weak}", "--base-url", srv.base_url,
+                         "--exam-file", str(exam_csv), "--n-exam", "40", "--n-pes", "20", "--n-boot", "300",
+                         "--recipe", str(llm_esi_env.recipe_dir), "--n-cases", str(N_CASES),
+                         "--out", str(out), "--cache", str(tmp_path / "cache.jsonl")])
+    assert code == 0
+    report = (out / "report.md").read_text(encoding="utf-8")
+    for heading in ("## Warunki pomiaru", "## Polskie egzaminy lekarskie", "## Część ESI", "## Część narzędziowa",
+                    "## Koszty i zużycie tokenów", "## Wybór modelu", "## Ograniczenia", "## Pliki przebiegu"):
+        assert heading in report, heading
+    assert f"Wybrany model: `{strong}`" in report and "Czas na pozycję" in report
+    assert "structured outputs" in report and "ratings.html" in report
+    results = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert results["selection"]["winner"] == strong
+    assert {c["part"] for c in results["costs"]} == {"exams", "esi", "tools"}
+    assert all(c["cost_usd"] is not None and c["cost_usd"] > 0 for c in results["costs"])
+    esi = results["parts"]["esi"]["summary"]
+    assert esi[strong]["valid_rate"] >= esi[weak]["valid_rate"]
+    assert esi[strong]["hallucination_rate"] <= esi[weak]["hallucination_rate"]
+    tools = results["parts"]["tools"]["summary"]
+    assert tools[strong]["valid_tool_call_rate"] > tools[weak]["valid_tool_call_rate"]
+
+
+def test_cli_dry_run_reports_esi_availability(llm_esi_env, env_paths, tmp_path, capsys):
+    cli = _load_cli()
+    with FakeOllama() as srv:
+        srv.add_model("*", "ok")
+        base = ["run", "--dry-run", "--parts", "esi,tools", "--models", "glm-5.3:cloud", "--base-url", srv.base_url,
+                "--n-cases", "40", "--cache", str(tmp_path / "c.jsonl")]
+        assert cli.main(base + ["--recipe", str(llm_esi_env.recipe_dir)]) == 0
+        ready = capsys.readouterr().out
+        assert cli.main(base + ["--recipe", str(tmp_path / "brak")]) == 0
+        missing = capsys.readouterr().out
+        assert srv.chat_count() == 0
+    assert "Część esi: 40 przypadków (receptura" in ready and "logreg" in ready and "$" in ready
+    assert "Część tools: 40 przypadków" in ready
+    assert "Część esi: zostanie POMINIĘTA" in missing and "Brak pliku receptury" in missing
+
+
+def test_cases_status(llm_esi_env, env_paths, tmp_path):
+    from src.llm_eval.esi_cases import cases_status
+
+    ok, detail = cases_status(llm_esi_env.recipe_dir)
+    assert ok and "lightgbm" in detail
+    ok, detail = cases_status(runs_dir=tmp_path / "pusty")
+    assert not ok and "brak ukończonych runów" in detail
+    ok, detail = cases_status(runs_dir=env_paths.RUNS_DIR)       # runy testowe są bez tuningu
+    assert not ok

@@ -204,8 +204,11 @@ def part_costs(part: str, res: dict[str, Any], usage: dict[str, dict[str, float]
         pt, ct = float(u.get("prompt_tokens") or 0), float(u.get("completion_tokens") or 0)
         if not calls and not pt:
             continue
-        rows.append({"part": part, "model": model, "calls": calls, "prompt_tokens": pt,
-                     "completion_tokens": ct, "cost_usd": cost_usd(model, pt, ct, prices)})
+        row = {"part": part, "model": model, "calls": calls, "prompt_tokens": pt,
+               "completion_tokens": ct, "cost_usd": cost_usd(model, pt, ct, prices)}
+        if u.get("latency_s_median") is not None:     # mediana czasu na pozycję (przypadek) z wyników części
+            row["latency_median_s"] = float(u["latency_s_median"])
+        rows.append(row)
     return rows
 
 
@@ -214,10 +217,12 @@ def exam_costs(exams: dict[str, Any]) -> list[dict[str, Any]]:
     for model in exams.get("models", []):
         ms = [m for m in exams.get("metrics", []) if m["model"] == model and m["split"] == "all"]
         costs = [m.get("cost_usd") for m in ms]
+        lat = [m["latency_median_s"] for m in ms if m.get("latency_median_s") is not None]
         rows.append({"part": "exams", "model": model, "calls": sum(m["n"] for m in ms),
                      "prompt_tokens": sum(m["prompt_tokens_total"] for m in ms),
                      "completion_tokens": sum(m["completion_tokens_total"] for m in ms),
-                     "cost_usd": None if any(c is None for c in costs) else sum(costs)})
+                     "cost_usd": None if any(c is None for c in costs) else sum(costs),
+                     "latency_median_s": sum(lat) / len(lat) if lat else None})
     return rows
 
 

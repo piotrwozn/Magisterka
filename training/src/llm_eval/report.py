@@ -305,10 +305,15 @@ def costs_markdown(costs: list[dict[str, Any]], fmt: Fmt | None = None) -> list[
         return ["Brak danych o zużyciu tokenów.", ""]
     rows = [[c.get("part", "?"), f"`{c.get('model')}`", str(int(c.get("calls") or 0)),
              f"{int(c.get('prompt_tokens') or 0):,}".replace(",", " "),
-             f"{int(c.get('completion_tokens') or 0):,}".replace(",", " "), format_usd(c.get("cost_usd"))]
+             f"{int(c.get('completion_tokens') or 0):,}".replace(",", " "),
+             fmt.num(fnum(c.get("latency_median_s")), 1), format_usd(c.get("cost_usd"))]
             for c in costs]
     total = [c.get("cost_usd") for c in costs]
-    lines = [md_table(["Część", "Model", "Wywołania", "Tokeny wej.", "Tokeny wyj.", "Koszt"], rows), ""]
+    lines = [md_table(["Część", "Model", "Pozycje", "Tokeny wej.", "Tokeny wyj.", "Czas na pozycję [s] (mediana)",
+                       "Koszt"], rows), "",
+             "Pozycja: w części exams jedno pytanie w jednym protokole (jedno zapytanie), w części esi jeden "
+             "przypadek (z ewentualnym ponowieniem), w części tools jeden przypadek (wszystkie kroki agenta). "
+             "Tokeny i koszt obejmują też odpowiedzi z pamięci podręcznej (koszt całego pomiaru).", ""]
     if all(t is not None for t in total):
         lines += [f"Razem: **{format_usd(sum(total))}** (ceny: {PRICING_SOURCE}; przy abonamencie Ollama "
                   f"koszt orientacyjny — zapytania nie są rozliczane per token).", ""]
@@ -402,17 +407,62 @@ def render_report(meta: dict[str, Any], parts: dict[str, Any], part_markdown: di
         lines += [md, ""] if md else [_skip_text(parts.get(part), part), ""]
     lines += ["## Koszty i zużycie tokenów", ""] + costs_markdown(costs, fmt)
     lines += selection_markdown(selection, fmt, cloud=uses_cloud(meta))
+    lines += limitations_markdown(parts)
+    lines += files_markdown(parts)
+    return "\n".join(lines)
+
+
+def _ran(part: Any) -> bool:
+    return isinstance(part, dict) and not part.get("skipped") and not part.get("failed")
+
+
+def limitations_markdown(parts: dict[str, Any]) -> list[str]:
+    """Ograniczenia pomiaru (do rozdziału „ograniczenia” pracy) — tylko dla części, które policzono."""
+    lines = ["## Ograniczenia", ""]
+    if _ran(parts.get("exams")):
+        lines += [
+            "- Pytania egzaminacyjne mogły trafić do danych treningowych modeli (kontaminacja; część pytań LEK "
+            "pochodzi z publicznej bazy) — protokół abstaining_substitution częściowo to kontroluje.",
+            "- Przedziały ufności opisują niepewność z powodu skończonej próby pytań, nie zmienność samego modelu "
+            "(temperatura 0, ale modele chmurowe nie gwarantują determinizmu).",
+        ]
+    if _ran(parts.get("esi")) or _ran(parts.get("tools")):
+        lines += [
+            "- Przypadki ESI pochodzą z danych amerykańskich (Yale EMMLC) opisanych po polsku; mała liczba "
+            "przypadków (szerokie przedziały) i celowa nadreprezentacja ESI 1–2 — odsetki nie są reprezentatywne "
+            "dla populacji SOR.",
+            "- Metryki tekstowe (pokrycie SHAP, wierność liczb, język, eskalacje) są heurystyczne (słowa kluczowe "
+            "i rdzenie); rozstrzyga ślepa ocena ekspercka (arkusz ratings.html → `score-ratings`).",
+            "- Modele chmurowe Ollamy ignorują parametr `format` (structured outputs), dlatego strukturę wymusza "
+            "jedyne narzędzie `submit_explanation` + tolerancyjne parsowanie JSON z treści i jedno ponowienie; "
+            "odsetek poprawnych odpowiedzi mierzy więc także posłuszeństwo wobec instrukcji.",
+        ]
     lines += [
-        "## Ograniczenia",
-        "",
-        "- Pytania egzaminacyjne mogły trafić do danych treningowych modeli (kontaminacja; część pytań LEK "
-        "pochodzi z publicznej bazy) — protokół abstaining_substitution częściowo to kontroluje.",
-        "- Przedziały ufności opisują niepewność z powodu skończonej próby pytań, nie zmienność samego modelu "
-        "(temperatura 0, ale modele chmurowe nie gwarantują determinizmu).",
-        "- Modele chmurowe mogą być po cichu aktualizowane — wersja serwera, digest i data pomiaru są podane wyżej.",
+        "- Modele chmurowe mogą być po cichu aktualizowane pod tym samym tagiem — wersja serwera, digest "
+        "(jeśli serwer go podaje) i data pomiaru są zapisane wyżej i w run_info.json; przy powtórzeniu pomiaru "
+        "porównaj je przed zestawieniem wyników.",
+        "- Ceny pochodzą z cennika API; przy abonamencie Ollama koszt jest orientacyjny.",
         "",
     ]
-    return "\n".join(lines)
+    return lines
+
+
+def files_markdown(parts: dict[str, Any]) -> list[str]:
+    """Spis plików przebiegu (ścieżki względem katalogu przebiegu)."""
+    lines = ["## Pliki przebiegu", "",
+             "- `run_info.json` — warunki pomiaru (polecenie, tagi modeli, /api/show, wersja serwera, daty); "
+             "`bakeoff.log` — log; `results.json` — wszystkie liczby; `raw_responses.jsonl` — surowe odpowiedzi."]
+    if _ran(parts.get("exams")):
+        lines.append("- `exam_items.csv` (wylosowane pytania), `exam_responses.csv` (odpowiedź każdego modelu), "
+                     "`exam_metrics.csv` (metryki model × protokół × egzamin).")
+    if _ran(parts.get("esi")):
+        lines.append("- `esi_cases.json` (przypadki, receptura, SHAP), `esi_items.csv`, `esi_summary.csv`, "
+                     "`ratings/ratings.html` + `ratings/ratings_template.csv` (dla oceniających), `key.json` "
+                     "(klucz liter → modeli — NIE dawać oceniającym).")
+    if _ran(parts.get("tools")):
+        lines.append("- `tools_items.csv`, `tools_summary.csv`, `tools_trajectories.jsonl` (kroki agenta).")
+    lines.append("")
+    return lines
 
 
 def api_error_banner(parts: dict[str, Any]) -> list[str]:
@@ -457,6 +507,8 @@ __all__ = [
     "deployability_note",
     "esi_scores",
     "exams_markdown",
+    "files_markdown",
+    "limitations_markdown",
     "meta_markdown",
     "render_report",
     "select_model",
