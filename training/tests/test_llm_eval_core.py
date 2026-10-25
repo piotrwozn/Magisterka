@@ -31,7 +31,7 @@ from src.llm_eval.pricing import (
     load_prices,
     price_for,
 )
-from tests.fake_ollama import FakeOllama, Reply, fake_ollama  # noqa: F401 — fixture
+from tests.fake_ollama import FakeOllama, Reply
 
 MSG = [{"role": "user", "content": "Ile to 2+2?"}]
 
@@ -41,6 +41,13 @@ def make_client(srv: FakeOllama, **kw) -> OllamaChat:
     kw.setdefault("backoff_max_s", 0.0)
     kw.setdefault("timeout_s", 5)
     return OllamaChat(base_url=srv.base_url, **kw)
+
+
+@pytest.fixture
+def srv():
+    """Uruchomiona atrapa Ollamy (tests/fake_ollama.py) — bez modeli, dodawane w teście."""
+    with FakeOllama() as server:
+        yield server
 
 
 # ─────────────────────────────────────────
@@ -88,19 +95,19 @@ def test_split_think_tags():
 # ─────────────────────────────────────────
 # chat(): parsowanie odpowiedzi
 # ─────────────────────────────────────────
-def test_chat_parses_content_thinking_tokens_and_tool_calls(fake_ollama):
-    fake_ollama.add_model("m", [
+def test_chat_parses_content_thinking_tokens_and_tool_calls(srv):
+    srv.add_model("m", [
         Reply(content="Prawidłowa odpowiedź to B.", thinking="krótko", prompt_tokens=11, completion_tokens=7),
         Reply(tool_calls=[{"name": "submit_explanation", "arguments": {"poziom_esi": 2}},
                           {"name": "what_if", "arguments": '{"changes": {"sbp": 80}}'},
                           {"name": "zly", "arguments": "{nie json"}]),
     ])
-    client = make_client(fake_ollama)
+    client = make_client(srv)
     res = client.chat("m", MSG, think="low", options={"temperature": 0})
     assert res.ok and res.content == "Prawidłowa odpowiedź to B." and res.thinking == "krótko"
     assert (res.prompt_tokens, res.completion_tokens) == (11, 7)
     assert res.latency_s >= 0 and res.attempts == 1 and res.raw["done"] is True
-    body = fake_ollama.chat_requests("m")[0]
+    body = srv.chat_requests("m")[0]
     assert body["think"] == "low" and body["stream"] is False and body["options"] == {"temperature": 0}
 
     res2 = client.chat("m", MSG, tools=[{"type": "function", "function": {"name": "submit_explanation"}}])
@@ -108,31 +115,31 @@ def test_chat_parses_content_thinking_tokens_and_tool_calls(fake_ollama):
     assert res2.tool_calls[0]["arguments"] == {"poziom_esi": 2}
     assert res2.tool_calls[1]["arguments"] == {"changes": {"sbp": 80}}       # JSON w tekście → dict
     assert res2.tool_calls[2]["arguments"] == {} and "arguments_raw" in res2.tool_calls[2]
-    assert "tools" in fake_ollama.chat_requests("m")[1]
+    assert "tools" in srv.chat_requests("m")[1]
 
 
-def test_chat_splits_think_tags_in_content(fake_ollama):
-    fake_ollama.add_model("m", "<think>tok rozumowania</think>Prawidłowa odpowiedź to C.")
-    res = make_client(fake_ollama).chat("m", MSG)
+def test_chat_splits_think_tags_in_content(srv):
+    srv.add_model("m", "<think>tok rozumowania</think>Prawidłowa odpowiedź to C.")
+    res = make_client(srv).chat("m", MSG)
     assert res.content == "Prawidłowa odpowiedź to C." and res.thinking == "tok rozumowania"
 
 
-def test_chat_sends_bearer_key(fake_ollama):
-    fake_ollama.add_model("m", "ok")
-    make_client(fake_ollama, api_key="sekret").chat("m", MSG)
-    headers = {k.lower(): v for k, v in fake_ollama.requests[-1]["headers"].items()}
+def test_chat_sends_bearer_key(srv):
+    srv.add_model("m", "ok")
+    make_client(srv, api_key="sekret").chat("m", MSG)
+    headers = {k.lower(): v for k, v in srv.requests[-1]["headers"].items()}
     assert headers["authorization"] == "Bearer sekret"
 
 
-def test_chat_handles_streaming_reply(fake_ollama):
+def test_chat_handles_streaming_reply(srv):
     """Gdyby serwer zignorował stream=false — odpowiedź NDJSON jest sklejana."""
     import requests
 
-    fake_ollama.add_model("m", Reply(content="Answer: D", thinking="x"))
+    srv.add_model("m", Reply(content="Answer: D", thinking="x"))
     # Atrapa odpowiada NDJSON-em, gdy stream != false — sprawdzamy funkcję sklejania na prawdziwej odpowiedzi
     from src.llm_eval.client import _merge_ndjson
 
-    text = requests.post(fake_ollama.base_url + "/api/chat",
+    text = requests.post(srv.base_url + "/api/chat",
                          json={"model": "m", "messages": MSG}).text
     merged = _merge_ndjson(text)
     assert merged["message"]["content"] == "Answer: D" and merged["eval_count"] > 0
@@ -141,37 +148,37 @@ def test_chat_handles_streaming_reply(fake_ollama):
 # ─────────────────────────────────────────
 # Ponowienia, błędy, bezpiecznik
 # ─────────────────────────────────────────
-def test_retries_on_429_and_503_then_succeeds(fake_ollama):
-    fake_ollama.add_model("m", "ok")
-    fake_ollama.fail_next(429, model="m", retry_after=0)
-    fake_ollama.fail_next(503, times=2, model="m")
-    res = make_client(fake_ollama, max_retries=5).chat("m", MSG)
+def test_retries_on_429_and_503_then_succeeds(srv):
+    srv.add_model("m", "ok")
+    srv.fail_next(429, model="m", retry_after=0)
+    srv.fail_next(503, times=2, model="m")
+    res = make_client(srv, max_retries=5).chat("m", MSG)
     assert res.ok and res.content == "ok" and res.attempts == 4
-    assert fake_ollama.chat_count("m") == 4
+    assert srv.chat_count("m") == 4
 
 
-def test_gives_up_after_max_retries_without_raising(fake_ollama):
-    fake_ollama.add_model("m", "ok")
-    fake_ollama.fail_next(502, times=10, model="m")
-    res = make_client(fake_ollama, max_retries=2).chat("m", MSG)
+def test_gives_up_after_max_retries_without_raising(srv):
+    srv.add_model("m", "ok")
+    srv.fail_next(502, times=10, model="m")
+    res = make_client(srv, max_retries=2).chat("m", MSG)
     assert not res.ok and "HTTP 502" in res.error and res.attempts == 3 and res.status == 502
     assert res.raw["status"] == 502
 
 
-def test_no_retry_on_404_unknown_model(fake_ollama):
-    res = make_client(fake_ollama).chat("brak", MSG)
+def test_no_retry_on_404_unknown_model(srv):
+    res = make_client(srv).chat("brak", MSG)
     assert not res.ok and "404" in res.error and res.attempts == 1
 
 
-def test_auth_error_has_hint(fake_ollama):
-    fake_ollama.add_model("m", Reply(status=401, error="unauthorized"))
-    res = make_client(fake_ollama).chat("m", MSG)
+def test_auth_error_has_hint(srv):
+    srv.add_model("m", Reply(status=401, error="unauthorized"))
+    res = make_client(srv).chat("m", MSG)
     assert not res.ok and "ollama signin" in res.error and res.attempts == 1
 
 
-def test_timeout_is_retried_and_reported(fake_ollama):
-    fake_ollama.add_model("m", Reply(content="za późno", delay_s=1.5))
-    res = make_client(fake_ollama, timeout_s=0.3, max_retries=1).chat("m", MSG)
+def test_timeout_is_retried_and_reported(srv):
+    srv.add_model("m", Reply(content="za późno", delay_s=1.5))
+    res = make_client(srv, timeout_s=0.3, max_retries=1).chat("m", MSG)
     assert not res.ok and "czas" in res.error and res.attempts == 2
 
 
@@ -184,36 +191,36 @@ def test_connection_refused_does_not_raise():
     assert client.model_info("m")["error"]
 
 
-def test_think_rejected_is_retried_without_think(fake_ollama):
+def test_think_rejected_is_retried_without_think(srv):
     def respond(req):
         if "think" in req:
             return Reply(status=400, error='"m" does not support thinking')
         return Reply(content="bez rozumowania")
 
-    fake_ollama.add_model("m", respond)
-    res = make_client(fake_ollama).chat("m", MSG, think="low")
+    srv.add_model("m", respond)
+    res = make_client(srv).chat("m", MSG, think="low")
     assert res.ok and res.content == "bez rozumowania" and res.notes
-    bodies = fake_ollama.chat_requests("m")
+    bodies = srv.chat_requests("m")
     assert "think" in bodies[0] and "think" not in bodies[1]
 
 
-def test_breaker_stops_calling_a_dead_model(fake_ollama):
-    fake_ollama.add_model("m", Reply(status=500, error="boom"))
-    client = make_client(fake_ollama, max_retries=0, max_consecutive_failures=2)
+def test_breaker_stops_calling_a_dead_model(srv):
+    srv.add_model("m", Reply(status=500, error="boom"))
+    client = make_client(srv, max_retries=0, max_consecutive_failures=2)
     assert not client.chat("m", MSG).ok
     assert not client.chat("m", MSG).ok
     skipped = client.chat("m", MSG)
-    assert "pominięto" in skipped.error and fake_ollama.chat_count("m") == 2
+    assert "pominięto" in skipped.error and srv.chat_count("m") == 2
     client.reset_breaker("m")
     client.chat("m", MSG)
-    assert fake_ollama.chat_count("m") == 3
+    assert srv.chat_count("m") == 3
     assert client.usage["m"]["calls"] == 4 and client.usage["m"]["errors"] == 4
 
 
 # ─────────────────────────────────────────
 # chat_many: kolejność i limit równoległości
 # ─────────────────────────────────────────
-def test_chat_many_keeps_order_and_bounds_concurrency(fake_ollama):
+def test_chat_many_keeps_order_and_bounds_concurrency(srv):
     state = {"now": 0, "max": 0}
     lock = threading.Lock()
 
@@ -226,8 +233,8 @@ def test_chat_many_keeps_order_and_bounds_concurrency(fake_ollama):
             state["now"] -= 1
         return Reply(content=req["messages"][-1]["content"].upper())
 
-    fake_ollama.add_model("m", respond)
-    client = make_client(fake_ollama, concurrency=2)
+    srv.add_model("m", respond)
+    client = make_client(srv, concurrency=2)
     seen = []
     jobs = [ChatJob("m", [{"role": "user", "content": f"x{i}"}], key=i) for i in range(6)]
     results = client.chat_many(jobs, on_result=lambda i, job, res: seen.append((i, job.key, res.ok)))
@@ -236,20 +243,20 @@ def test_chat_many_keeps_order_and_bounds_concurrency(fake_ollama):
     assert state["max"] == 2
 
 
-def test_chat_many_accepts_dict_jobs(fake_ollama):
-    fake_ollama.add_model("*", "ok")
-    res = make_client(fake_ollama).chat_many([{"model": "a", "messages": MSG, "extra": 1}, {"model": "b", "messages": MSG}])
+def test_chat_many_accepts_dict_jobs(srv):
+    srv.add_model("*", "ok")
+    res = make_client(srv).chat_many([{"model": "a", "messages": MSG, "extra": 1}, {"model": "b", "messages": MSG}])
     assert [r.model for r in res] == ["a", "b"] and all(r.ok for r in res)
-    assert make_client(fake_ollama).chat_many([]) == []
+    assert make_client(srv).chat_many([]) == []
 
 
 # ─────────────────────────────────────────
 # server_info / model_info
 # ─────────────────────────────────────────
-def test_server_and_model_info(fake_ollama):
-    fake_ollama.version = "0.31.2"
-    fake_ollama.add_model("glm-5.3:cloud", "ok", details={"family": "glm", "parameter_size": "744B"}, digest="abc123def456789")
-    client = make_client(fake_ollama)
+def test_server_and_model_info(srv):
+    srv.version = "0.31.2"
+    srv.add_model("glm-5.3:cloud", "ok", details={"family": "glm", "parameter_size": "744B"}, digest="abc123def456789")
+    client = make_client(srv)
     info = client.server_info()
     assert info["version"] == "0.31.2" and info["mode"] == "local" and info["error"] is None
     mi = client.model_info("glm-5.3:cloud")
@@ -390,3 +397,49 @@ def test_deployability_notes_cover_default_models():
     for tag in ("glm-5.3:cloud", "gpt-oss:120b-cloud", "deepseek-v4.1-flash:cloud", "kimi-k3:cloud"):
         assert deployability_note(tag) != "brak notatki"
     assert deployability_note("inny:1b") == "brak notatki"
+
+
+def test_esi_scores_from_part_summary():
+    from src.llm_eval.report import esi_scores
+
+    summary = {"a": {"valid_rate": 1.0, "level_match_rate": 1.0, "shap_coverage": 0.6, "hallucination_rate": 0.0,
+                     "polish_rate": 1.0},
+               "b": {"valid_rate": 0.5, "level_match_rate": None, "shap_coverage": 0.2, "hallucination_rate": 0.5,
+                     "polish_rate": 1.0}}
+    scores = esi_scores({"skipped": None, "summary": summary})
+    assert scores["a"] == pytest.approx(0.92) and scores["b"] == pytest.approx((0.5 + 0.2 + 0.5 + 1.0) / 4)
+    assert esi_scores({"ranking_score": {"a": 2}, "summary": summary}) == {"a": 2.0}
+    assert esi_scores({"skipped": "brak runów", "summary": summary}) == {}
+    assert esi_scores(None) == {}
+
+
+def test_think_rejection_is_remembered_per_model(srv):
+    def respond(req):
+        return Reply(status=400, error="think value not supported") if "think" in req else Reply(content="ok")
+
+    srv.add_model("m", respond)
+    client = make_client(srv)
+    assert client.chat("m", MSG, think="low").ok
+    second = client.chat("m", MSG, think="low")
+    assert second.ok and "pominięte" in second.notes[0]
+    assert srv.chat_count("m") == 3                  # 400 + ponowienie, potem od razu bez think
+
+
+def test_api_error_banner():
+    from src.llm_eval.report import api_error_banner
+
+    parts = {"exams": {"metrics": [{"model": "a", "split": "all", "api_errors": 3},
+                                   {"model": "a", "split": "r_lek", "api_errors": 3},
+                                   {"model": "b", "split": "all", "api_errors": 0}]},
+             "esi": {"summary": {"b": {"api_errors": 1}}}}
+    text = "\n".join(api_error_banner(parts))
+    assert "`a`: 3" in text and "`b`: 1" in text
+    assert api_error_banner({"exams": {"metrics": []}}) == []
+
+
+def test_select_model_equal_esi_scores_fall_back_to_point_estimate():
+    from src.llm_eval.report import select_model
+
+    exams = _fake_exams({"x": (0.70, 0.50), "y": (0.70, 0.50)})
+    sel = select_model(exams, {"summary": {"x": {"valid_rate": 0.0}, "y": {"valid_rate": 0.0}}}, n_boot=300)
+    assert sel["decided_by"] == "point_estimate"

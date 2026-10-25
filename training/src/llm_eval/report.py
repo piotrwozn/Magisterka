@@ -36,7 +36,8 @@ SECONDARY_PROTOCOL = "standard"
 SELECTION_CRITERION: str = (
     "Kryterium główne: trafność w protokole abstaining_substitution (NASK) na pytaniach LEK + PES. "
     "Modele, których sparowana różnica z najlepszym ma 95% przedział zawierający 0, są z nim w remisie; "
-    "remis rozstrzyga trafność w protokole standardowym (ta sama reguła), a następnie wynik części ESI."
+    "remis rozstrzyga trafność w protokole standardowym (ta sama reguła), a następnie wynik części ESI "
+    "(średnia: poprawna struktura, zgodność poziomu ESI, pokrycie cech SHAP, brak halucynacji, język polski)."
 )
 
 # Notatki o możliwości wdrożenia lokalnego (NIE kryterium). Źródła: notatki badawcze 2026-10-25
@@ -88,14 +89,39 @@ def _acc(exams: dict[str, Any], model: str, protocol: str) -> float:
     return -1.0 if v is None else v
 
 
+# Wynik części ESI do rozstrzygania remisów, gdy część nie podała własnego `ranking_score`:
+# średnia (równe wagi) z poniższych odsetków w `summary[model]` (brakujące pomijane).
+ESI_SCORE_COMPONENTS: tuple[tuple[str, bool], ...] = (
+    ("valid_rate", False),            # poprawna struktura odpowiedzi
+    ("level_match_rate", False),      # przytoczony poziom ESI = decyzja systemu
+    ("shap_coverage", False),         # pokrycie 5 najważniejszych cech SHAP
+    ("hallucination_rate", True),     # zmyślone pomiary (odwrócone: 1 − odsetek)
+    ("polish_rate", False),           # odpowiedź po polsku
+)
+
+
 def esi_scores(esi: dict[str, Any] | None) -> dict[str, float]:
-    """{model: wynik} z wyników części ESI (`ranking_score` albo `score`); brak → {}."""
-    if not isinstance(esi, dict):
+    """
+    {model: wynik ∈ [0, 1]} z wyników części ESI: `ranking_score` / `score` podany przez część,
+    a gdy go brak — średnia ESI_SCORE_COMPONENTS z `summary[model]`; brak danych → {}.
+    """
+    if not isinstance(esi, dict) or esi.get("skipped"):
         return {}
     raw = esi.get("ranking_score") or esi.get("score")
-    if not isinstance(raw, dict):
+    if isinstance(raw, dict):
+        return {str(m): float(v) for m, v in raw.items() if fnum(v) is not None}
+    summary = esi.get("summary")
+    if not isinstance(summary, dict):
         return {}
-    return {str(m): float(v) for m, v in raw.items() if fnum(v) is not None}
+    out = {}
+    for model, s in summary.items():
+        if not isinstance(s, dict):
+            continue
+        vals = [(1.0 - v) if invert else v for key, invert in ESI_SCORE_COMPONENTS
+                if (v := fnum(s.get(key))) is not None]
+        if vals:
+            out[str(model)] = float(np.mean(vals))
+    return out
 
 
 # ─────────────────────────────────────────
@@ -150,7 +176,8 @@ def select_model(exams: dict[str, Any] | None, esi: dict[str, Any] | None = None
             winner, decided = best2, "standard"
             why = (f"Remis w kryterium głównym ({tie_txt}); rozstrzyga protokół standardowy — {best2} jest w nim "
                    f"istotnie lepszy od pozostałych modeli z remisu.")
-        elif scores and all(m in scores for m in g2):
+        elif scores and all(m in scores for m in g2) and \
+                sum(abs(scores[m] - max(scores[x] for x in g2)) < 1e-9 for m in g2) == 1:
             winner, decided = max(g2, key=lambda m: scores[m]), "esi"
             why = (f"Remis w kryterium głównym ({tie_txt}) i w protokole standardowym ({', '.join(g2)}); "
                    f"rozstrzyga wynik części ESI — najwyższy ma {max(g2, key=lambda m: scores[m])}.")
@@ -158,7 +185,7 @@ def select_model(exams: dict[str, Any] | None, esi: dict[str, Any] | None = None
             winner = max(g2, key=lambda m: (_acc(exams, m, PRIMARY_PROTOCOL), _acc(exams, m, SECONDARY_PROTOCOL)))
             decided = "point_estimate"
             why = (f"Remis statystyczny w kryterium głównym ({tie_txt}) i w protokole standardowym "
-                   f"({', '.join(g2)}); brak wyniku części ESI do rozstrzygnięcia — wskazano model z najwyższą "
+                   f"({', '.join(g2)}); brak (albo remis) wyniku części ESI — wskazano model z najwyższą "
                    f"wartością punktową ({winner}). Wybór między modelami z remisu nie jest rozstrzygnięty "
                    f"statystycznie — warto zwiększyć próbę (--n-exam / --n-pes) albo uruchomić część ESI.")
 
@@ -175,7 +202,7 @@ def select_model(exams: dict[str, Any] | None, esi: dict[str, Any] | None = None
             "tied_primary": m in g1, "tied_secondary": m in g2,
             "esi_score": scores.get(m), "note": deployability_note(m),
         })
-    out.update(winner=winner, decided_by=decided, primary_tie=g1 if len(g1) > 1 else [],
+    out.update(winner=winner, decided_by=decided, best_primary=best, primary_tie=g1 if len(g1) > 1 else [],
                secondary_tie=g2 if len(g2) > 1 else [], ranking=ranking, explanation=why)
     return out
 
@@ -195,15 +222,16 @@ def exams_markdown(exams: dict[str, Any], fmt: Fmt | None = None) -> list[str]:
     models = list(exams.get("models", []))
     s = exams.get("sample", {})
     n = s.get("n", {})
-    pes_txt = ("medycyna ratunkowa / choroby wewnętrzne (rozpoznane w nazwie egzaminu)"
-               if s.get("pes_mode") == "specialty" else "losowe pytania PES (specjalizacji nie rozpoznano)")
+    pes_txt = ("specjalizacje medycyna ratunkowa i choroby wewnętrzne, rozpoznane w nazwie egzaminu"
+               if s.get("pes_mode") == "specialty" else "losowe pytania PES — specjalizacji nie rozpoznano")
     lines = [
-        "## 1. Polskie egzaminy lekarskie (NASK-PIB/Reassess-Polish-Medical-Exams)",
+        "## Polskie egzaminy lekarskie (NASK-PIB/Reassess-Polish-Medical-Exams)",
         "",
-        f"Próba: **{n.get('lek', 0)} pytań LEK** (losowanie warstwowe wg edycji egzaminu, {s.get('lek_editions', '?')} "
-        f"edycji) + **{n.get('pes', 0)} pytań PES** ({pes_txt}); seed {s.get('seed')}, te same pytania dla każdego "
-        f"modelu i obu protokołów. Pula: pytania jednokrotnego wyboru A–E kwalifikujące się do protokołu "
-        f"abstaining_substitution (wykluczenia jak w skrypcie NASK).",
+        f"Próba (seed {s.get('seed')}, te same pytania dla każdego modelu i obu protokołów): liczba pytań LEK "
+        f"**{n.get('lek', 0)}** (losowanie warstwowe wg edycji egzaminu; liczba edycji: {s.get('lek_editions', '?')}), "
+        f"liczba pytań PES **{n.get('pes', 0)}** ({pes_txt}; liczba egzaminów: {len(s.get('pes_exam_names') or [])}). "
+        f"Pula: pytania jednokrotnego wyboru A–E kwalifikujące się do protokołu abstaining_substitution "
+        f"(wykluczenia jak w skrypcie NASK).",
         "",
         "Protokoły: **standardowy** (pytanie bez zmian) i **abstaining_substitution** (tekst poprawnej opcji "
         "zastąpiony zdaniem „żadna z odpowiedzi nie jest poprawna”; litera poprawnej odpowiedzi bez zmian). "
@@ -213,7 +241,7 @@ def exams_markdown(exams: dict[str, Any], fmt: Fmt | None = None) -> list[str]:
     ]
     for protocol in (PRIMARY_PROTOCOL, SECONDARY_PROTOCOL):
         title = "kryterium główne" if protocol == PRIMARY_PROTOCOL else "kontrola i rozstrzyganie remisów"
-        lines += [f"### Trafność — protokół {PROTOCOL_LABELS[protocol]} ({title})", ""]
+        lines += [f"### Trafność: protokół {protocol} — {title}", "", f"Protokół {PROTOCOL_LABELS[protocol]}.", ""]
         rows = []
         for m in models:
             cells = [f"`{m}`"] + [_rate(fmt, _metric(exams, m, protocol, sp)) for sp in (*SPLITS, "all")]
@@ -231,7 +259,7 @@ def exams_markdown(exams: dict[str, Any], fmt: Fmt | None = None) -> list[str]:
         best = block.get("best")
         if not best:
             continue
-        lines += [f"Protokół {PROTOCOL_LABELS[protocol]} — najlepszy: `{best}`.", ""]
+        lines += [f"Protokół {protocol} — najlepszy: `{best}`.", ""]
         rows = []
         for r in block.get("rows", []):
             verdict = "remis (różnica nieistotna)" if r.get("tied_with_best") else "istotnie gorszy"
@@ -289,7 +317,15 @@ def costs_markdown(costs: list[dict[str, Any]], fmt: Fmt | None = None) -> list[
     return lines
 
 
-def selection_markdown(sel: dict[str, Any], fmt: Fmt | None = None) -> list[str]:
+def uses_cloud(meta: dict[str, Any]) -> bool:
+    """Czy pomiar szedł przez chmurę Ollamy (tryb bezpośredni, tag ':cloud'/'-cloud' albo model zdalny)."""
+    server = meta.get("server") or {}
+    models = [str(m) for m in meta.get("models") or []]
+    remote = any((info or {}).get("remote_host") for info in (meta.get("model_info") or {}).values())
+    return server.get("mode") == "cloud" or remote or any(canonical_model(m) != m for m in models)
+
+
+def selection_markdown(sel: dict[str, Any], fmt: Fmt | None = None, cloud: bool = True) -> list[str]:
     fmt = fmt or Fmt()
     lines = ["## Wybór modelu", "", sel.get("criterion", SELECTION_CRITERION), ""]
     if sel.get("winner"):
@@ -297,12 +333,13 @@ def selection_markdown(sel: dict[str, Any], fmt: Fmt | None = None) -> list[str]
     else:
         lines += [sel.get("explanation", "Brak rozstrzygnięcia."), ""]
     rows = []
+    best_primary = sel.get("best_primary")
     for r in sel.get("ranking", []):
         abst, std = r.get("acc_abstaining") or {}, r.get("acc_standard") or {}
         rows.append([str(r["rank"]), f"`{r['model']}`",
                      fmt.pct_ci(abst.get("accuracy"), abst.get("ci_low"), abst.get("ci_high")) if abst else "—",
                      fmt.pct_ci(std.get("accuracy"), std.get("ci_low"), std.get("ci_high")) if std else "—",
-                     "tak" if r.get("tied_primary") else "nie",
+                     "najlepszy" if r["model"] == best_primary else ("tak" if r.get("tied_primary") else "nie"),
                      fmt.num(r.get("esi_score"), 3) if r.get("esi_score") is not None else "—"])
     if rows:
         lines += [md_table(["#", "Model", "Abstaining (LEK+PES)", "Standard (LEK+PES)", "Remis z najlepszym",
@@ -310,7 +347,7 @@ def selection_markdown(sel: dict[str, Any], fmt: Fmt | None = None) -> list[str]
     lines += ["### Możliwość wdrożenia (notatka, nie kryterium)", ""]
     for r in sel.get("ranking", []):
         lines.append(f"- `{r['model']}` — {r.get('note') or deployability_note(r['model'])}")
-    lines += ["", CLOUD_NOTE, ""]
+    lines += ["", CLOUD_NOTE if cloud else "Pomiar wykonano na lokalnym serwerze Ollamy (bez chmury).", ""]
     return lines
 
 
@@ -349,20 +386,22 @@ def render_report(meta: dict[str, Any], parts: dict[str, Any], part_markdown: di
     if selection.get("winner"):
         lines += [f"**Wynik w skrócie:** wybrany model `{selection['winner']}` "
                   f"(rozstrzygnięcie: {_decided_label(selection.get('decided_by'))}). Szczegóły w sekcji „Wybór modelu”.", ""]
+    lines += api_error_banner(parts)
     lines += ["## Warunki pomiaru", ""] + meta_markdown(meta)
 
     exams = parts.get("exams")
     if isinstance(exams, dict) and exams.get("metrics"):
         lines += exams_markdown(exams, fmt)
     else:
-        lines += ["## 1. Polskie egzaminy lekarskie", "", _skip_text(parts.get("exams"), "exams"), ""]
-    for num, (part, title) in enumerate((("esi", "Wyjaśnienia decyzji ESI (polskie przypadki triażu)"),
-                                         ("tools", "Agent z narzędziami")), start=2):
-        lines += [f"## {num}. {title}", ""]
-        md = part_markdown.get(part)
-        lines += [md.strip(), ""] if md else [_skip_text(parts.get(part), part), ""]
-    lines += ["## 4. Koszty i zużycie tokenów", ""] + costs_markdown(costs, fmt)
-    lines += selection_markdown(selection, fmt)
+        lines += ["## Polskie egzaminy lekarskie", "", _skip_text(parts.get("exams"), "exams"), ""]
+    for part, title in (("esi", "Wyjaśnienia decyzji ESI (polskie przypadki triażu)"),
+                        ("tools", "Agent z narzędziami")):
+        md = (part_markdown.get(part) or "").strip()
+        if not md.startswith("## "):          # sekcja części bez własnego nagłówka najwyższego poziomu
+            lines += [f"## {title}", ""]
+        lines += [md, ""] if md else [_skip_text(parts.get(part), part), ""]
+    lines += ["## Koszty i zużycie tokenów", ""] + costs_markdown(costs, fmt)
+    lines += selection_markdown(selection, fmt, cloud=uses_cloud(meta))
     lines += [
         "## Ograniczenia",
         "",
@@ -374,6 +413,26 @@ def render_report(meta: dict[str, Any], parts: dict[str, Any], part_markdown: di
         "",
     ]
     return "\n".join(lines)
+
+
+def api_error_banner(parts: dict[str, Any]) -> list[str]:
+    """Ostrzeżenie na początku raportu, gdy część odpowiedzi to błędy API (liczone jako błędne)."""
+    counts: dict[str, int] = {}
+    exams = parts.get("exams") if isinstance(parts.get("exams"), dict) else {}
+    for row in exams.get("metrics", []) or []:
+        if row.get("split") == "all" and row.get("api_errors"):
+            counts[row["model"]] = counts.get(row["model"], 0) + int(row["api_errors"])
+    for part in ("esi", "tools"):
+        summary = (parts.get(part) or {}).get("summary") if isinstance(parts.get(part), dict) else None
+        for model, s in (summary or {}).items():
+            if isinstance(s, dict) and s.get("api_errors"):
+                counts[model] = counts.get(model, 0) + int(s["api_errors"])
+    if not counts:
+        return []
+    detail = ", ".join(f"`{m}`: {n}" for m, n in sorted(counts.items()))
+    return [f"> **Uwaga:** część zapytań zakończyła się błędem API po wszystkich ponowieniach ({detail}); takie "
+            "odpowiedzi liczone są jako błędne. Uruchom to samo polecenie ponownie — pobierze tylko brakujące "
+            "odpowiedzi (pamięć podręczna) — zanim użyjesz wyników w pracy.", ""]
 
 
 def _decided_label(decided: str | None) -> str:
@@ -391,6 +450,7 @@ def _skip_text(part: Any, name: str) -> str:
 
 __all__ = [
     "CLOUD_NOTE",
+    "api_error_banner",
     "DEPLOYABILITY_NOTES",
     "SELECTION_CRITERION",
     "costs_markdown",
@@ -401,4 +461,5 @@ __all__ = [
     "render_report",
     "select_model",
     "selection_markdown",
+    "uses_cloud",
 ]

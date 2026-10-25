@@ -19,7 +19,9 @@ Receptura:
 (cechy inżynieryjne przeliczane przez src.features.engineering) — tak samo jak 08 na
 zapisanych predykcjach: prawdopodobieństwa modeli zaokrąglane do float32 (format
 predictions_*.parquet), normalizacja, `blend`, `apply_temperature`, `decide_rule`.
-Dzięki temu what_if bez zmian odtwarza decyzję receptury dla tego wiersza.
+Decyzja przypadku jest liczona dla pojedynczego wiersza tą samą ścieżką co what_if (what_if bez
+zmian = decyzja przypadku bit w bit), a zgodność z decyzją 08 na zapisanych predykcjach jest
+sprawdzana i raportowana (`decision_check`, `live_vs_stored_mismatches`).
 """
 
 from __future__ import annotations
@@ -179,7 +181,7 @@ def load_recipe(path: Path | str, runs_dir: Path | str | None = None) -> Recipe:
         runs=runs, weights=weights, method=str(data.get("method", "mean")),
         temperature=None if temperature is None else float(temperature),
         spec=normalize_spec(spec), feature_set=str(data.get("feature_set", "triage")),
-        source=f"receptura {path}", data_fingerprint=data.get("data_fingerprint"),
+        source=f"plik {path.as_posix()}", data_fingerprint=data.get("data_fingerprint"),
     )
 
 
@@ -307,6 +309,23 @@ class RecipePredictor:
         """Wiersze kanoniczne → (prawdopodobieństwa, klasy 0–4)."""
         return self.predict_features(self.features(base))
 
+    @staticmethod
+    def row_frame(row: dict[str, float | None]) -> pd.DataFrame:
+        """Wiersz kanoniczny (słownik) → ramka 1 × kolumny, float32 (None = brak pomiaru → NaN)."""
+        return pd.DataFrame([{k: (np.nan if v is None else v) for k, v in row.items()}]).astype(np.float32)
+
+    def predict_row(self, row: dict[str, float | None]) -> tuple[np.ndarray, int, pd.DataFrame]:
+        """
+        Jeden pacjent, jak w backendzie i w what_if: (prawdopodobieństwa (5,), klasa 0–4, cechy X).
+
+        Ta sama ścieżka obliczeń dla przypadku i dla what_if — wynik bez zmian jest identyczny bit
+        w bit. (Wsadowe liczenie wielu wierszy może różnić się o 1 ulp float32 przez inną ścieżkę
+        BLAS, dlatego przypadki liczymy zawsze pojedynczo.)
+        """
+        X = self.features(self.row_frame(row))
+        proba, pred = self.predict_features(X)
+        return proba[0], int(pred[0]), X
+
 
 def stored_decisions(recipe: Recipe) -> pd.DataFrame:
     """
@@ -337,6 +356,16 @@ def fmt_num(value: float | None, digits: int = 1) -> str:
     if digits == 0 or abs(value - round(value)) < 1e-9 and digits <= 1:
         return str(int(round(value)))
     return f"{value:.{digits}f}".replace(".", ",")
+
+
+def plural_pl(n: int, one: str, few: str, many: str) -> str:
+    """Polska forma liczebnika: 1 przypadek, 2–4 przypadki (bez 12–14), 5+ przypadków."""
+    n = int(n)
+    if n == 1:
+        return f"{n} {one}"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} {few}"
+    return f"{n} {many}"
 
 
 def years_pl(age: float) -> str:
@@ -598,7 +627,8 @@ def allocate_strata(n_cases: int, available: dict[int, int],
                     base: dict[int, int] | None = None) -> dict[int, int]:
     """
     Liczba przypadków na poziom ESI: proporcje `base` (domyślnie 8/12/10/6/4) przeskalowane do
-    n_cases (największe reszty), ograniczone dostępnością; braki uzupełniane wg REFILL_ORDER.
+    n_cases (największe reszty), ograniczone dostępnością; niedobór rozdzielany po jednym przypadku
+    na poziom, kolejno wg REFILL_ORDER (najpierw ESI 2), dopóki są wiersze.
     """
     base = base or DEFAULT_STRATA
     total = sum(base.values())
@@ -678,8 +708,6 @@ def build_cases(
     val = load_split("val", columns=["row_id", *cols])
     val = val[val["row_id"].isin(row_ids)].set_index("row_id").loc[row_ids]
     base = val[cols].astype(np.float32)
-    X = predictor.features(base)
-    live_proba, live_pred = predictor.predict_features(X)
     if shap_helper is None:
         try:
             shap_helper = ShapHelper(predictor)
@@ -691,17 +719,19 @@ def build_cases(
     proba_cols = [f"p_{n.lower()}" for n in CLASS_NAMES]
     for i, row_id in enumerate(row_ids):
         stored = decisions.loc[row_id]
-        decision_idx = int(stored["decision"])
-        p = stored[proba_cols].to_numpy(dtype=float)
-        live_diff = float(np.abs(live_proba[i] - p).max())
-        if int(live_pred[i]) != decision_idx:
-            log.warning(f"Wiersz {row_id}: decyzja z modeli (ESI {int(live_pred[i]) + 1}) ≠ z zapisanych predykcji "
-                        f"(ESI {decision_idx + 1}); maks. różnica prawdopodobieństw {live_diff:.2e}")
+        stored_idx = int(stored["decision"])
         row = _clean_row(base.loc[row_id])
+        # Decyzja przypadku = receptura na tym jednym wierszu (jak backend i what_if);
+        # zgodność z decyzją 08 na zapisanych predykcjach — w decision_check
+        p, decision_idx, X_row = predictor.predict_row(row)
+        live_diff = float(np.abs(p - stored[proba_cols].to_numpy(dtype=float)).max())
+        if decision_idx != stored_idx:
+            log.warning(f"Wiersz {row_id}: decyzja z modeli (ESI {decision_idx + 1}) ≠ z zapisanych predykcji "
+                        f"(ESI {stored_idx + 1}); maks. różnica prawdopodobieństw {live_diff:.2e}")
         shap_items: list[dict[str, Any]] = []
         if shap_helper is not None:
             try:
-                shap_items = shap_helper.top_features(X.iloc[[i]], decision_idx)
+                shap_items = shap_helper.top_features(X_row, decision_idx)
             except Exception as exc:
                 log.warning(f"SHAP dla wiersza {row_id} nie powiódł się: {exc}")
         cases.append(EsiCase(
@@ -718,7 +748,7 @@ def build_cases(
             vitals=vitals_for_check(row),
             complaints=active_complaints(row),
             base_row=row,
-            decision_check={"stored_esi": decision_idx + 1, "live_esi": int(live_pred[i]) + 1,
+            decision_check={"stored_esi": stored_idx + 1, "live_esi": decision_idx + 1,
                             "max_abs_proba_diff": live_diff},
         ))
     return cases, predictor, shap_helper
@@ -788,13 +818,38 @@ def prepare_context(
     return EsiContext(recipe=recipe, predictor=predictor, cases=cases, shap=shap)
 
 
+# Kontekst zbudowany w tym procesie (część esi → część tools tego samego przebiegu: jedno
+# wczytanie modeli i jedno losowanie przypadków). Klucz obejmuje recepturę, runs/ i odcisk danych.
+_CONTEXT_MEMO: dict[tuple, EsiContext] = {}
+
+
+def _memo_key(kwargs: dict[str, Any]) -> tuple:
+    from src.data.dataset import data_fingerprint
+
+    recipe = kwargs.get("recipe_path")
+    runs_dir = kwargs.get("runs_dir") or config.RUNS_DIR
+    strata = kwargs.get("strata")
+    return (None if not recipe else str(Path(recipe).resolve()), str(Path(runs_dir).resolve()),
+            int(kwargs.get("n_cases", 40)), int(kwargs.get("seed", RANDOM_SEED)),
+            kwargs.get("feature_set", "triage"), kwargs.get("tag"),
+            None if strata is None else tuple(sorted(strata.items())), data_fingerprint())
+
+
 def try_prepare_context(**kwargs: Any) -> tuple[EsiContext | None, str | None]:
-    """Jak `prepare_context`, ale brak runów → (None, powód) zamiast wyjątku (część pomijana)."""
+    """
+    Jak `prepare_context`, ale brak runów → (None, powód) zamiast wyjątku (część pomijana).
+    Ten sam zestaw argumentów w jednym procesie → ten sam kontekst (bez ponownego liczenia).
+    """
+    key = _memo_key(kwargs)
+    if key in _CONTEXT_MEMO:
+        return _CONTEXT_MEMO[key], None
     try:
-        return prepare_context(**kwargs), None
+        ctx = prepare_context(**kwargs)
     except CasesUnavailable as exc:
         log.warning(f"Części esi/tools pominięte: {exc}")
         return None, str(exc)
+    _CONTEXT_MEMO[key] = ctx
+    return ctx, None
 
 
 __all__ = [

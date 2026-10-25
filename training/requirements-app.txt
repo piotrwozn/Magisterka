@@ -6,3 +6,9 @@ streamlit>=1.28
 lime>=0.2
 dice-ml>=0.11
 requests>=2.31
+
+# Porównanie modeli LLM (scripts/12_llm_bakeoff.py): pobranie pytań egzaminacyjnych NASK
+# z Hugging Face (NASK-PIB/Reassess-Polish-Medical-Exams). Token: `hf auth login` albo HF_TOKEN.
+# Bez tych pakietów działa wariant z lokalnym plikiem (--exam-file).
+datasets>=3.0
+huggingface_hub>=0.34          # polecenie `hf auth login`

@@ -39,7 +39,7 @@ import pandas as pd
 from src.llm_eval.cache import JsonlWriter, ResponseCache, prompt_hash
 from src.llm_eval.cc_labels_pl import feature_synonyms, fold_text, mentions
 from src.llm_eval.client import ChatResult, parse_think
-from src.llm_eval.esi_cases import EsiCase, EsiContext, fmt_num, try_prepare_context
+from src.llm_eval.esi_cases import EsiCase, EsiContext, fmt_num, plural_pl, try_prepare_context
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -402,9 +402,10 @@ def numeric_faithfulness(text: str, case: EsiCase,
             kind = "bp"
         # Najbliższe słowo kluczowe przed liczbą (≤ 35 znaków, bez innej liczby pomiędzy)
         prev_end = spans[idx - 1][1] if idx > 0 else -1
-        candidates = [(e, s, k) for s, e, k in keyword_hits if prev_end <= s and e <= start and start - e <= 35]
+        candidates = [(e, -s, k) for s, e, k in keyword_hits if prev_end <= s and e <= start and start - e <= 35]
         if candidates:
-            e, s, k = max(candidates)
+            e, neg_s, k = max(candidates)          # najbliższe; przy tym samym końcu — najdłuższe dopasowanie
+            s = -neg_s
             kw_start = s
             if kind is None or (kind == "bp" and k in ("bp", "rr_amb")):
                 kind = k
@@ -412,8 +413,11 @@ def numeric_faithfulness(text: str, case: EsiCase,
             continue
         if kind == "bp" and b_text is None and not candidates and not _SUFFIX_BP.match(after):
             continue
-        # Blokery (prawdopodobieństwa, skale, poziomy) między słowem kluczowym a liczbą lub tuż przed nim
-        if any(kw_start - 15 <= s and e <= start for s, e in blockers):
+        # Blokery (prawdopodobieństwa, skale, poziomy) między słowem kluczowym a liczbą albo tuż przed
+        # słowem kluczowym (np. „średnie ciśnienie”)
+        if any((kw_start <= s and e <= start)
+               or (e <= kw_start and kw_start - e <= 10 and not re.search(r"[,;.:!?()\d]", t[e:kw_start]))
+               for s, e in blockers):
             continue
         window = t[max(0, kw_start - 15):start]
         if _COMPARATORS.search(t[max(0, start - 18):start].rstrip()):
@@ -538,6 +542,12 @@ def cached_chat(client: Any, cache: ResponseCache | None, part: str, model: str,
     return res, cached
 
 
+def api_error(calls: list[ChatResult], result: Any) -> str | None:
+    """Błąd zapytania (sieć / limit / serwer), gdy przez niego nie ma wyniku; inaczej None."""
+    failed = [c.error for c in calls if not c.ok]
+    return failed[-1] if failed and result is None else None
+
+
 def _usage(calls: list[ChatResult]) -> dict[str, Any]:
     return {
         "n_calls": len(calls),
@@ -574,8 +584,7 @@ def run_esi_item(client: Any, model: str, case: EsiCase, ctx: EsiContext, *, thi
     item: dict[str, Any] = {
         "model": model, "case_id": case.case_id, "row_id": case.row_id, "nurse_esi": case.nurse_esi,
         "decision_esi": case.decision_esi, "valid": int(expl is not None), "strict": int(bool(strict)),
-        "via": via, "retried": int(retried), "api_error": next((c.error for c in calls if not c.ok), None)
-        if all(not c.ok for c in calls) or (expl is None and any(not c.ok for c in calls)) else None,
+        "via": via, "retried": int(retried), "api_error": api_error(calls, expl),
         "errors": errors, "explanation": expl, **_usage(calls),
     }
     if expl is not None:
@@ -716,6 +725,11 @@ def _ci_text(ci: list[float | None]) -> str:
     return f" ({fmt_num(100 * ci[0], 0)}–{fmt_num(100 * ci[1], 0)}%)"
 
 
+def int_text(value: int | None) -> str:
+    """Liczba całkowita z odstępem tysięcy (12 345)."""
+    return "—" if value is None else f"{int(value):,}".replace(",", " ")
+
+
 def _num_text(value: float | None, digits: int = 1) -> str:
     return "—" if value is None else fmt_num(value, digits)
 
@@ -728,15 +742,25 @@ def _usd(value: float | None) -> str:
 
 def render_markdown(summary: dict[str, dict[str, Any]], ctx: EsiContext, files: dict[str, str],
                     think: Any) -> str:
-    """Sekcja raportu (po polsku, tabele gotowe do pracy)."""
+    """Sekcja raportu (po polsku, tabele gotowe do pracy); ścieżki plików względem katalogu przebiegu."""
     s = ctx.summary()
+
+    def rel(key: str) -> str:
+        path = Path(files.get(key, ""))
+        base = Path(files["section_dir"]) if files.get("section_dir") else path.parent
+        try:
+            return path.relative_to(base).as_posix()
+        except ValueError:
+            return path.as_posix()
+
     lines = [
         "## Część ESI — wyjaśnienia decyzji triażowej",
         "",
-        f"- Przypadki: {s['n_cases']} wierszy VAL z kompletem HR/SBP/RR, warstwy wg ESI z triażu "
+        f"- Przypadki: {plural_pl(s['n_cases'], 'wiersz', 'wiersze', 'wierszy')} VAL z kompletem HR/SBP/RR, "
+        f"warstwy wg ESI z triażu "
         f"(pielęgniarka): " + ", ".join(f"ESI {k}: {v}" for k, v in s["nurse_esi_counts"].items())
         + "; decyzje systemu: " + ", ".join(f"ESI {k}: {v}" for k, v in s["decision_esi_counts"].items()) + ".",
-        f"- Receptura decyzji: {ctx.recipe.source}. {ctx.recipe_text.capitalize()}.",
+        f"- Receptura decyzji ({ctx.recipe.source}): {ctx.recipe_text}.",
         f"- SHAP: model `{s['shap_model']}` (metoda {s['shap_method']}), top-5 cech dla poziomu decyzji.",
         f"- Wymuszone narzędzie `{SUBMIT_NAME}` (bez `format` — chmura go ignoruje); brak wywołania → JSON z treści; "
         f"nadal źle → 1 ponowienie z opisem błędu. Rozumowanie: `think={think!r}`.",
@@ -757,8 +781,7 @@ def render_markdown(summary: dict[str, dict[str, Any]], ctx: EsiContext, files: 
             f"({m['numbers_wrong']}/{m['numbers_checked']} liczb) | {pct(m['polish_rate'])} | {pct(m['citation_rate'])} | "
             f"{m['esc_useful']} / {m['esc_false_alarm']} / {m['esc_wrong_direction']} | "
             f"{m['esc_missed']} z {m['esc_opportunities']} | {_num_text(m['latency_s_median'])} | "
-            f"{m['prompt_tokens']:,} / {m['completion_tokens']:,} | {_usd(m['cost_usd'])} |".replace(",", " ")
-            .replace("  ", " "))
+            f"{int_text(m['prompt_tokens'])} / {int_text(m['completion_tokens'])} | {_usd(m['cost_usd'])} |")
     lines += [
         "",
         "Definicje: *poprawne wyjście* — obiekt zgodny ze schematem po lekkiej normalizacji (np. „2” → 2), "
@@ -769,8 +792,8 @@ def render_markdown(summary: dict[str, dict[str, Any]], ctx: EsiContext, files: 
         "z triażu było pilniejsze niż decyzja systemu; *pominięte okazje* — takie przypadki bez sugestii. "
         "Metryki tekstowe są heurystyczne — rozstrzyga ślepa ocena ekspercka.",
         "",
-        f"Ślepy arkusz ocen: `{files.get('ratings_html', '')}` (+ `{files.get('ratings_template', '')}`); "
-        f"klucz modeli osobno: `{files.get('ratings_key', '')}`. Po wypełnieniu: "
+        f"Ślepy arkusz ocen: `{rel('ratings_html')}` (+ `{rel('ratings_template')}`); "
+        f"klucz modeli osobno: `{rel('ratings_key')}` (nie przekazywać oceniającym). Po wypełnieniu: "
         f"`python scripts/12_llm_bakeoff.py score-ratings --csv <plik.csv>`.",
         "",
     ]
@@ -796,13 +819,16 @@ def run_esi_part(
     cache: ResponseCache | None = None,
     prices: dict[str, Any] | None = None,
     runs_dir: Path | str | None = None,
+    raw_log: JsonlWriter | None = None,
     write_ratings: bool = True,
 ) -> dict[str, Any]:
     """
     Część "esi": każdy model × każdy przypadek. Zwraca {"part", "skipped", "summary" (model →
     metryki), "items", "files", "markdown", "context"}; pliki w out_dir: esi_cases.json,
-    esi_items.csv, esi_summary.csv, raw_esi.jsonl, ratings/ratings.html, ratings/ratings_template.csv,
-    key.json. Brak runów / receptury → {"skipped": powód} (część exams działa dalej).
+    esi_items.csv, esi_summary.csv, esi_section.md, ratings/ratings.html, ratings/ratings_template.csv,
+    key.json i surowe odpowiedzi (`raw_log` przebiegu albo raw_esi.jsonl). Brak runów / receptury →
+    {"skipped": powód} (część exams działa dalej). Kontekst (przypadki) jest współdzielony z częścią
+    tools tego samego procesu (`try_prepare_context`).
     """
     from src.llm_eval import ratings as rt
     from src.utils.fileio import write_text_atomic
@@ -816,7 +842,7 @@ def run_esi_part(
     out.mkdir(parents=True, exist_ok=True)
     think = parse_think(think)
     files = {"cases": str(context.save(out / "esi_cases.json"))}
-    raw = JsonlWriter(out / RAW_FILE)
+    raw = raw_log if raw_log is not None else JsonlWriter(out / RAW_FILE)
     concurrency = int(getattr(client, "concurrency", 3) or 3)
     work = [(m, c) for m in models for c in context.cases]
     log.info(f"Część ESI: {len(models)} model(e) × {len(context.cases)} przypadków = {len(work)} pozycji "
@@ -833,10 +859,10 @@ def run_esi_part(
     pd.DataFrame([{"model": m, **{k: v for k, v in s.items() if not isinstance(v, list)}}
                   for m, s in summary.items()]).to_csv(out / "esi_summary.csv", index=False, encoding="utf-8")
     files.update({"items_csv": str(out / "esi_items.csv"), "summary_csv": str(out / "esi_summary.csv"),
-                  "raw": str(out / RAW_FILE)})
+                  "raw": str(raw.path)})
     if write_ratings:
         files.update(rt.write_rating_sheet(out, context, items, models, seed=seed))
-    markdown = render_markdown(summary, context, files, think)
+    markdown = render_markdown(summary, context, {**files, "section_dir": str(out)}, think)
     write_text_atomic(out / "esi_section.md", markdown)
     files["section_md"] = str(out / "esi_section.md")
     return {"part": PART, "skipped": None, "summary": summary, "items": items, "files": files,

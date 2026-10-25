@@ -192,7 +192,7 @@ def load_exam_sources(exam_files: Sequence[str | Path] | None = None,
 def normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
     """Typy kolumn, litera odpowiedzi, uuid (gdy brak — zastępczy z egzaminu, edycji i id), item_id."""
     out = df.copy()
-    out["question"] = out["question"].astype(str)
+    out["question"] = out["question"].astype(str).str.replace("\r\n", "\n", regex=False)   # CSV z Windows
     out["answer"] = out["answer"].astype(str).str.strip().str.upper()
     out["exam_name"] = out["exam_name"].astype(str)
     out["id"] = out["id"].astype(str)
@@ -289,6 +289,18 @@ def stratified_sample(df: pd.DataFrame, n: int, strata_col: str, seed: int) -> p
     return pd.concat(picked).sort_values([strata_col, "item_id"]).reset_index(drop=True)
 
 
+SPECIALTY_COLUMNS: tuple[str, ...] = ("specialty", "specialization", "specjalizacja", "category", "subject")
+
+
+def _specialty_text(df: pd.DataFrame) -> pd.Series:
+    """exam_name + ewentualne kolumny ze specjalizacją (jeśli zbiór je ma) — tekst do dopasowania wzorców PES."""
+    text = df["exam_name"].astype(str)
+    for col in SPECIALTY_COLUMNS:
+        if col in df.columns:
+            text = text + " " + df[col].fillna("").astype(str)
+    return text
+
+
 def sample_items(df: pd.DataFrame, n_lek: int = DEFAULT_N_LEK, n_pes: int = DEFAULT_N_PES,
                  seed: int = DEFAULT_SEED,
                  pes_patterns: Sequence[str] = PES_SPECIALTY_PATTERNS) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -300,7 +312,8 @@ def sample_items(df: pd.DataFrame, n_lek: int = DEFAULT_N_LEK, n_pes: int = DEFA
     lek_pool = pool[pool["split"] == SPLIT_LEK]
     pes_pool = pool[pool["split"] == SPLIT_PES]
     pattern = "|".join(pes_patterns)
-    spec = pes_pool[pes_pool["exam_name"].str.contains(pattern, case=False, regex=True, na=False)] if pattern else pes_pool.iloc[0:0]
+    spec = pes_pool[_specialty_text(pes_pool).str.contains(pattern, case=False, regex=True, na=False)] \
+        if pattern else pes_pool.iloc[0:0]
     pes_mode = "specialty" if len(spec) else "random"
     lek = stratified_sample(lek_pool, n_lek, "exam_name", seed)
     pes = stratified_sample(spec if len(spec) else pes_pool, n_pes, "exam_name", seed)
@@ -330,21 +343,47 @@ def sample_items(df: pd.DataFrame, n_lek: int = DEFAULT_N_LEK, n_pes: int = DEFA
 # Parsowanie odpowiedzi
 # ─────────────────────────────────────────
 _LETTER_TAIL = r"[\s:：\-–—=]*[\*_\"'„”«»(\[]*\s*([A-E])(?!\w)"
-_ANSWER_RE = re.compile(
-    r"(?i:odpowied(?:ź|zią|z(?!i))|answer)(?:\s+(?i:to|jest|brzmi|is|nr))*" + _LETTER_TAIL
-)
+_KW = r"(?:odpowied(?:ź|zią|z(?!i))|answer)"
+_ADJ = r"(?:prawidłow\w*|poprawn\w*|właściw\w*|correct|final|ostateczn\w*|końcow\w*)"
+_LINK = r"(?:\s+(?:to|jest|brzmi|is))"
+# Silne wzorce: jawna deklaracja odpowiedzi („Prawidłowa odpowiedź to B”, „Odpowiedź prawidłowa: B”,
+# „odpowiedź to B”, „Answer: B”). Słabe: samo „odpowiedź X” (np. w uzasadnieniu „odpowiedź A jest błędna”).
+_STRONG_RES = tuple(re.compile(p + _LETTER_TAIL) for p in (
+    rf"(?i:{_ADJ}\s+{_KW}{_LINK}*)",
+    rf"(?i:{_KW}\s+{_ADJ}{_LINK}*)",
+    rf"(?i:{_KW}{_LINK}+)",
+    rf"(?i:{_KW})\s*[:：]",
+))
+_WEAK_RE = re.compile(rf"(?i:{_KW}){_LINK}*" + _LETTER_TAIL, )
 _LONE_RE = re.compile(r"^[\s\*_\"'„”«»(\[]*([A-E])[\s\.\)\]\*_\"'”»:]*$")
 _LINE_RE = re.compile(r"^[\s\*_\"'„«(\[]*([A-E])(?:[\.\)\]:]|\*\*|\s*$)")
 
 
 def parse_answer(content: str | None) -> str | None:
     """
-    Litera A–E z odpowiedzi modelu albo None: ostatnie „odpowiedź (to) X” / „Answer: X”,
-    samotna litera („B”, „**B.**”), linia zaczynająca się od „X.” / „X)” (ostatnia, potem pierwsza).
+    Litera A–E z odpowiedzi modelu albo None. Kolejność: OSTATNIA jawna deklaracja („Prawidłowa
+    odpowiedź to X”, „Odpowiedź prawidłowa: X”, „odpowiedź to X”, „Answer: X”), samotna litera
+    („B”, „**B.**”), ostatnia linia zaczynająca się od „X.” / „X)” / „X”, ostatnie słabe
+    „odpowiedź X”, pierwsza linia „X. …”. Rozumowanie (thinking) nie jest tu przekazywane.
     """
     text = str(content or "").strip()
     if not text:
         return None
+    strong = [(m.end(), m.group(1)) for rx in _STRONG_RES for m in rx.finditer(text)]
+    if strong:
+        return max(strong)[1]
+    lone = _LONE_RE.match(text)
+    if lone:
+        return lone.group(1)
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    last = _LINE_RE.match(lines[-1])
+    if last:
+        return last.group(1)
+    weak = _WEAK_RE.findall(text)
+    if weak:
+        return weak[-1]
+    first = _LINE_RE.match(lines[0])
+    return first.group(1) if first else None
     matches = _ANSWER_RE.findall(text)
     if matches:
         return matches[-1]

@@ -48,6 +48,9 @@ from urllib.parse import urlparse
 
 import requests
 
+from src.utils.logger import get_logger
+
+log = get_logger(__name__)
 # ─────────────────────────────────────────
 # Stałe
 # ─────────────────────────────────────────
@@ -269,6 +272,7 @@ class OllamaChat:
         self._fail_streak: dict[str, int] = {}
         self._last_error: dict[str, str] = {}
         self._tags: list[dict[str, Any]] | None = None
+        self._no_think: set[str] = set()          # modele, które odrzuciły `think` (400)
         self.usage: dict[str, dict[str, float]] = {}
 
     # ── pomocnicze ──
@@ -358,16 +362,18 @@ class OllamaChat:
             self._record(model, res)
             return res
 
+        notes: list[str] = []
         body: dict[str, Any] = {"model": self.api_model(model), "messages": list(messages), "stream": False}
         if tools:
             body["tools"] = tools
-        if think is not None:
+        if think is not None and model not in self._no_think:
             body["think"] = think
+        elif think is not None:
+            notes.append(f"think={think!r} pominięte (model go nie obsługuje)")
         if options:
             body["options"] = options
 
         url = f"{self.base_url}/api/chat"
-        notes: list[str] = []
         attempts = 0
         started = time.perf_counter()
         last_error, last_status, last_raw = "nieznany błąd", None, {}
@@ -408,6 +414,12 @@ class OllamaChat:
                 last_raw = {"status": status, "body": text[:2000]}
                 if status == 400 and "think" in body and "think" in last_error.lower():
                     notes.append(f"model odrzucił think={body['think']!r} — ponowienie bez think")
+                    with self._lock:
+                        first = model not in self._no_think
+                        self._no_think.add(model)
+                    if first:
+                        log.warning(f"{model}: serwer odrzucił think={body['think']!r} ({last_error}) — "
+                                    f"zapytania do tego modelu idą bez think")
                     body.pop("think")
                     attempts -= 1
                     continue

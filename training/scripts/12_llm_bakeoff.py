@@ -52,6 +52,7 @@ PART_ENTRY: dict[str, tuple[str, str]] = {
 }
 RATINGS_ENTRY: tuple[tuple[str, str], ...] = (("src.llm_eval.ratings", "score_ratings"),
                                               ("src.llm_eval.explain_task", "score_ratings"))
+SECONDS_PER_CALL: dict[str, float] = {"exams": 6.0, "esi": 25.0, "tools": 10.0}   # tylko do --dry-run
 PING_MESSAGES = [{"role": "user", "content": "Test łączności. Odpowiedz jednym słowem: OK"}]
 
 
@@ -90,8 +91,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--decimal-comma", action="store_true", help="Przecinek dziesiętny w report.md")
 
     score = sub.add_parser("score-ratings", help="Wczytaj wypełnione ślepe oceny (ratings) i policz średnie")
-    score.add_argument("--csv", required=True, help="Wypełniony arkusz ocen (CSV)")
-    score.add_argument("--key", default=None, help="key.json z przebiegu (domyślnie obok CSV)")
+    score.add_argument("--csv", required=True, action="append",
+                       help="Wypełniony arkusz ocen (CSV); kilku oceniających — podaj --csv kilka razy")
+    score.add_argument("--key", default=None, help="key.json z przebiegu (domyślnie szukany obok arkuszy)")
     score.add_argument("--out", default=None, help="Katalog wyniku (domyślnie katalog CSV)")
     score.add_argument("--seed", type=int, default=42)
     return parser
@@ -187,13 +189,22 @@ def part_costs(part: str, res: dict[str, Any], usage: dict[str, dict[str, float]
     """Zużycie części: `usage` z wyników części (gdy podała) albo licznik klienta z tego przebiegu."""
     from src.llm_eval.pricing import cost_usd
 
-    source = res.get("usage") if isinstance(res.get("usage"), dict) else usage
+    if isinstance(res.get("usage"), dict):
+        source = res["usage"]
+    elif isinstance(res.get("summary"), dict) and any(isinstance(v, dict) and "prompt_tokens" in v
+                                                      for v in res["summary"].values()):
+        source = res["summary"]          # część ESI/narzędzi: tokeny wszystkich pozycji (także z cache)
+    else:
+        source = usage
     rows = []
     for model, u in (source or {}).items():
-        if not isinstance(u, dict) or not u.get("calls", u.get("prompt_tokens", 0)):
+        if not isinstance(u, dict):
             continue
+        calls = u.get("calls", u.get("n_items", 0)) or 0
         pt, ct = float(u.get("prompt_tokens") or 0), float(u.get("completion_tokens") or 0)
-        rows.append({"part": part, "model": model, "calls": u.get("calls", 0), "prompt_tokens": pt,
+        if not calls and not pt:
+            continue
+        rows.append({"part": part, "model": model, "calls": calls, "prompt_tokens": pt,
                      "completion_tokens": ct, "cost_usd": cost_usd(model, pt, ct, prices)})
     return rows
 
@@ -239,8 +250,8 @@ def _dry_run(args: argparse.Namespace, parts: list[str], models: list[str], clie
         try:
             items, sinfo = sample_items(load_exam_sources(args.exam_file), n_lek=args.n_exam, n_pes=args.n_pes,
                                         seed=args.seed)
-            print(f"  Egzaminy: {sinfo['n']['lek']} LEK + {sinfo['n']['pes']} PES "
-                  f"(PES: {sinfo['pes_mode']}) × 2 protokoły")
+            pes_txt = "specjalizacje SOR / interna" if sinfo["pes_mode"] == "specialty" else "losowe"
+            print(f"  Egzaminy: {sinfo['n']['lek']} LEK + {sinfo['n']['pes']} PES (PES: {pes_txt}) × 2 protokoły")
         except Exception as exc:     # noqa: BLE001 — w planie tylko ostrzeżenie
             print(f"  Egzaminy: nie udało się wczytać pytań ({exc}) — szacunek dla N={args.n_exam + args.n_pes}")
         opts = {**DEFAULT_OPTIONS, "temperature": args.temperature, "seed": args.seed}
@@ -263,6 +274,10 @@ def _dry_run(args: argparse.Namespace, parts: list[str], models: list[str], clie
               f"{format_usd(r['uncached_cost_usd']):>7}")
     print(f"\n  Razem: {format_usd(total)} (bez pozycji z pamięci podręcznej: {format_usd(total_un)}); "
           f"ceny: {PRICING_SOURCE}. Przy abonamencie Ollama to koszt orientacyjny (limit planu, nie faktura).")
+    seconds = sum(r["uncached_calls"] * SECONDS_PER_CALL.get(r["part"], 10.0) for r in rows) / max(1, args.concurrency)
+    print(f"  Szacowany czas: ≈ {seconds / 3600:.1f} h (założenie: "
+          + ", ".join(f"{p} ~{s:.0f} s/zapytanie" for p, s in SECONDS_PER_CALL.items())
+          + f", {args.concurrency} naraz; rzeczywisty czas zależy od obciążenia chmury)")
     return 0
 
 
@@ -339,6 +354,7 @@ def _run(args: argparse.Namespace, parts: list[str], models: list[str], think: A
     from src.llm_eval.report import render_report, select_model
     from src.utils.fileio import write_json_atomic, write_text_atomic
 
+    _attach_log(log_path)          # loggery modułów zaimportowanych przed chwilą też do bakeoff.log
     command = "python scripts/12_llm_bakeoff.py " + " ".join(shlex.quote(a) for a in sys.argv[1:]) \
         if Path(sys.argv[0]).name == "12_llm_bakeoff.py" else "run (wywołanie z kodu)"
     server = client.server_info()
@@ -442,13 +458,14 @@ def _run(args: argparse.Namespace, parts: list[str], models: list[str], think: A
 # score-ratings
 # ─────────────────────────────────────────
 def cmd_score_ratings(args: argparse.Namespace) -> int:
-    csv_path = Path(args.csv)
-    if not csv_path.exists():
-        log.error(f"Brak pliku ocen: {csv_path}")
+    csv_paths = [Path(p) for p in args.csv]
+    missing = [str(p) for p in csv_paths if not p.exists()]
+    if missing:
+        log.error(f"Brak pliku ocen: {', '.join(missing)}")
         return 2
-    key = Path(args.key) if args.key else csv_path.parent / "key.json"
-    out = Path(args.out) if args.out else csv_path.parent
-    fn, why = None, None
+    key = Path(args.key) if args.key else None
+    out = Path(args.out) if args.out else csv_paths[0].parent
+    fn, why, module = None, None, None
     for module, attr in RATINGS_ENTRY:
         fn, why = load_entry(module, attr)
         if fn is not None:
@@ -456,14 +473,19 @@ def cmd_score_ratings(args: argparse.Namespace) -> int:
     if fn is None:
         log.error(f"Ocena arkuszy niedostępna: {why}")
         return 2
-    ctx = {"csv": csv_path, "csv_path": csv_path, "ratings_csv": csv_path, "key": key, "key_path": key,
+    ctx = {"csv_paths": csv_paths, "csv": csv_paths[0], "csv_path": csv_paths[0], "key": key, "key_path": key,
            "out": out, "out_dir": out, "seed": args.seed, "log": log}
-    ret = call_with_context(fn, ctx)
+    try:
+        ret = call_with_context(fn, ctx)
+    except (ValueError, FileNotFoundError, KeyError) as exc:
+        log.error(f"Nie udało się wczytać ocen: {exc}")
+        return 2
     res, md = unpack_part(ret)
-    if md:
-        print(md)
-    elif isinstance(ret, str):
-        print(ret)
+    writer = getattr(importlib.import_module(module), "write_scores", None)
+    if writer is not None and isinstance(ret, dict):
+        files = call_with_context(writer, {"result": ret, "out_dir": out})
+        log.info(f"Wyniki ocen zapisane: {files}")
+    print(md or (ret if isinstance(ret, str) else ""))
     return 0
 
 
