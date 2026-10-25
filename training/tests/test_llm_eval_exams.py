@@ -179,6 +179,12 @@ def test_sample_items_prefers_ed_and_internal_pes():
     assert items["item_id"].is_unique
 
 
+def test_pes_specialty_matching_ignores_diacritics_and_case():
+    df = make_nask_frame(pes_editions=["PES_CHOROBY_WEWNETRZNE_2023", "pes kardiologia 2023"])
+    items, info = sample_items(df, n_lek=5, n_pes=10, seed=42)
+    assert info["pes_mode"] == "specialty" and info["pes_exam_names"] == ["PES_CHOROBY_WEWNETRZNE_2023"]
+
+
 def test_sample_items_random_pes_when_specialty_unknown():
     df = make_nask_frame(pes_editions=["PES jesień 2022", "PES wiosna 2023"])
     items, info = sample_items(df, n_lek=10, n_pes=15, seed=42)

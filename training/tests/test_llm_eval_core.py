@@ -387,7 +387,12 @@ def test_select_model_tie_broken_by_standard_then_esi():
 def test_select_model_without_exams_uses_esi_or_reports_missing():
     from src.llm_eval.report import select_model
 
-    assert select_model(None, {"ranking_score": {"a": 0.2, "b": 0.7}})["winner"] == "b"
+    from src.llm_eval.report import selection_markdown
+
+    sel = select_model(None, {"ranking_score": {"a": 0.2, "b": 0.7}})
+    assert sel["winner"] == "b" and "--parts exams,esi,tools" in sel["explanation"]
+    table = "\n".join(selection_markdown(sel))
+    assert "| 1 | `b` | — | — | — | 0.700 |" in table              # bez egzaminów: brak kolumny remisu
     assert select_model(None, None)["winner"] is None
 
 

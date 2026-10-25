@@ -149,7 +149,9 @@ def select_model(exams: dict[str, Any] | None, esi: dict[str, Any] | None = None
             order = sorted(scores, key=lambda m: -scores[m])
             out.update(winner=order[0], decided_by="esi",
                        explanation="Brak części egzaminacyjnej — ranking tylko wg wyniku części ESI (kryterium "
-                                   "główne niedostępne).")
+                                   "główne niedostępne). Do wyboru według uzgodnionego kryterium uruchom wszystkie "
+                                   "części jednym poleceniem (`--parts exams,esi,tools`) — odpowiedzi egzaminacyjne "
+                                   "z wcześniejszego przebiegu zostaną wzięte z pamięci podręcznej.")
             out["ranking"] = [{"rank": i + 1, "model": m, "esi_score": scores[m],
                                "note": deployability_note(m)} for i, m in enumerate(order)]
         else:
@@ -216,6 +218,15 @@ def _rate(fmt: Fmt, row: dict[str, Any] | None) -> str:
     return fmt.rate(row["correct"], row["n"])
 
 
+def _pes_names(names: list[str], limit: int = 12) -> str:
+    """Egzaminy PES w próbie: nazwy (do sprawdzenia filtra specjalizacji) albo sama liczba, gdy jest ich dużo."""
+    if not names:
+        return "brak egzaminów"
+    if len(names) > limit:
+        return f"liczba egzaminów: {len(names)}"
+    return "egzaminy: " + ", ".join(names)
+
+
 def _source_text(source: dict[str, Any] | None) -> str:
     """Źródło pytań do raportu: zbiór HF z rewizją albo pliki z sumą SHA-256."""
     if not source:
@@ -244,7 +255,7 @@ def exams_markdown(exams: dict[str, Any], fmt: Fmt | None = None) -> list[str]:
         "",
         f"Próba (seed {s.get('seed')}, te same pytania dla każdego modelu i obu protokołów): liczba pytań LEK "
         f"**{n.get('lek', 0)}** (losowanie warstwowe wg edycji egzaminu; liczba edycji: {s.get('lek_editions', '?')}), "
-        f"liczba pytań PES **{n.get('pes', 0)}** ({pes_txt}; liczba egzaminów: {len(s.get('pes_exam_names') or [])}). "
+        f"liczba pytań PES **{n.get('pes', 0)}** ({pes_txt}; {_pes_names(s.get('pes_exam_names') or [])}). "
         f"Pula: pytania jednokrotnego wyboru A–E kwalifikujące się do protokołu abstaining_substitution "
         f"(wykluczenia jak w skrypcie NASK). {_source_text(s.get('source'))}",
         "",
@@ -359,6 +370,7 @@ def selection_markdown(sel: dict[str, Any], fmt: Fmt | None = None, cloud: bool 
         rows.append([str(r["rank"]), f"`{r['model']}`",
                      fmt.pct_ci(abst.get("accuracy"), abst.get("ci_low"), abst.get("ci_high")) if abst else "—",
                      fmt.pct_ci(std.get("accuracy"), std.get("ci_low"), std.get("ci_high")) if std else "—",
+                     "—" if not abst else
                      "najlepszy" if r["model"] == best_primary else ("tak" if r.get("tied_primary") else "nie"),
                      fmt.num(r.get("esi_score"), 3) if r.get("esi_score") is not None else "—"])
     if rows:

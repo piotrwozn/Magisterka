@@ -93,8 +93,10 @@ FREE_FORM_NEGATIVE_PATTERNS: tuple[str, ...] = (
     r"wymienionych", r"prawdopodobne", r"poniższych", r"powyższych", r"podanych", r"zaproponowanych",
     r"powyższe", r"wszystkie", r"przedstawionych", r"niżej", r"przedstawiony", r"z wyjątkiem",
 )
-# Specjalizacje PES bliskie SOR (dopasowanie w exam_name, bez rozróżniania wielkości liter)
-PES_SPECIALTY_PATTERNS: tuple[str, ...] = (r"ratunk", r"wewnętrzn", r"emergency", r"internal")
+# Specjalizacje PES bliskie SOR — dopasowanie w exam_name (i kolumnach specjalizacji) po zamianie na małe
+# litery bez polskich znaków („Choroby wewnętrzne” = „choroby_wewnetrzne”)
+PES_SPECIALTY_PATTERNS: tuple[str, ...] = (r"ratunk", r"wewnetrzn", r"emergency", r"internal")
+_FOLD_PL = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
 
 DEFAULT_N_LEK, DEFAULT_N_PES, DEFAULT_SEED = 300, 200, 42
 DEFAULT_OPTIONS: dict[str, Any] = {"temperature": 0.0, "seed": 42, "num_predict": 4096}
@@ -326,7 +328,7 @@ def _specialty_text(df: pd.DataFrame) -> pd.Series:
     for col in SPECIALTY_COLUMNS:
         if col in df.columns:
             text = text + " " + df[col].fillna("").astype(str)
-    return text
+    return text.map(lambda t: t.translate(_FOLD_PL).lower())
 
 
 def sample_items(df: pd.DataFrame, n_lek: int = DEFAULT_N_LEK, n_pes: int = DEFAULT_N_PES,
