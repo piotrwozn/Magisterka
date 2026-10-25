@@ -558,7 +558,11 @@ class EsiCase:
     def decision_text(self, recipe_text: str | None = None) -> str:
         probs = ", ".join(f"ESI {i + 1}: {fmt_num(100 * self.probabilities[n], 1)}%"
                           for i, n in enumerate(CLASS_NAMES))
-        lines = [f"Decyzja systemu: ESI {self.decision_esi} ({config.CLASS_NAMES_PL[self.decision_esi - 1]}).",
+        color = config.TOPSOR_COLORS[self.decision_esi - 1]
+        wait = config.TOPSOR_MAX_WAIT_MINUTES[color]
+        lines = [f"Decyzja systemu: ESI {self.decision_esi} (kolor TOPSOR: "
+                 f"{config.TOPSOR_COLORS_PL[self.decision_esi - 1]}, "
+                 f"{'natychmiast' if not wait else f'kontakt z lekarzem do {wait} min'}).",
                  f"Prawdopodobieństwa poziomów (po kalibracji): {probs}.",
                  f"Oczekiwany poziom ESI: {fmt_num(self.expected_esi, 2)}."]
         if recipe_text:
@@ -682,7 +686,7 @@ def select_rows(decisions: pd.DataFrame, n_cases: int, seed: int,
             chosen += [int(i) for i in rng.choice(ids, size=alloc[level], replace=False)]
     chosen = [chosen[i] for i in rng.permutation(len(chosen))]
     log.info("Przypadki ESI: " + ", ".join(f"ESI {k}: {v}" for k, v in sorted(alloc.items()))
-             + f" (z {len(pool):,} wierszy VAL z kompletem HR/SBP/RR)")
+             + f" (z {len(pool):,} wierszy VAL z kompletem HR/SBP/RR)".replace(",", " "))
     return chosen
 
 

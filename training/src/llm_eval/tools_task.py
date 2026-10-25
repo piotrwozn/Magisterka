@@ -53,6 +53,7 @@ from src.llm_eval.explain_task import (
     assistant_message,
     cached_chat,
     coerce_explanation,
+    decimal_point,
     extract_json_object,
     int_text,
     items_frame,
@@ -587,11 +588,12 @@ def run_tools_part(
     runs_dir: Path | str | None = None,
     raw_log: JsonlWriter | None = None,
     max_steps: int = MAX_STEPS,
+    decimal_comma: bool = False,
 ) -> dict[str, Any]:
     """
     Część "tools": agent × przypadek. Zwraca {"part", "skipped", "summary", "items", "files",
     "markdown", "context"}; pliki: tools_items.csv, tools_summary.csv, tools_trajectories.jsonl,
-    raw_tools.jsonl (+ esi_cases.json, jeśli kontekst budowany tutaj).
+    raw_tools.jsonl (+ esi_cases.json, jeśli kontekst budowany tutaj). decimal_comma — jak w run_esi_part.
     """
     from src.utils.fileio import write_text_atomic
 
@@ -629,6 +631,8 @@ def run_tools_part(
         traj.write({"model": it["model"], "case_id": it["case_id"], "trajectory": it.get("trajectory"),
                     "explanation": it.get("explanation")})
     markdown = render_markdown(summary, context, think, max_steps)
+    if not decimal_comma:
+        markdown = decimal_point(markdown)
     write_text_atomic(out / "tools_section.md", markdown)
     files.update({"items_csv": str(out / "tools_items.csv"), "summary_csv": str(out / "tools_summary.csv"),
                   "trajectories": str(out / "tools_trajectories.jsonl"), "raw": str(raw.path),

@@ -302,6 +302,8 @@ def test_cli_all_three_parts_rank_models(llm_esi_env, env_paths, tmp_path):
         assert heading in report, heading
     assert f"Wybrany model: `{strong}`" in report and "Czas na pozycję" in report
     assert "structured outputs" in report and "ratings.html" in report
+    parts_md = report.split("## Część ESI")[1].split("## Koszty")[0]
+    assert not re.search(r"\d,\d", parts_md)                  # bez --decimal-comma: kropka jak w reszcie raportu
     results = json.loads((out / "results.json").read_text(encoding="utf-8"))
     assert results["selection"]["winner"] == strong
     assert {c["part"] for c in results["costs"]} == {"exams", "esi", "tools"}

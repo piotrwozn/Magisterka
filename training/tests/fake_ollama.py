@@ -41,8 +41,9 @@ STABILNE API (używają go testy CORE i ESI — zmiany tylko zgodne wstecz)
     (skrypt) albo funkcja(req: dict) → str | Reply | dict, gdzie req = ciało JSON zapytania
     ({"model", "messages", "tools"?, "think"?, "options"?, "stream"?}).
 
-    srv.add_model(name, responder, details=None, capabilities=None, digest=None) — details trafiają
-    do /api/show i /api/tags (domyślnie family "fake", parameter_size "1B", …).
+    srv.add_model(name, responder, details=None, capabilities=None, digest=None, thinking=None) —
+    details trafiają do /api/show i /api/tags (domyślnie family "fake", parameter_size "1B", …);
+    thinking = obiekt "thinking" z /api/show (domyślnie {"values": ["low", "medium", "high"]}).
 
     exam_oracle(answer_key, p_correct=…) — gotowa odpowiedź dla testów egzaminów (zob. niżej).
     triage_responder(answer_key, skill=…) — „model” dla wszystkich części (egzaminy + esi + tools).
@@ -105,6 +106,7 @@ class _Model:
     capabilities: list[str]
     digest: str
     position: int = 0          # pozycja w skrypcie (lista odpowiedzi)
+    thinking: dict[str, Any] | None = None     # /api/show "thinking" (None → low/medium/high)
 
 
 @dataclass
@@ -181,7 +183,8 @@ class FakeOllama:
 
     # ── konfiguracja ──
     def add_model(self, name: str, responder: Responder, details: dict[str, Any] | None = None,
-                  capabilities: list[str] | None = None, digest: str | None = None) -> FakeOllama:
+                  capabilities: list[str] | None = None, digest: str | None = None,
+                  thinking: dict[str, Any] | None = None) -> FakeOllama:
         base = {"format": "gguf", "family": "fake", "families": ["fake"], "parameter_size": "1B",
                 "quantization_level": "F16", "context_length": 8192, "parent_model": ""}
         base.update(details or {})
@@ -191,6 +194,7 @@ class FakeOllama:
                 details=base,
                 capabilities=list(capabilities or ["completion", "tools", "thinking"]),
                 digest=digest or hashlib.sha256(name.encode("utf-8")).hexdigest(),
+                thinking=thinking,
             )
         return self
 
@@ -297,7 +301,7 @@ class FakeOllama:
             "capabilities": entry.capabilities,
             "model_info": {"general.architecture": entry.details.get("family", "fake")},
             "modified_at": "2026-10-01T00:00:00Z",
-            "thinking": {"values": ["low", "medium", "high"], "default": "medium"},
+            "thinking": entry.thinking or {"values": ["low", "medium", "high"], "default": "medium"},
         }
 
     def tags_payload(self) -> dict[str, Any]:

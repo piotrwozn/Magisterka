@@ -113,6 +113,35 @@ def parse_think(value: Any) -> bool | str | None:
     raise ValueError(f"Nieznana wartość think '{value}' (low | medium | high | max | true | false | default)")
 
 
+def map_think(think: bool | str | None, values: Sequence[Any] | None) -> bool | str | None:
+    """
+    Żądane `think` → wartość obsługiwana przez model wg /api/show (`thinking.values`).
+
+    Dokumentacja Ollamy: poziom (tekst) musi być DOKŁADNIE jedną z wartości modelu. Gdy żądanego
+    poziomu brak — najbliższy obsługiwany poziom (przy remisie niższy), a gdy model ma tylko
+    true/false — True (z rozumowaniem) albo False, gdy model rozumowania nie obsługuje.
+    values None / puste (brak metadanych) → bez zmian (serwer ewentualnie odrzuci → zapytanie bez think).
+    """
+    if think is None or not values:
+        return think
+    vals = list(values)
+    if any(v is think or v == think for v in vals if isinstance(v, type(think))):
+        return think
+    levels = [v for v in vals if isinstance(v, str) and v in THINK_LEVELS]
+    if isinstance(think, str) and think in THINK_LEVELS:
+        if levels:
+            i = THINK_LEVELS.index(think)
+            return min(levels, key=lambda v: (abs(THINK_LEVELS.index(v) - i), THINK_LEVELS.index(v)))
+        if any(v is True for v in vals):
+            return True
+        return False if any(v is False for v in vals) else think
+    if think is True and levels:
+        return None                      # model ma tylko poziomy — jego domyślny
+    if think is False and not any(v is False for v in vals):
+        return None                      # rozumowania nie da się wyłączyć — domyślne modelu
+    return think
+
+
 def split_think_tags(content: str) -> tuple[str, str | None]:
     """Treść zaczynająca się od <think>…</think> (część modeli przez API zgodne) → (odpowiedź, rozumowanie)."""
     match = _THINK_TAG.match(content or "")
@@ -273,6 +302,7 @@ class OllamaChat:
         self._last_error: dict[str, str] = {}
         self._tags: list[dict[str, Any]] | None = None
         self._no_think: set[str] = set()          # modele, które odrzuciły `think` (400)
+        self._think_values: dict[str, list[Any]] = {}   # /api/show thinking.values per model
         self.usage: dict[str, dict[str, float]] = {}
 
     # ── pomocnicze ──
@@ -324,6 +354,17 @@ class OllamaChat:
                         f"(ostatni: {self._last_error.get(model, '?')[:200]})")
         return None
 
+    def set_think_values(self, model: str, values: Sequence[Any] | None) -> None:
+        """Wartości `think` obsługiwane przez model (z /api/show) — `chat` dopasowuje do nich żądanie."""
+        if values:
+            self._think_values[model] = list(values)
+
+    def effective_think(self, model: str, think: bool | str | None) -> bool | str | None:
+        """Wartość `think`, która faktycznie trafi do serwera dla modelu (None = pole pominięte)."""
+        if think is None or model in self._no_think:
+            return None
+        return map_think(think, self._think_values.get(model))
+
     def reset_breaker(self, model: str | None = None) -> None:
         """Zeruje licznik kolejnych błędów (jednego modelu albo wszystkich)."""
         with self._lock:
@@ -367,7 +408,11 @@ class OllamaChat:
         if tools:
             body["tools"] = tools
         if think is not None and model not in self._no_think:
-            body["think"] = think
+            sent = self.effective_think(model, think)
+            if sent is not None:
+                body["think"] = sent
+            if sent != think:
+                notes.append(f"think={think!r} → {sent!r} (wartości modelu wg /api/show)")
         elif think is not None:
             notes.append(f"think={think!r} pominięte (model go nie obsługuje)")
         if options:
@@ -493,8 +538,12 @@ class OllamaChat:
         try:
             resp = requests.request(method, f"{self.base_url}{path}", json=body, headers=self._headers(),
                                     timeout=self.info_timeout_s)
+        except requests.ConnectionError as exc:
+            hint = ("" if self.cloud else
+                    " — czy demon Ollamy działa? (aplikacja Ollama albo `ollama serve`; potem `ollama signin`)")
+            return None, f"brak połączenia z {self.base_url} ({exc.__class__.__name__}){hint}"
         except requests.RequestException as exc:
-            return None, f"{exc.__class__.__name__}: {exc}"
+            return None, f"{exc.__class__.__name__}: {str(exc)[:200]}"
         try:
             payload = resp.json()
         except ValueError:
@@ -552,6 +601,7 @@ __all__ = [
     "THINK_LEVELS",
     "canonical_model",
     "is_cloud_url",
+    "map_think",
     "normalize_base_url",
     "parse_think",
     "split_think_tags",

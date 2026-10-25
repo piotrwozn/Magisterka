@@ -478,6 +478,21 @@ class TestRatings:
         written = write_scores(result, tmp_path)
         assert Path(written["md"]).read_text(encoding="utf-8").startswith("## Ślepa ocena")
 
+    def test_excel_semicolon_cp1250_sheet(self, tmp_path):
+        """Szablon zapisany w polskim Excelu (średniki, Windows-1250) też jest wczytywany."""
+        from src.llm_eval.ratings import score_ratings
+
+        key = {"cases": {"C01": {"A": "m1", "B": "m2"}, "C02": {"A": "m2", "B": "m1"}}}
+        (tmp_path / "key.json").write_text(json.dumps(key), encoding="utf-8")
+        text = ("oceniajacy;case_id;litera;zgodnosc_kliniczna;przydatnosc;jasnosc;halucynacja;komentarz\r\n"
+                "Łukasz;C01;A;5;4;5;0;świetne\r\nŁukasz;C01;B;2;2;3;tak;zmyślone tętno\r\n"
+                "Łukasz;C02;A;1;2;2;1;\r\nŁukasz;C02;B;4;4;4;0;\r\n")
+        path = tmp_path / "oceny_excel.csv"
+        path.write_bytes(text.encode("cp1250"))
+        res = score_ratings([path], n_boot=100)
+        assert res["raters"] == ["Łukasz"] and res["n_ratings"] == 4
+        assert res["summary"]["m1"]["zgodnosc_kliniczna"] == 4.5 and res["summary"]["m2"]["hallucination_rate"] == 1.0
+
     def test_bad_csv_columns(self, tmp_path):
         from src.llm_eval.ratings import score_ratings
 

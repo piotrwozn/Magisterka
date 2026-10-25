@@ -382,9 +382,18 @@ def _run(args: argparse.Namespace, parts: list[str], models: list[str], think: A
                  f"rodzina={d.get('family', '—')}, parametry={d.get('parameter_size', '—')}, "
                  f"kwantyzacja={d.get('quantization_level', '—')}, zdalny={info.get('remote_model', '—')}"
                  + (f" — {info['error']}" if info.get("error") else ""))
+    think_effective = {}
+    for model, info in model_info.items():
+        thinking = info.get("thinking") if isinstance(info.get("thinking"), dict) else {}
+        client.set_think_values(model, thinking.get("values"))
+        think_effective[model] = client.effective_think(model, think)
+        if think_effective[model] != think:
+            log.warning(f"Model {model}: think={think!r} nieobsługiwane (wartości modelu: {thinking.get('values')}) "
+                        f"— wysyłane think={think_effective[model]!r}")
     meta: dict[str, Any] = {
         "started_at": started.isoformat(timespec="seconds"), "command": command, "server": server,
-        "model_info": model_info, "models": models, "parts": parts, "think": think, "seed": args.seed,
+        "model_info": model_info, "models": models, "parts": parts, "think": think,
+        "think_effective": think_effective, "seed": args.seed,
         "concurrency": args.concurrency, "n_exam": args.n_exam, "n_pes": args.n_pes, "n_cases": args.n_cases,
         "cache": str(cache.path), "fresh": bool(args.fresh), "out_dir": str(out_dir),
     }
@@ -426,7 +435,8 @@ def _run(args: argparse.Namespace, parts: list[str], models: list[str], think: A
 
     ctx = {"client": client, "models": models, "out_dir": out_dir, "cache": cache, "think": think,
            "n_cases": args.n_cases, "recipe": args.recipe, "seed": args.seed, "prices": prices, "raw_log": raw_log,
-           "log": log, "fresh": bool(args.fresh), "concurrency": args.concurrency, "dry_run": False}
+           "log": log, "fresh": bool(args.fresh), "concurrency": args.concurrency, "dry_run": False,
+           "decimal_comma": bool(args.decimal_comma)}
     for part in ("esi", "tools"):
         if part not in parts:
             continue

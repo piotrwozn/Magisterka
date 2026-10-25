@@ -443,3 +443,36 @@ def test_select_model_equal_esi_scores_fall_back_to_point_estimate():
     exams = _fake_exams({"x": (0.70, 0.50), "y": (0.70, 0.50)})
     sel = select_model(exams, {"summary": {"x": {"valid_rate": 0.0}, "y": {"valid_rate": 0.0}}}, n_boot=300)
     assert sel["decided_by"] == "point_estimate"
+
+
+@pytest.mark.parametrize("think, values, expected", [
+    ("low", ["low", "medium", "high"], "low"),
+    ("low", ["medium", "high"], "medium"),
+    ("max", ["low", "medium", "high"], "high"),
+    ("medium", ["low", "high"], "low"),                 # remis odległości → niższy poziom
+    ("low", [True, False], True),
+    ("high", [False], False),
+    (True, ["low", "high"], None),                      # tylko poziomy → domyślny poziom modelu
+    (False, ["low", "high"], None),                     # nie da się wyłączyć → domyślne
+    (False, [True, False], False),
+    ("low", None, "low"),                               # brak metadanych → bez zmian
+    (None, ["low"], None),
+])
+def test_map_think_to_model_values(think, values, expected):
+    from src.llm_eval.client import map_think
+
+    assert map_think(think, values) == expected
+
+
+def test_chat_sends_think_supported_by_model(srv):
+    srv.add_model("tylko-bool", "ok", thinking={"values": [True, False], "default": True})
+    srv.add_model("poziomy", "ok", thinking={"values": ["medium", "high"], "default": "medium"})
+    client = make_client(srv)
+    for model in ("tylko-bool", "poziomy"):
+        info = client.model_info(model)
+        client.set_think_values(model, info["thinking"]["values"])
+    res = client.chat("tylko-bool", MSG, think="low")
+    assert res.ok and srv.chat_requests("tylko-bool")[-1]["think"] is True and "→ True" in res.notes[0]
+    client.chat("poziomy", MSG, think="low")
+    assert srv.chat_requests("poziomy")[-1]["think"] == "medium"
+    assert client.effective_think("poziomy", "max") == "high" and client.effective_think("inny", "low") == "low"

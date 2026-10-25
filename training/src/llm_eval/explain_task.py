@@ -800,6 +800,18 @@ def render_markdown(summary: dict[str, dict[str, Any]], ctx: EsiContext, files: 
     return "\n".join(lines)
 
 
+_DECIMAL_COMMA = re.compile(r"(?<=\d),(?=\d)")
+
+
+def decimal_point(markdown: str) -> str:
+    """Przecinek dziesiętny → kropka (sekcja zgodna z resztą report.md bez --decimal-comma).
+
+    Liczby w sekcjach części esi/tools są formatowane po polsku (`fmt_num`); separator tysięcy
+    to spacja, więc zamiana „cyfra,cyfra” dotyczy wyłącznie ułamków.
+    """
+    return _DECIMAL_COMMA.sub(".", markdown)
+
+
 def skipped_result(part: str, title: str, reason: str) -> dict[str, Any]:
     return {"part": part, "skipped": reason, "summary": {}, "items": [], "files": {},
             "markdown": f"## {title}\n\nPominięto: {reason}\n"}
@@ -821,6 +833,7 @@ def run_esi_part(
     runs_dir: Path | str | None = None,
     raw_log: JsonlWriter | None = None,
     write_ratings: bool = True,
+    decimal_comma: bool = False,
 ) -> dict[str, Any]:
     """
     Część "esi": każdy model × każdy przypadek. Zwraca {"part", "skipped", "summary" (model →
@@ -828,7 +841,8 @@ def run_esi_part(
     esi_items.csv, esi_summary.csv, esi_section.md, ratings/ratings.html, ratings/ratings_template.csv,
     key.json i surowe odpowiedzi (`raw_log` przebiegu albo raw_esi.jsonl). Brak runów / receptury →
     {"skipped": powód} (część exams działa dalej). Kontekst (przypadki) jest współdzielony z częścią
-    tools tego samego procesu (`try_prepare_context`).
+    tools tego samego procesu (`try_prepare_context`). decimal_comma=False → liczby w sekcji
+    raportu z kropką dziesiętną (jak domyślny report.md; CLI --decimal-comma).
     """
     from src.llm_eval import ratings as rt
     from src.utils.fileio import write_text_atomic
@@ -863,6 +877,8 @@ def run_esi_part(
     if write_ratings:
         files.update(rt.write_rating_sheet(out, context, items, models, seed=seed))
     markdown = render_markdown(summary, context, {**files, "section_dir": str(out)}, think)
+    if not decimal_comma:
+        markdown = decimal_point(markdown)
     write_text_atomic(out / "esi_section.md", markdown)
     files["section_md"] = str(out / "esi_section.md")
     return {"part": PART, "skipped": None, "summary": summary, "items": items, "files": files,
@@ -878,6 +894,7 @@ __all__ = [
     "cached_chat",
     "citations",
     "coerce_explanation",
+    "decimal_point",
     "escalation_outcome",
     "extract_json_object",
     "numeric_faithfulness",

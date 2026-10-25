@@ -41,6 +41,7 @@ modelem (dokładny test McNemara + sparowany bootstrap Δ) i luka standard − a
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections.abc import Callable, Sequence
@@ -147,11 +148,8 @@ def load_exam_file(spec: str | Path) -> pd.DataFrame:
     Egzamin: prefiks > kolumna `split` > nazwa pliku > exam_name (wiersze nierozpoznane → błąd).
     """
     text = str(spec)
-    forced = None
-    for split in SPLITS:
-        if text.startswith(split + "="):
-            forced, text = split, text[len(split) + 1:]
-    path = Path(text)
+    forced = next((split for split in SPLITS if text.startswith(split + "=")), None)
+    path = Path(_strip_split_prefix(text))
     if not path.exists():
         raise FileNotFoundError(f"Brak pliku z pytaniami: {path}")
     df = pd.read_parquet(path) if path.suffix.lower() in (".parquet", ".pq") else pd.read_csv(path, encoding="utf-8")
@@ -187,6 +185,36 @@ def load_exam_sources(exam_files: Sequence[str | Path] | None = None,
             frames.append(part)
         df = pd.concat(frames, ignore_index=True)
     return normalize_frame(df)
+
+
+def _strip_split_prefix(spec: str | Path) -> str:
+    text = str(spec)
+    for split in SPLITS:
+        if text.startswith(split + "="):
+            return text[len(split) + 1:]
+    return text
+
+
+def describe_source(exam_files: Sequence[str | Path] | None = None) -> dict[str, Any]:
+    """
+    Skąd pochodzą pytania (do raportu i cytowania): pliki z sumą SHA-256 albo zbiór HF z rewizją
+    (commit repozytorium zbioru; None, gdy nie udało się jej pobrać — pomiar działa dalej).
+    """
+    if exam_files:
+        files = []
+        for spec in exam_files:
+            path = Path(_strip_split_prefix(spec))
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16] if path.exists() else None
+            files.append({"file": path.name, "sha256": digest})
+        return {"type": "file", "files": files}
+    revision = None
+    try:
+        from huggingface_hub import HfApi
+
+        revision = HfApi().dataset_info(HF_REPO).sha
+    except Exception as exc:     # noqa: BLE001 — brak sieci / tokenu nie może zatrzymać pomiaru
+        log.warning(f"Nie udało się ustalić rewizji zbioru {HF_REPO}: {exc}")
+    return {"type": "hf", "repo": HF_REPO, "revision": revision}
 
 
 def normalize_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -654,6 +682,7 @@ def run_exams_part(client: OllamaChat, models: Sequence[str], *, out_dir: Path, 
     responses.to_csv(out_dir / "exam_responses.csv", index=False, encoding="utf-8")
     results = evaluate(responses, items, models, prices=prices, n_boot=n_boot, seed=seed)
     pd.DataFrame(results["metrics"]).to_csv(out_dir / "exam_metrics.csv", index=False, encoding="utf-8")
+    info["source"] = describe_source(exam_files) if source is None else {"type": "frame"}
     results.update({"sample": info, "protocols": list(PROTOCOLS), "think": think, "options": opts,
                     "models": list(models), "prompt": SYSTEM_PROMPT_PL})
     # Wektory trafień (do rozstrzygania remisów w wyborze modelu) — tylko w pamięci, nie w JSON
@@ -673,6 +702,7 @@ __all__ = [
     "abstaining_mask",
     "build_messages",
     "correctness_matrix",
+    "describe_source",
     "estimate_exams",
     "evaluate",
     "free_form_mask",

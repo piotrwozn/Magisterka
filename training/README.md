@@ -90,7 +90,7 @@ na Windows ustaw uśpienie przy zasilaniu sieciowym na „Nigdy”.
 |---|---|
 | `requirements-lock.txt` | **przetestowany zestaw** (dokładne wersje: rdzeń + pytest + zależności przechodnie) — instaluj ten |
 | `requirements.txt` | rdzeń z zakresami wersji (gdy lock nie pasuje do platformy) |
-| `requirements-app.txt` | demo Streamlit, LIME, DiCE (`pip install -r requirements-app.txt` po locku) |
+| `requirements-app.txt` | demo Streamlit, LIME, DiCE, pobieranie pytań NASK do porównania LLM (`pip install -r requirements-app.txt` po locku) |
 | `requirements-dev.txt` | pytest, ruff, black; MLflow opcjonalnie (zakomentowany) |
 
 ## 3. Kontrola środowiska
@@ -437,6 +437,7 @@ python scripts/08_final_report.py --tag standard --weights wagi.json  # raport k
 python scripts/09_seed_refits.py --tag standard                      # refity z innymi seedami (punkt 15)
 python scripts/10_leave_site_out.py --tag standard                   # walidacja z wyłączeniem oddziału
 python scripts/11_learning_curve.py --tag standard                   # krzywa uczenia
+python scripts/12_llm_bakeoff.py run --dry-run                       # porównanie LLM do wyjaśnień (punkt 16)
 streamlit run app/streamlit_app.py                                   # demo (requirements-app.txt)
 ```
 
@@ -674,3 +675,22 @@ koszt i Bayes T. Raport sam wczytuje wyniki analiz z kroku 1 (sekcja 13 i kolumn
 Do pracy dołącz też `docs/TRIPOD_AI.md` (lista kontrolna: pozycja → status → miejsce w repo lub
 raporcie) i `docs/LITERATURA.md` (porównanie z literaturą; liczby oznaczone „do weryfikacji”
 sprawdź w oryginałach).
+
+## 16. Porównanie modeli językowych do wyjaśnień (LLM bake-off)
+
+`scripts/12_llm_bakeoff.py` wybiera model językowy, który pisze polskie wyjaśnienia decyzji ESI:
+kryterium główne to trafność na polskich egzaminach lekarskich (zbiór NASK, protokół
+abstaining_substitution), potwierdzona na polskich przypadkach triażu i w teście narzędzi.
+Modele chmurowe przez Ollamę (`ollama signin` albo `OLLAMA_API_KEY`), pytania z Hugging Face
+(`hf auth login`). Pełny opis — instalacja, kolejność poleceń, ślepa ocena ekspercka, jak czytać
+i cytować wyniki, ograniczenia: **`docs/LLM_BAKEOFF.md`**.
+
+```powershell
+pip install -r requirements-app.txt
+python scripts/12_llm_bakeoff.py run --dry-run          # plan i szacunek kosztu
+python scripts/12_llm_bakeoff.py run --parts exams      # już teraz: egzaminy (bez wytrenowanych modeli)
+python scripts/12_llm_bakeoff.py run --recipe runs/final_report__triage__<czas>/recipe.json   # po treningu: wszystko
+```
+
+Wynik: `runs/llm_bakeoff/<czas>/report.md` (sekcja „Wybór modelu”). Przerwany przebieg wznawia
+to samo polecenie (pamięć podręczna odpowiedzi). Linux: `make llm-bakeoff`.

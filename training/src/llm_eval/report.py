@@ -216,6 +216,21 @@ def _rate(fmt: Fmt, row: dict[str, Any] | None) -> str:
     return fmt.rate(row["correct"], row["n"])
 
 
+def _source_text(source: dict[str, Any] | None) -> str:
+    """Źródło pytań do raportu: zbiór HF z rewizją albo pliki z sumą SHA-256."""
+    if not source:
+        return ""
+    if source.get("type") == "hf":
+        rev = source.get("revision")
+        return (f"Źródło: Hugging Face `{source.get('repo')}`"
+                + (f", rewizja `{str(rev)[:12]}`." if rev else " (rewizji nie udało się ustalić)."))
+    if source.get("type") == "file":
+        files = ", ".join(f"`{f['file']}`" + (f" (SHA-256 {f['sha256']})" if f.get("sha256") else "")
+                          for f in source.get("files", []))
+        return f"Źródło: plik(i) {files}."
+    return ""
+
+
 def exams_markdown(exams: dict[str, Any], fmt: Fmt | None = None) -> list[str]:
     """Sekcja egzaminów: próba, trafność z CI per protokół, porównania parami, luka, opóźnienia."""
     fmt = fmt or Fmt()
@@ -231,7 +246,7 @@ def exams_markdown(exams: dict[str, Any], fmt: Fmt | None = None) -> list[str]:
         f"**{n.get('lek', 0)}** (losowanie warstwowe wg edycji egzaminu; liczba edycji: {s.get('lek_editions', '?')}), "
         f"liczba pytań PES **{n.get('pes', 0)}** ({pes_txt}; liczba egzaminów: {len(s.get('pes_exam_names') or [])}). "
         f"Pula: pytania jednokrotnego wyboru A–E kwalifikujące się do protokołu abstaining_substitution "
-        f"(wykluczenia jak w skrypcie NASK).",
+        f"(wykluczenia jak w skrypcie NASK). {_source_text(s.get('source'))}",
         "",
         "Protokoły: **standardowy** (pytanie bez zmian) i **abstaining_substitution** (tekst poprawnej opcji "
         "zastąpiony zdaniem „żadna z odpowiedzi nie jest poprawna”; litera poprawnej odpowiedzi bez zmian). "
@@ -367,14 +382,17 @@ def meta_markdown(meta: dict[str, Any]) -> list[str]:
         "",
     ]
     rows = []
+    effective = meta.get("think_effective") or {}
     for m, info in (meta.get("model_info") or {}).items():
         d = info.get("details", {}) or {}
+        sent = effective.get(m, meta.get("think"))
         rows.append([f"`{m}`", info.get("api_model", m), (info.get("digest") or "—")[:12],
                      d.get("family") or "—", d.get("parameter_size") or "—", d.get("quantization_level") or "—",
-                     info.get("remote_model") or "—", info.get("error") or ""])
+                     info.get("remote_model") or "—", "domyślne modelu" if sent is None else str(sent),
+                     info.get("error") or ""])
     if rows:
         lines += [md_table(["Model (tag)", "Nazwa w API", "Digest", "Rodzina", "Parametry", "Kwantyzacja",
-                            "Model zdalny", "Uwagi"], rows), ""]
+                            "Model zdalny", "think (wysyłane)", "Uwagi"], rows), ""]
     excluded = meta.get("excluded_models") or {}
     if excluded:
         lines += ["Modele wyłączone po teście łączności:", ""]

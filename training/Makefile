@@ -10,6 +10,7 @@
 #   make analyses     — po treningu: analizy do pracy (seedy, leave-site-out, krzywa uczenia; wznawialne)
 #   make final-report — raport końcowy do pracy na TEST (raz, dla receptury wybranej na VAL)
 #   make explain-global MODEL=ebm — SHAP globalny, zależności, krzywe kształtu EBM (runs/<run>/figures/global)
+#   make llm-bakeoff  — porównanie modeli LLM do wyjaśnień (docs/LLM_BAKEOFF.md; Ollama po `ollama signin`)
 #   make test         — testy
 #
 # Zmienne: PROFILE=standard|thorough|quick|smoke  FEATURES=triage|full|triage,full  MODELS=all|lista
@@ -17,6 +18,8 @@
 # Pojedynczy model ręcznie: make train MODEL=xgboost ARGS="--tune --profile quick"
 # Raport końcowy: make final-report TAG=standard WEIGHTS='{"xgboost":0.4,"catboost":0.3,"ebm":0.3}' \
 #                   REPORT_ARGS="--method geometric --main-rule target --target-undertriage 0.15"
+# Porównanie LLM: make llm-bakeoff PARTS=exams | RECIPE=runs/final_report__triage__<czas>/recipe.json \
+#                   LLM_ARGS="--dry-run";  oceny: make llm-ratings RATINGS="oceny_1.csv oceny_2.csv" KEY=…/key.json
 
 PYTHON ?= python
 PROFILE ?= standard
@@ -28,12 +31,17 @@ RUN_ARGS ?=
 TAG ?= standard
 WEIGHTS ?= optimize
 REPORT_ARGS ?=
+PARTS ?= exams,esi,tools
+RECIPE ?=
+LLM_ARGS ?=
+RATINGS ?=
+KEY ?=
 
 RUN_ALL = $(PYTHON) scripts/run_all.py --feature-set $(FEATURES) --models $(MODELS) $(RUN_ARGS)
 
 .PHONY: install install-app install-dev check-env all smoke quick thorough status dry-run analyses \
         convert prepare prepare-site train train-all tune compare eval explain explain-global cv final-report \
-        demo mlflow test test-fast lint format clean clean-all
+        llm-bakeoff llm-ratings demo mlflow test test-fast lint format clean clean-all
 
 # --- Instalacja ---
 install:
@@ -113,6 +121,14 @@ final-report:
 
 cv:
 	$(PYTHON) scripts/06_cross_validate.py --model $(MODEL) --feature-set $(FEATURES)
+
+# --- Porównanie modeli językowych (docs/LLM_BAKEOFF.md): egzaminy NASK + wyjaśnienia ESI + narzędzia ---
+# Wznawialne (pamięć podręczna runs/llm_bakeoff/cache); egzaminy działają bez wytrenowanych modeli.
+llm-bakeoff:
+	$(PYTHON) scripts/12_llm_bakeoff.py run --parts $(PARTS) $(if $(RECIPE),--recipe $(RECIPE),) $(LLM_ARGS)
+
+llm-ratings:
+	$(PYTHON) scripts/12_llm_bakeoff.py score-ratings $(foreach f,$(RATINGS),--csv $(f)) $(if $(KEY),--key $(KEY),)
 
 demo:
 	streamlit run app/streamlit_app.py

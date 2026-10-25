@@ -213,6 +213,24 @@ def test_load_exam_file_split_resolution(tmp_path):
         load_exam_file(tmp_path / "brak.csv")
 
 
+def test_describe_source_files_and_hf(tmp_path, monkeypatch):
+    import hashlib
+
+    from src.llm_eval.exams import HF_REPO, describe_source
+    from src.llm_eval.report import _source_text
+
+    path = tmp_path / "pytania.csv"
+    make_nask_frame(n_per_edition=2).to_csv(path, index=False, encoding="utf-8")
+    src = describe_source([f"r_lek={path}"])
+    assert src == {"type": "file", "files": [{"file": "pytania.csv",
+                                               "sha256": hashlib.sha256(path.read_bytes()).hexdigest()[:16]}]}
+    assert "SHA-256" in _source_text(src) and "pytania.csv" in _source_text(src)
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)        # brak pakietu → rewizja nieznana
+    hf = describe_source(None)
+    assert hf == {"type": "hf", "repo": HF_REPO, "revision": None}
+    assert "nie udało się ustalić" in _source_text(hf)
+
+
 def test_hf_loader_without_datasets_gives_clear_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "datasets", None)       # import datasets → ImportError
     with pytest.raises(RuntimeError, match="requirements-app.txt"):
@@ -335,6 +353,7 @@ def test_cli_run_exams_end_to_end_and_rerun_uses_cache(cli, srv, nask_csv, tmp_p
     assert "Clopper–Pearsona" in report and "McNemar" in report and "## Wybór modelu" in report
     assert "Wybrany model: `fake-a`" in report and "0.31.0-fake" in report
     assert "%" in report and "[" in report                                  # trafność z przedziałem
+    assert "Źródło: plik(i) `nask_synthetic.csv` (SHA-256" in report
     results = json.loads((out / "results.json").read_text(encoding="utf-8"))
     assert results["selection"]["winner"] == "fake-a"
     assert "_correctness" not in results["parts"]["exams"]

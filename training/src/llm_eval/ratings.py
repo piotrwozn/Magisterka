@@ -17,6 +17,7 @@ oceny zapisują się w przeglądarce (localStorage) i eksportują do CSV w forma
 from __future__ import annotations
 
 import html
+import io
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -261,13 +262,29 @@ def _flag(value: Any) -> float:
     return float("nan")
 
 
+def read_sheet_csv(path: Path | str) -> pd.DataFrame:
+    """
+    Arkusz ocen CSV: eksport z ratings.html (UTF-8 z BOM, przecinki) albo szablon zapisany w Excelu
+    z polskimi ustawieniami (średniki, często kodowanie Windows-1250). Wszystkie pola jako tekst.
+    """
+    raw = Path(path).read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1250")
+        log.warning(f"{Path(path).name}: plik nie jest w UTF-8 — odczyt jako Windows-1250 (Excel)")
+    header = text.split("\n", 1)[0]
+    sep = ";" if header.count(";") > header.count(",") else ","
+    return pd.read_csv(io.StringIO(text), dtype=str, sep=sep, keep_default_na=False)
+
+
 def load_ratings(csv_paths: Sequence[Path | str], key_path: Path | str | None = None) -> pd.DataFrame:
     """Wypełnione arkusze CSV → ramka (model, case_id, litera, oceniajacy, skale, halucynacja)."""
     paths = [Path(p) for p in csv_paths]
     key = json.loads(_find_key(paths, key_path).read_text(encoding="utf-8"))
     frames = []
     for path in paths:
-        df = pd.read_csv(path, dtype=str, encoding="utf-8-sig", keep_default_na=False)
+        df = read_sheet_csv(path)
         df.columns = [str(c).strip().lower() for c in df.columns]
         missing = [c for c in ("case_id", "litera", *SCALES) if c not in df.columns]
         if missing:
