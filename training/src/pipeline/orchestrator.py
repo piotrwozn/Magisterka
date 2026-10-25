@@ -4,6 +4,11 @@ Orkiestrator nocnego przebiegu — jedno polecenie, wznawialne, Windows / Linux 
     python scripts/run_all.py                         # profil standard, zestaw triage, 6 modeli
     python scripts/run_all.py --profile smoke         # 5–10 min: test instalacji i całego pipeline'u
     python scripts/run_all.py --status                # stan z plików-znaczników, nic nie uruchamia
+    python scripts/run_all.py --stage analyses        # po treningu: analizy do pracy (seedy, oddziały, krzywa)
+    python scripts/run_all.py --stage all             # trening, potem analizy
+
+Etapy (`--stage`): train (domyślnie, kroki 1–5), analyses (krok 6, po sprawdzeniu, że główne runy
+z tuningiem istnieją), all (train, potem analyses).
 
 Kroki (każdy w OSOBNYM procesie — awaria natywna/CUDA/OOM zabija jeden krok, nie całą noc):
     1. preflight  — scripts/00_check_env.py (próba GPU, RAM, dysk, wersje) → preflight.json,
@@ -19,7 +24,11 @@ Kroki (każdy w OSOBNYM procesie — awaria natywna/CUDA/OOM zabija jeden krok, 
                     runs/<run>/figures/metrics_val.json),
     4. compare    — scripts/07_compare_runs.py --feature-set FS --runs <runy tego przebiegu>,
     5. podsumowanie — runs/run_all_summary__<fs>__<profil>__<czas>.md (TYLKO metryki VAL)
-                    + logs/run_all/<czas>/status.json (PID orkiestratora → `--status` wie, czy żyje).
+                    + logs/run_all/<czas>/status.json (PID orkiestratora → `--status` wie, czy żyje),
+    6. analizy (`--stage analyses|all`, refity z najlepszymi parametrami, bez tuningu; kolejno, wszystkie
+       wątki): scripts/09_seed_refits.py → 10_leave_site_out.py → 11_learning_curve.py --tag P
+       --models <modele z gotowym runem ∩ domyślne modele analizy>; każdy skrypt jest wznawialny
+       (gotowe jednostki pomija), wyniki w runs/analyses/<analiza>__<fs>__<tag>/results.json.
 
 Tory (`--lanes auto`): 2, gdy co najmniej jeden model idzie na GPU (urządzenie 'gpu' z próby GPU
 w preflight), ≥ 16 rdzeni fizycznych i ≥ 30 GB RAM (komputer z 32 GB raportuje ~31,8 GB) —
@@ -111,6 +120,20 @@ _GPU_TEXT = re.compile(r"cuda|out of memory|nccl|cublas|cudnn|\bgpu\b|device ord
 # catboost przy próbie GPU na maszynie bez karty: "Error 35 (…) ignored while obtaining device count" — nie błąd kroku
 _IGNORED = re.compile(r"\bignored\b", re.IGNORECASE)
 
+# Etapy przebiegu (`--stage`)
+STAGES: tuple[str, ...] = ("train", "analyses", "all")
+# Analizy (kolejność kroków): nazwa → (skrypt, domyślne modele; None = wszystkie z gotowym runem).
+# Domyślne modele = DEFAULT_MODELS w src/analysis/{site_out,learning_curve}.py (bez importu tutaj).
+ANALYSIS_STEPS: dict[str, tuple[str, tuple[str, ...] | None]] = {
+    "seeds": ("09_seed_refits.py", None),
+    "site_out": ("10_leave_site_out.py", ("lightgbm", "xgboost", "catboost", "logreg")),
+    "learning_curve": ("11_learning_curve.py", ("lightgbm", "xgboost")),
+}
+# Szacunek czasu analizy = mnożnik × czas treningu finalnego runów (seedy 3×, oddziały A+B ≈ 2×,
+# krzywa uczenia: suma ułamków 0,05+0,1+0,25+0,5+1 ≈ 1,9×) + stały narzut na model
+ANALYSIS_ETA_FACTOR: dict[str, float] = {"seeds": 3.0, "site_out": 2.0, "learning_curve": 1.9}
+ANALYSIS_OVERHEAD_S: float = 30.0
+
 # Stany zadania modelu
 PENDING, RUNNING, DONE, SKIPPED = "pending", "running", "done", "skipped"
 FAILED, INTERRUPTED, NOT_STARTED = "failed", "interrupted", "not_started"
@@ -139,6 +162,7 @@ class Options:
     status: bool = False
     skip_preflight: bool = False
     keep_awake: bool = True
+    stage: str = "train"                             # train | analyses | all
     argv: list[str] = field(default_factory=list)    # do polecenia wznowienia
 
     @property
@@ -176,6 +200,28 @@ class ModelTask:
     @property
     def key(self) -> str:
         return f"{self.fs}/{self.model}"
+
+
+@dataclass
+class AnalysisTask:
+    """Krok analizy (09 / 10 / 11) dla zestawu cech — skrypt sam pomija gotowe jednostki."""
+
+    fs: str
+    name: str                  # seeds | site_out | learning_curve
+    models: list[str]
+    status: str = PENDING
+    rc: int | None = None
+    eta_s: float | None = None
+    duration_s: float | None = None
+    units_done: int | None = None
+    units_total: int | None = None
+    results: str | None = None
+    log: str | None = None
+    note: str | None = None
+
+    @property
+    def key(self) -> str:
+        return f"{self.fs}/{self.name}"
 
 
 # ─────────────────────────────────────────
@@ -425,6 +471,25 @@ def eval_command(run_dir: Path | str) -> list[str]:
 def compare_command(feature_set: str, run_names: Sequence[str], out_path: Path) -> list[str]:
     return [*python_cmd(), str(SCRIPTS_DIR / "07_compare_runs.py"), "--feature-set", feature_set,
             "--runs", *run_names, "--out", str(out_path)]
+
+
+def analysis_command(name: str, feature_set: str, tag: str, models: Sequence[str]) -> list[str]:
+    """scripts/09|10|11 z tagiem runów źródłowych i listą modeli (reszta opcji: domyślne skryptu)."""
+    script, _ = ANALYSIS_STEPS[name]
+    return [*python_cmd(), str(SCRIPTS_DIR / script), "--feature-set", feature_set, "--tag", tag,
+            "--models", ",".join(models)]
+
+
+def analysis_models(name: str, available: Sequence[str]) -> list[str]:
+    """Modele analizy: domyślne modele kroku ∩ modele z gotowym runem (kolejność MODEL_ORDER)."""
+    _, defaults = ANALYSIS_STEPS[name]
+    return [m for m in MODEL_ORDER if m in available and (defaults is None or m in defaults)]
+
+
+def analysis_eta_s(name: str, durations: Mapping[str, float | None]) -> float:
+    """Szacunek czasu kroku analizy z czasów treningu finalnego runów źródłowych (s)."""
+    total = sum(float(d or 0.0) + ANALYSIS_OVERHEAD_S / ANALYSIS_ETA_FACTOR[name] for d in durations.values())
+    return ANALYSIS_ETA_FACTOR[name] * total
 
 
 def prepare_command(split: str) -> list[str]:
@@ -729,6 +794,7 @@ class Orchestrator:
         self.stop = threading.Event()
         self.interrupted = False
         self.tasks: list[ModelTask] = []
+        self.analysis_tasks: list[AnalysisTask] = []
         self.lanes: list[Lane] = []
         self.devices: dict[str, str] = {}
         self.gpu_models: list[str] = []
@@ -1066,6 +1132,8 @@ class Orchestrator:
                      f"{format_duration(max(lane_totals.values()))}"
                      + ("" if len(lane_totals) < 2 else
                         " (" + ", ".join(f"tor {k}: {format_duration(v)}" for k, v in lane_totals.items()) + ")"))
+        if self.opts.stage == "all":
+            self.say("Po treningu: analizy (seedy → leave-site-out → krzywa uczenia) na gotowych runach")
         if not self.opts.dry_run:
             self.say(f"Logi: {self.log_dir}")
 
@@ -1262,6 +1330,7 @@ class Orchestrator:
             "devices": self.devices,
             "lanes": [asdict(lane) for lane in self.lanes],
             "tasks": [asdict(t) for t in self.tasks],
+            "analyses": [asdict(t) for t in self.analysis_tasks],
             "compare": self.compare,
             "interrupted": self.interrupted,
             "summaries": [str(p) for p in self.summaries],
@@ -1397,6 +1466,7 @@ class Orchestrator:
             return 130
         bad = any(t.status in (FAILED, INTERRUPTED, NOT_STARTED) or t.eval_status == FAILED for t in self.tasks)
         bad = bad or any(c.get("status") == FAILED for c in self.compare.values())
+        bad = bad or any(t.status in (FAILED, INTERRUPTED) for t in self.analysis_tasks)
         return 1 if bad else 0
 
     def _resume_plan(self) -> tuple[list[str], str | None]:
@@ -1475,33 +1545,196 @@ class Orchestrator:
                 self.log_dir.mkdir(parents=True, exist_ok=True)
                 if not self.run_preflight():
                     return 2
-            if not self.prepare():
-                self._write_status()
-                self._say_resume()
-                return 130 if self.interrupted else 2
-            self.plan()
-            self.print_plan()
-            if o.dry_run:
-                for task in self.tasks:
-                    if task.status == PENDING:
-                        self.say(f"  $ {subprocess.list2cmdline(train_command(task.model, task.fs, o.profile, o.tag, o.tune))}")
-                return 0
-            with self._lock:
-                self._lane_busy = {lane.name: True for lane in self.lanes}
+            code = 0
+            if o.stage in ("train", "all"):
+                code = self._run_train()
+                if o.stage == "train" or self.interrupted or code == 2:
+                    return code
+            code_analyses = self._run_analyses_stage()
+            return 130 if self.interrupted else max(code, code_analyses)
+
+    def _run_train(self) -> int:
+        """Etap train: przygotowanie danych, trening + ewaluacja modeli w torach, porównanie, podsumowanie."""
+        o = self.opts
+        if not self.prepare():
             self._write_status()
-            self._run_jobs([lambda lane=lane: self._lane_worker(lane) for lane in self.lanes])
-            for task in self.tasks:     # przerwanie w trakcie: oznacz, co nie ruszyło
+            self._say_resume()
+            return 130 if self.interrupted else 2
+        self.plan()
+        self.print_plan()
+        if o.dry_run:
+            for task in self.tasks:
                 if task.status == PENDING:
-                    task.status, task.eval_status = NOT_STARTED, NOT_STARTED
-                elif task.status == RUNNING:
-                    task.status = INTERRUPTED
-            if not self.interrupted:
-                self.run_compare()
-            for fs in o.feature_sets:
-                self.summaries.append(self.write_summary(fs))
+                    self.say(f"  $ {subprocess.list2cmdline(train_command(task.model, task.fs, o.profile, o.tag, o.tune))}")
+            return 0
+        with self._lock:
+            self._lane_busy = {lane.name: True for lane in self.lanes}
+        self._write_status()
+        self._run_jobs([lambda lane=lane: self._lane_worker(lane) for lane in self.lanes])
+        for task in self.tasks:     # przerwanie w trakcie: oznacz, co nie ruszyło
+            if task.status == PENDING:
+                task.status, task.eval_status = NOT_STARTED, NOT_STARTED
+            elif task.status == RUNNING:
+                task.status = INTERRUPTED
+        if not self.interrupted:
+            self.run_compare()
+        for fs in o.feature_sets:
+            self.summaries.append(self.write_summary(fs))
+        self._write_status()
+        self._print_final()
+        return self.exit_code()
+
+    # ── etap analyses ──
+    def _source_run_dirs(self, fs: str) -> dict[str, Path]:
+        """Główne runy profilu z tuningiem (DONE.json, bieżące dane) — źródła refitów analiz."""
+        from src.utils.config import DATA_VERSION
+
+        self.fingerprint = data_fingerprint()
+        out: dict[str, Path] = {}
+        for model in self.opts.models:
+            run_dir = find_done_run(self.runs_dir, model, fs, self.opts.tag, DATA_VERSION, self.fingerprint,
+                                    tuned=True)
+            if run_dir is not None:
+                out[model] = run_dir
+        return out
+
+    def plan_analyses(self) -> bool:
+        """
+        Zadania analiz dla każdego zestawu cech: modele z gotowym głównym runem ∩ domyślne modele
+        kroku. False (z komunikatem) = brak jakiegokolwiek głównego runa — najpierw trening.
+        """
+        o = self.opts
+        assume_trained = o.dry_run and o.stage == "all"     # plan na sucho: runy powstaną w etapie train
+        self.analysis_tasks = []
+        found = False
+        for fs in o.feature_sets:
+            runs = {m: None for m in o.models} if assume_trained else self._source_run_dirs(fs)
+            found = found or bool(runs)
+            missing = [m for m in o.models if m not in runs]
+            if runs and missing:
+                self.say(f"Analizy {fs}: brak ukończonych runów '{o.tag}' (z tuningiem, bieżące dane) dla: "
+                         f"{', '.join(missing)} — analizy bez tych modeli", logging.WARNING)
+            durations = {m: (read_json(Path(d) / "run_info.json") or {}).get("training_duration_s")
+                         for m, d in runs.items() if d is not None}
+            for name in ANALYSIS_STEPS:
+                models = analysis_models(name, list(runs))
+                task = AnalysisTask(fs=fs, name=name, models=models,
+                                    eta_s=analysis_eta_s(name, {m: durations.get(m) for m in models}))
+                if not models:
+                    task.status, task.note = NOT_STARTED, "brak modeli tej analizy z gotowym runem"
+                self.analysis_tasks.append(task)
+        if not found:
+            self.say(f"Analizy: brak ukończonych runów profilu '{o.profile}' (tag '{o.tag}', z tuningiem, dane "
+                     f"{config.DATA_VERSION} / odcisk {self.fingerprint}) dla modeli {', '.join(o.models)} i zestawu "
+                     f"{', '.join(o.feature_sets)}. Najpierw trening: python scripts/run_all.py --profile {o.profile}"
+                     + (f" --feature-set {','.join(o.feature_sets)}" if o.feature_sets != ["triage"] else "")
+                     + " (albo od razu: --stage all)", logging.ERROR)
+        return found
+
+    def print_analysis_plan(self) -> None:
+        self.say("─" * 72)
+        self.say(f" Analizy (refity z najlepszymi parametrami, bez tuningu) · tag '{self.opts.tag}' · "
+                 f"wyniki: {self.runs_dir / 'analyses'}")
+        for task in self.analysis_tasks:
+            if task.models:
+                self.say(f"  {task.fs:7s} {task.name:15s} {', '.join(task.models)} — ETA ≤ {format_duration(task.eta_s)} "
+                         f"(gotowe jednostki są pomijane)")
+            else:
+                self.say(f"  {task.fs:7s} {task.name:15s} pomijam — {task.note}")
+
+    def _read_analysis_progress(self, task: AnalysisTask) -> None:
+        from src.analysis.common import analysis_dir, analysis_progress
+
+        progress = analysis_progress(analysis_dir(task.name, task.fs, self.opts.tag, self.runs_dir))
+        if progress:
+            task.units_done, task.units_total, task.results = progress["done"], progress["total"], progress["results"]
+
+    def run_analyses(self) -> None:
+        """Kroki 09 → 10 → 11 kolejno (wszystkie wątki); Ctrl+C i --fail-fast zatrzymują kolejne."""
+        multi = len(self.opts.feature_sets) > 1
+        for task in self.analysis_tasks:
+            if task.status != PENDING:
+                continue
+            if self.stop.is_set():
+                task.status = NOT_STARTED
+                continue
+            task.status = RUNNING
             self._write_status()
-            self._print_final()
-            return self.exit_code()
+            self.say(f"▶ analiza {task.key}: {', '.join(task.models)} (ETA ≤ {format_duration(task.eta_s)})")
+            log_path = self.log_dir / f"{task.fs}__analysis_{task.name}.log"
+            task.log = str(log_path)
+            cmd = analysis_command(task.name, task.fs, self.opts.tag, task.models)
+            prefix = f"{task.name}·{task.fs}" if multi else task.name
+            result: dict[str, int] = {}
+
+            def job(cmd: list[str] = cmd, log_path: Path = log_path, prefix: str = prefix) -> None:
+                result["rc"] = self.runner(cmd, self._base_env(self._total_threads()), log_path, prefix)
+
+            t0 = time.time()
+            self._run_jobs([job])
+            task.rc = result.get("rc")
+            task.duration_s = round(time.time() - t0, 1)
+            if self.interrupted or task.rc in INTERRUPT_CODES:
+                self.interrupted = True
+                self.stop.set()
+                task.status = INTERRUPTED
+            elif task.rc == 0:
+                task.status = DONE
+            else:
+                task.status = FAILED
+                self.say(f"✗ analiza {task.key}: NIEUDANA (kod {task.rc}) — log: {log_path}", logging.ERROR)
+            try:
+                self._read_analysis_progress(task)
+            except Exception as exc:  # noqa: BLE001 — odczyt postępu nie może przerwać przebiegu
+                log.warning(f"Postęp analizy {task.key}: {exc}")
+            if task.status == DONE:
+                self.say(f"✓ analiza {task.key}: {task.units_done}/{task.units_total} jednostek, "
+                         f"{format_duration(task.duration_s)} → {task.results}")
+            self._write_status()
+            if task.status == FAILED and self.opts.fail_fast:
+                self.say("--fail-fast: zatrzymuję dalsze kroki", logging.WARNING)
+                self.stop.set()
+
+    def _run_analyses_stage(self) -> int:
+        """Etap analyses: kontrola głównych runów, potem 09 → 10 → 11 (wznawialne)."""
+        from src.data.dataset import is_prepared
+
+        o = self.opts
+        if not o.tune:
+            self.say("Analizy wymagają runów z tuningiem — uruchom bez --no-tune", logging.ERROR)
+            return 2
+        if not (o.dry_run and o.stage == "all") and not is_prepared():
+            self.say("Analizy: dane nieprzygotowane albo nieaktualne — najpierw: python scripts/run_all.py "
+                     f"--profile {o.profile} (przygotowanie danych i trening)", logging.ERROR)
+            return 2
+        if not self.devices:
+            gpu_ok, detected = self._gpu_hint()
+            self.devices = resolve_devices(os.environ, detected)
+        if not self.plan_analyses():
+            self._write_status()
+            return 2
+        self.print_analysis_plan()
+        if o.dry_run:
+            for task in self.analysis_tasks:
+                if task.models:
+                    self.say(f"  $ {subprocess.list2cmdline(analysis_command(task.name, task.fs, o.tag, task.models))}")
+            return 0
+        self._write_status()
+        self.run_analyses()
+        self._write_status()
+        self._print_analyses_final()
+        return 130 if self.interrupted else self.exit_code()
+
+    def _print_analyses_final(self) -> None:
+        self.say("─" * 72)
+        for t in self.analysis_tasks:
+            units = "" if t.units_total is None else f" {t.units_done}/{t.units_total} jednostek"
+            self.say(f"  {t.fs:7s} analiza {t.name:15s} {STATUS_PL.get(t.status, t.status):17s}{units}"
+                     + (f" → {Path(t.results).parent / 'summary.md'}" if t.results else "")
+                     + (f" ({t.note})" if t.note else ""))
+        if any(t.status in (FAILED, INTERRUPTED, NOT_STARTED) and t.models for t in self.analysis_tasks):
+            self.say(f"Wznowienie analiz (gotowe jednostki zostaną pominięte): {resume_command(self.opts.argv)}",
+                     logging.WARNING)
 
     def _print_final(self) -> None:
         self.say("═" * 72)
@@ -1588,6 +1821,7 @@ def status_report(opts: Options) -> str:
                 elif alive:
                     state = "w toku — " + state if progress else "w toku"
             lines.append(f"{fs:7s} {model:14s} {state:30s} {'—':18s} {'—':11s} {detail}")
+    lines += _analyses_status_lines(opts, status if same_run and active else {}, alive)
     if status_path is not None:
         line = f"Ostatnie uruchomienie: {status_path.parent} (aktualizacja {status.get('updated_at')})"
         if active and alive is False:
@@ -1601,6 +1835,29 @@ def status_report(opts: Options) -> str:
             line += f" — zakończony ({status.get('state')}, kod {status.get('exit_code')})"
         lines += ["", line]
     return "\n".join(lines)
+
+
+def _analyses_status_lines(opts: Options, status: Mapping[str, Any], alive: bool | None) -> list[str]:
+    """Postęp analiz (runs/analyses/…: plan.json, pliki jednostek, results.json) dla `--status`."""
+    try:
+        from src.analysis.common import analyses_status
+    except ImportError:             # niepełna instalacja — stan treningu i tak jest pokazany
+        return []
+    running = {f"{t.get('fs')}/{t.get('name')}" for t in status.get("analyses", []) if t.get("status") == RUNNING}
+    lines = ["", f"Analizy (tag '{opts.tag}', runs/analyses; uruchom: --stage analyses):"]
+    for fs in opts.feature_sets:
+        for name, progress in analyses_status(fs, opts.tag, Path(config.RUNS_DIR)).items():
+            if progress is None:
+                state, detail = "nierozpoczęta", ""
+            else:
+                state = f"{progress['done']}/{progress['total']} jednostek" + (" — gotowe" if progress["complete"] else "")
+                if progress["failures"]:
+                    state += f", błędy: {progress['failures']}"
+                detail = progress.get("results") or ""
+            if f"{fs}/{name}" in running:
+                state = (STATE_DEAD if alive is False else "w toku") + f" — {state}"
+            lines.append(f"{fs:7s} {name:15s} {state:44s} {detail}")
+    return lines
 
 
 # ─────────────────────────────────────────
@@ -1631,6 +1888,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status", action="store_true", help="Pokaż stan z plików-znaczników i zakończ")
     parser.add_argument("--skip-preflight", action="store_true", help="Pomiń kontrolę środowiska")
     parser.add_argument("--no-keep-awake", action="store_true", help="Nie blokuj uśpienia komputera")
+    parser.add_argument("--stage", choices=list(STAGES), default="train",
+                        help="train = trening; analyses = analizy do pracy na gotowych runach (seedy, "
+                             "leave-site-out, krzywa uczenia; scripts/09–11); all = trening, potem analizy")
     return parser
 
 
@@ -1645,7 +1905,7 @@ def options_from_args(argv: Sequence[str]) -> Options:
         profile=args.profile, feature_sets=feature_sets, models=models, split=args.split,
         tune=not args.no_tune, lanes=args.lanes, force=args.force, fail_fast=args.fail_fast,
         dry_run=args.dry_run, status=args.status, skip_preflight=args.skip_preflight,
-        keep_awake=not args.no_keep_awake, argv=list(argv),
+        keep_awake=not args.no_keep_awake, stage=args.stage, argv=list(argv),
     )
 
 
@@ -1663,10 +1923,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "AnalysisTask",
     "Lane",
     "ModelTask",
     "Options",
     "Orchestrator",
+    "analysis_command",
+    "analysis_eta_s",
+    "analysis_models",
     "assign_lanes",
     "build_child_env",
     "data_fingerprint",

@@ -60,6 +60,7 @@ pip install -r requirements-lock.txt     # Python 3.12/3.13 x64; sterownik NVIDI
 python scripts/00_check_env.py           # kontrola środowiska
 python scripts/run_all.py --profile smoke   # 5–10 min: test całego pipeline'u
 python scripts/run_all.py                # tuning + trening 6 modeli, ewaluacja, porównanie (noc, wznawialne)
+python scripts/run_all.py --stage analyses  # potem: analizy do pracy, na końcu scripts/08_final_report.py (training/README.md §15)
 ```
 
 Na noc pod Windows: tryb zasilania „Najlepsza wydajność” i otwarte (niezminimalizowane) okno konsoli.
@@ -77,10 +78,10 @@ Magisterka/
 │   │   ├── models/        # 6 modeli + trening + tuning Optuną
 │   │   ├── pipeline/      # run_all: orkiestrator, kontrola środowiska, blokada uśpienia
 │   │   ├── ensemble/      # narzędzia do ręcznego łączenia modeli
-│   │   ├── evaluation/    # metryki, CV, wykresy, niepewność
+│   │   ├── evaluation/    # metryki, CV, wykresy, niepewność, statystyka (CI, kalibracja)
 │   │   ├── explain/       # SHAP, LIME, DiCE, reguły ESI, Ollama
 │   │   └── utils/         # konfiguracja, logowanie, sprzęt (CPU/GPU)
-│   ├── scripts/           # 00_check_env, run_all, 01_convert … 07_compare_runs
+│   ├── scripts/           # 00_check_env, run_all, 01_convert … 07_compare_runs, 08_final_report
 │   ├── tests/
 │   ├── app/               # demo Streamlit
 │   ├── DATA_AUDIT.md      # raport z audytu danych (generowany)
@@ -101,7 +102,9 @@ Magisterka/
 | **Expected cost** | średni koszt decyzji (niedotriażowanie 3× droższe) |
 
 Wybór modeli i łączenie odbywa się na zbiorze walidacyjnym; zbiór testowy służy wyłącznie do
-ostatecznej oceny.
+ostatecznej oceny. Raport końcowy do pracy (95% przedziały ufności, kalibracja, porównania parami,
+plik wag dla backendu) tworzy `training/scripts/08_final_report.py` — zob.
+[`training/README.md`](training/README.md#14-raport-końcowy-do-pracy-przedziały-ufności-kalibracja).
 
 ## Licencja
 

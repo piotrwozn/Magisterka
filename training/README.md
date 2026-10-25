@@ -20,6 +20,8 @@ cd C:\dev\Magisterka\training            # w aktywnym venv (instalacja: niżej)
 python scripts/00_check_env.py           # 1. kontrola środowiska: GPU, RAM, dysk, wersje, dane
 python scripts/run_all.py --profile smoke   # 2. test całego pipeline'u: 5–10 min
 python scripts/run_all.py                # 3. właściwy przebieg na noc (profil standard)
+python scripts/run_all.py --stage analyses  # 4. po treningu: analizy do pracy (seedy, oddziały, krzywa uczenia)
+python scripts/08_final_report.py --tag standard   # 5. raz, na końcu: raport końcowy na TEST (punkt 15)
 ```
 
 Po awarii, restarcie albo Ctrl+C uruchom **to samo polecenie** — gotowe modele zostaną pominięte,
@@ -205,6 +207,7 @@ Zbiory `val` i `test` nie biorą udziału w tuningu ani w treningu.
 | `--lanes auto\|1\|2` | tory równoległe |
 | `--force` | trenuj ponownie także gotowe modele (ukończone próby Optuny i tak zostaną użyte); po przerwaniu polecenie wznowienia zachowuje `--force` tylko dla niedokończonych modeli |
 | `--fail-fast` | pierwszy nieudany model zatrzymuje kolejne (domyślnie pozostałe trenują dalej) |
+| `--stage train\|analyses\|all` | `train` (domyślnie) — tuning i trening; `analyses` — analizy do pracy na gotowych runach (punkt 15); `all` — jedno i drugie |
 | `--dry-run` | pokaż plan, ETA i polecenia, nic nie uruchamiaj |
 | `--status` | stan z plików-znaczników, nic nie uruchamiaj |
 | `--skip-preflight`, `--no-keep-awake` | pomiń kontrolę środowiska / blokadę uśpienia |
@@ -264,9 +267,10 @@ Podsumowanie i porównanie pokazują **tylko metryki VAL**. Zbiór testowy oceni
 | gdzie | co |
 |---|---|
 | `runs/<czas>_<model>_<zestaw>_<profil>/` | jeden run: `report.md` (metryki, tuning, macierz pomyłek, top cechy), `metrics.json`, `predictions_val.parquet` i `predictions_test.parquet` (`row_id, site, esi, target, vitals_complete, p_esi1…p_esi5, pred_argmax, pred_cost`), `model.joblib`, `run_info.json` (parametry, urządzenie, sprzęt, tuning), `feature_importance.csv`, `DONE.json` |
-| `runs/<run>/figures/` | z ewaluacji: macierze pomyłek (także podgrupa vc), ROC, kalibracja, ważność cech, `metrics_val.json` (z metrykami per oddział) |
+| `runs/<run>/figures/` | z ewaluacji: macierze pomyłek (także podgrupa vc), ROC, kalibracja i wykres niezawodności, ważność cech, `metrics_val.json` (metryki per oddział, `calibration`: ECE, `ci`: 95% przedziały ufności) |
 | `runs/leaderboard.csv` | jeden wiersz na ukończony run, metryki VAL (+ podgrupa vc) |
-| `runs/comparison__<zestaw>__<profil>__<czas>.md` | porównanie modeli na VAL, różnorodność, średnia równowagowa |
+| `runs/comparison__<zestaw>__<profil>__<czas>.md` | porównanie modeli na VAL (z ECE i temperaturą T), różnorodność, średnia równowagowa |
+| `runs/final_report__<zestaw>__<czas>/` | raport końcowy na TEST (punkt 14): `report.md`, `metrics.json`, `recipe.json`, `tables/`, `figures/`, `backend_ensemble_weights.json` |
 | `logs/run_all/<czas>/` | log każdego kroku (`<zestaw>__<model>__train.log`, `…__eval.log`), `preflight.json`, `status.json`, `run_all.log` |
 | `logs/optuna/` | badania Optuny (`optuna_<model>.db`) i wynik każdego badania (`<badanie>.best.json`) |
 | `logs/training/` | szczegółowe logi treningu i historia prób (`*_trials.csv`) |
@@ -283,6 +287,11 @@ Podsumowanie i porównanie pokazują **tylko metryki VAL**. Zbiór testowy oceni
 - `overtriage_rate` — ESI 4–5 → ESI 1–2;
 - `mistriage_under` / `mistriage_over` — błąd o dowolny poziom;
 - `auc_macro`, `log_loss`, `brier` — jakość prawdopodobieństw; `expected_cost` — średni koszt decyzji.
+
+Raport końcowy (punkt 14) dodaje reguły dopasowywane na VAL z celem niedotriażowania T
+(`src/evaluation/decision.py`): **`target`** (progi oczekiwanego poziomu ESI + siatka
+bezpieczeństwa) i **`bayes_target`** (decyzja Bayesa z karą λ za ESI 1–2 → 3–5). Przy tym samym
+niedotriażowaniu mają wyraźnie wyższe QWK niż reguła kosztowa (ULEPSZENIA.md, B1–B4).
 
 Klucze w `metrics.json`: `{split}_{reguła}_{metryka}`, a dla podgrupy vc `{split}_vc_{reguła}_{metryka}`.
 
@@ -320,6 +329,9 @@ final = evaluate(y_test, apply_temperature(blend(P_test, weights), T), rule="cos
 
 Pojedynczy model: `python scripts/04_evaluate.py --run <run> --split test`. Nie wracaj potem do
 strojenia — liczby z testu idą tylko do pracy.
+
+Całość tego kroku — z przedziałami ufności, kalibracją, porównaniem z najlepszym pojedynczym
+modelem i plikiem wag dla backendu — robi jedno polecenie: `scripts/08_final_report.py` (punkt 14).
 
 ## 9. Rozwiązywanie problemów
 
@@ -415,10 +427,16 @@ za mało, by go tak użyć.
 python scripts/02_preprocess.py [--split site]                       # dane → splity + DATA_AUDIT.md
 python scripts/03_train.py --model xgboost --tune --profile quick    # jeden model (tag `quick`)
 python scripts/03_train.py --model all                               # 6 modeli bez tuningu (tag `standard-notune`)
-python scripts/04_evaluate.py --run <run>                            # wykresy i metryki na val
+python scripts/04_evaluate.py --run <run>                            # wykresy, metryki, ECE i 95% CI na val
 python scripts/05_explain.py --model-name xgboost --n-patients 5     # SHAP + kontrola reguł ESI
+python scripts/05_explain.py --run <run> --global                    # SHAP globalny, zależności, kształty EBM
 python scripts/06_cross_validate.py --model lightgbm                 # k-fold CV na TRAIN
 python scripts/07_compare_runs.py --tag standard                     # porównanie na val
+python scripts/07_compare_runs.py --tag standard --bootstrap 1000     # + 95% przedziały ufności (val)
+python scripts/08_final_report.py --tag standard --weights wagi.json  # raport końcowy na TEST (punkt 14)
+python scripts/09_seed_refits.py --tag standard                      # refity z innymi seedami (punkt 15)
+python scripts/10_leave_site_out.py --tag standard                   # walidacja z wyłączeniem oddziału
+python scripts/11_learning_curve.py --tag standard                   # krzywa uczenia
 streamlit run app/streamlit_app.py                                   # demo (requirements-app.txt)
 ```
 
@@ -442,3 +460,217 @@ python -m pytest tests -q -m "not slow"      # bez testów w procesach
 
 Testy używają wyłącznie syntetycznych danych w katalogach tymczasowych; nie dotykają `data/`,
 `runs/` ani `logs/`.
+
+## 14. Raport końcowy do pracy (przedziały ufności, kalibracja)
+
+Gdy recepturę masz już wybraną na `val`, jedno polecenie liczy wszystkie liczby do pracy na
+zbiorze **testowym**, z zapisanych predykcji (bez ponownego treningu):
+
+```powershell
+python scripts/07_compare_runs.py --tag standard --bootstrap 1000    # 1. wybór na VAL (z przedziałami)
+python scripts/08_final_report.py --feature-set triage --tag standard --weights wagi.json --temperature fit
+```
+
+`wagi.json` to zwykły plik, np. `{"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}`. Może to być też
+`backend_ensemble_weights.json` z wcześniejszego raportu — wtedy skrypt przejmuje z niego również
+metodę łączenia (`method`), regułę dla backendu (`rule`) i to, czy jest temperatura. Opcja podana
+jawnie i sprzeczna z plikiem (np. `--method mean` przy `"method": "geometric"`) kończy się odmową.
+Samą wartość T skrypt zawsze dopasowuje na nowo na VAL i ostrzega, gdy wyszła inna niż w pliku.
+Na Linuksie JSON można podać wprost:
+`--weights '{"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}'`. W PowerShell lepiej użyć pliku,
+bo PowerShell potrafi zgubić cudzysłowy w JSON-ie. Skrót na Linuksie: `make final-report TAG=standard WEIGHTS='{…}'`.
+
+### Zalecana kolejność
+
+1. **Wybór na VAL.** Porównaj modele (`07_compare_runs.py`, z `--bootstrap 1000` dla przedziałów)
+   i ewentualnie połączenia (`src.ensemble`, punkt 8). Zdecyduj o modelach, wagach, metodzie
+   łączenia (`mean` / `geometric`), temperaturze (`fit` / `none`) i regule decyzyjnej.
+2. **Raz — TEST.** Uruchom `08_final_report.py` z tą recepturą. Skrypt na początku i na końcu
+   wypisuje ostrzeżenie, że test ocenia się raz. Każde uruchomienie trafia do rejestru
+   `runs/final_reports.jsonl` (niezależnie od `--out`). Jeśli dla tych samych runów był już raport,
+   skrypt go wylicza (z informacją, czy receptura była ta sama) i zapisuje w `recipe.json`
+   (`previous_reports`).
+3. **Do pracy** bierzesz tabele z `report.md` (albo `tables/*.csv`) i wykresy z `figures/`.
+   **Do backendu** kopiujesz `backend_ensemble_weights.json` jako `backend/models/ensemble_weights.json`
+   (wagi, metoda, temperatura, reguła — format `backend/app/models/ensemble.py`).
+
+### Co jest w raporcie (`runs/final_report__<zestaw>__<czas>/`)
+
+| sekcja `report.md` | zawartość |
+|---|---|
+| Receptura | runy, wagi, temperatura (połączenia i każdego modelu), najlepszy pojedynczy model (najniższy log loss na VAL); **reguły decyzyjne** dopasowane na VAL (progi, q siatki, λ) i ich wynik na VAL (reguły dopasowywane — cross-fitting) |
+| Punkt pracy (VAL) | kompromis niedotriażowanie – QWK: koszt k = 1…10, progi T, progi T + siatka, Bayes T dla T = 10/15/20%; wykres `tradeoff_val.png` z wybranym punktem |
+| Jak czytać | krótka instrukcja do tabel (poniżej to samo szerzej) |
+| 1. Wynik końcowy | połączenie: metryki z 95% CI dla wszystkich reguł (argmax, koszt, progi T, Bayes T), cała populacja i podgrupa vc |
+| 2. Połączenie i modele | każdy model (z własną temperaturą i własnymi regułami z VAL) obok połączenia, reguła główna i argmax; wykresy leśne `forest_test_*.png` |
+| 3. Różnice sparowane | Δ = połączenie − najlepszy pojedynczy model dla QWK, niedotriażowania i log loss: przedział, p i **wyższość wg reguły C1** (CI bez 0, Δ większa od minimalnej istotnej różnicy i od 2 × SD seedów) |
+| 4. Kalibracja | ECE, MCE, log loss, Brier przed i po temperaturze; ECE idealnie skalibrowanego modelu (szum); wykres `reliability_test_blend.png` |
+| 5. Macierze pomyłek | liczby i % wiersza dla reguły głównej i argmax (+ wykresy, także dla podgrupy vc) |
+| 6. Oddziały | połączenie na każdym oddziale z CI |
+| 7. Przyjęcia | AUC pilności względem przyjęcia do szpitala (model vs ESI z triażu), odsetek przyjęć wg poziomu, AUC w podgrupach (7.1) i niezgodność model–pielęgniarka a przyjęcia (7.2); bez kolumny `admitted` (ani w predykcjach, ani w splicie) — pominięte |
+| 8. Podgrupy i równość | płeć, wiek 18–39/40–64/65–79/80+, sposób przybycia, oddział, vc: QWK, niedotriażowanie, Δ względem grupy odniesienia (Newcombe), przetriażowanie, krytyczne pominięcie; undertriage „zakotwiczone w przyjęciu” — model vs pielęgniarka. Atrybuty z przygotowanego splitu (join po `row_id`; inny odcisk danych = sekcja bez atrybutów) |
+| 9. Analiza błędów | niedotriażowanie wg pary ESI i grupy dolegliwości (`cc_group_*`), przyjęcia niedotriażowanych ESI 2 (szum etykiet) |
+| 10. Krzywe decyzyjne | net benefit: wykrywanie ESI 1–2 i przyjęcie do szpitala (model vs reguła pielęgniarki „ESI ≤ 2”, Δ z CI) |
+| 11. Kalibracja per poziom i oddział | O/E każdego poziomu ESI, kalibracja „in the large” i nachylenie dla P(ESI 1–2) |
+| 12. Odsyłanie i conformal | odsyłanie 10/20/30% najbardziej niepewnych do pielęgniarki; zbiory conformal 90% (LAC i warunkowe po ESI) |
+| 13. Analizy dodatkowe | podsumowanie `runs/analyses/` (seedy, leave-site-out, krzywa uczenia) albo nota, jak je uruchomić |
+
+Poza tym: `metrics.json` (wszystkie liczby, także porównania połączenia z każdym modelem),
+`recipe.json` (receptura do odtworzenia, commit gita, argumenty, dopasowane reguły) i
+`backend_ensemble_weights.json` (wagi, metoda, temperatura i reguła główna z parametrami, np.
+`"rule": "target", "cutpoints": […], "safety_q": 0.13` — format `backend/app/models/ensemble.py`).
+Sekcja bez danych (brak `admitted`, atrybutów pacjentów, wyników analiz, za mała podgrupa) jest
+pomijana z notą w `report.md`, a nie przerywa raportu.
+
+### Co znaczą liczby
+
+- **Przedział ufności 95%**, zapis `0.712 [0.701; 0.723]`. Zbiór testowy to jedna próbka
+  pacjentów. Gdyby wylosować inną z tej samej populacji, wynik byłby trochę inny. Przedział
+  pokazuje, jak bardzo. Liczymy go **bootstrapem**: 2000 razy losujemy pacjentów ze zwracaniem
+  (osobno w każdej klasie ESI, więc rzadkie ESI 1 jest w każdym losowaniu), za każdym razem
+  liczymy metrykę i bierzemy 2,5. i 97,5. percentyl. Przedział **nie** obejmuje zmienności samego
+  treningu (inne ziarno, inne hiperparametry).
+- **Odsetki pacjentów** (trafność, niedotriażowanie, przetriażowanie, krytyczne pominięcia,
+  czułość ESI 1 i ESI 1–2) mają **dokładny przedział Clopper–Pearsona** z liczebności, a nie
+  przedział z bootstrapu. Losowanie w klasach ESI ustala mianownik (np. liczbę pacjentów ESI 1), więc
+  bootstrap odsetka tylko powtarza zaobserwowaną proporcję: przy 0 zdarzeń daje „przedział” [0; 0],
+  a przy kilku zdarzeniach — za wąski. Clopper–Pearson przy 0 krytycznych pominięć na 38 pacjentów
+  ESI 1 daje [0; 9,3%] i tyle niepewności rzeczywiście jest. Dlatego przy metrykach ESI raport podaje
+  też liczebność, np. `0.0% [0.0; 9.3] (0/38)`. Dla ESI 1 (kilkaset wizyt na teście, w podgrupie vc
+  kilkadziesiąt, na oddziale czasem kilka) przedziały są szerokie i tak należy je opisać.
+- **Porównanie dwóch modeli.** Nakładające się przedziały w tabeli 2 **nie** oznaczają, że modele są
+  równie dobre. O różnicy rozstrzyga sekcja 3: **sparowany bootstrap**, czyli oba modele oceniane
+  na tych samych losowaniach pacjentów. Jeśli przedział Δ nie zawiera 0, różnica jest istotna.
+  `p` to dwustronna p-wartość z tego samego bootstrapu: 2 × odsetek losowań, w których Δ wypadła
+  po „drugiej” stronie zera (losowania z Δ dokładnie 0 liczą się do obu stron — ostrożnie). Jest
+  zgodna z przedziałem: przedział bez zera ⇔ p < 0,05. Najmniejsza możliwa p to 1/liczba losowań.
+  Dla niedotriażowania i log loss **ujemna** Δ znaczy, że połączenie jest lepsze.
+- **ECE** (expected calibration error) mówi, czy prawdopodobieństwa „mówią prawdę”. Pacjentów
+  dzielimy na grupy według pewności modelu (np. 70–77%) i porównujemy tę pewność z odsetkiem
+  trafień w grupie. ECE to średnia różnica: 0 = idealnie, 0,03 = model myli się średnio o 3 punkty
+  procentowe w ocenie własnej pewności. ECE z grup jest **zawyżone przez szum**: nawet idealnie
+  skalibrowany model ma ECE > 0, tym większe, im mniej pacjentów. Dlatego raport podaje też
+  „ECE idealnie skalibrowanego modelu” przy tej samej liczności i p-wartość testu kalibracji
+  (małe p = kalibracja gorsza, niż wynikałoby z samego szumu). Z tego samego powodu przedział
+  bootstrap ECE bywa przesunięty w górę, a wartość punktowa może leżeć tuż pod nim. ECE modeli
+  porównuj więc parami (Δ), a nie przez nakładanie przedziałów. *ECE per poziom* robi to samo osobno
+  dla każdego poziomu ESI. **MCE** to najgorsza grupa.
+- **Temperatura T** to jeden parametr dopasowany na VAL: prawdopodobieństwa podnosi się do potęgi
+  1/T i normalizuje. T > 1 „uspokaja” zbyt pewny model, T < 1 go wyostrza. Najbardziej
+  prawdopodobny poziom (argmax) się nie zmienia, zmieniają się prawdopodobieństwa, a więc decyzje
+  reguły kosztowej. Uczciwa ocena na VAL to wartości „cross-fit”: T dopasowana na jednej połowie val
+  i oceniana na drugiej.
+- **Podgrupa vc** to pacjenci z kompletem HR, SBP i RR, czyli populacja jak w TOPSOR (punkt 11).
+  Raportuj ją zawsze obok całej populacji.
+
+### Opcje `08_final_report.py`
+
+| opcja | znaczenie |
+|---|---|
+| `--runs RUN …` albo `--feature-set FS --tag TAG [--models a,b]` | jawne runy albo najnowszy ukończony run każdego modelu (filtry jak w 07: `--include-samples`, `--include-untuned`, `--include-weighted`) |
+| `--weights JSON\|plik.json\|optimize\|equal` | wagi połączenia (domyślnie `optimize` = minimalny log loss na VAL; `equal` = równe wagi — w testach wyraźnie gorsze); model spoza wag ma wagę 0, ale w tabelach jest oceniany osobno; z pliku w formacie backendu przejmowane są też `method`, `rule` i (nie)obecność temperatury |
+| `--method mean\|geometric` | średnia arytmetyczna albo geometryczna prawdopodobieństw (domyślnie z pliku wag, inaczej `mean`) |
+| `--temperature fit\|none` | temperatura połączenia dopasowana na VAL (domyślnie z pliku wag, inaczej `fit`) |
+| `--main-rule target\|bayes_target\|cost\|argmax` | reguła główna: tabele szczegółowe, podgrupy, błędy i plik dla backendu (domyślnie `target`; z pliku wag — jego `rule`); dawna nazwa `--backend-rule` |
+| `--target-undertriage T` | cel niedotriażowania ESI 1–2 → 3–5 reguł `target` i `bayes_target` na VAL (domyślnie 0,15) |
+| `--guarantee` | próg tak, by górna granica Clopper–Pearsona niedotriażowania na VAL była ≤ T (ostrożniej o ~1 pp) |
+| `--safety-net` / `--no-safety-net` | siatka bezpieczeństwa: P(ESI 1)+P(ESI 2) ≥ q → najwyżej ESI 3 (domyślnie włączona; q dobrane na VAL) |
+| `--fit-population vc\|all` | wiersze VAL do dopasowania progów: vc (komplet HR/SBP/RR, jak TOPSOR; domyślnie) albo cały VAL |
+| `--rule all\|both\|<reguła>` | reguły w tabelach (domyślnie `all` = wszystkie cztery; `both` = argmax + koszt jak dawniej; jedna reguła = tylko ta i ona trafia do backendu) |
+| `--bootstrap N` | liczba losowań (domyślnie 2000); `--alpha 0.05`, `--seed 42` |
+| `--decimal-comma` | przecinek dziesiętny w `report.md` (typografia polska) |
+| `--out DIR`, `--no-plots`, `--n-bins 15` | katalog raportu, bez wykresów, biny ECE |
+
+**Odmowa (kod wyjścia 2)** następuje, gdy runy pochodzą z różnych zestawów cech, wersji albo
+przygotowań danych, gdy ten sam model występuje dwa razy, gdy predykcje val/test mają różne wiersze
+lub etykiety (np. inne `--eval-sample`), gdy w predykcjach są prawdopodobieństwa NaN / nieskończone /
+ujemne albo wiersz o zerowej sumie (komunikat podaje run i liczbę złych wierszy), gdy wagi są błędne
+(model spoza runów, waga ujemna, same zera), gdy reguła w pliku wag jest niepoprawna (np. `target`
+bez `cutpoints`), gdy reguły nie da się dopasować na VAL, albo gdy jawna opcja (`--method`,
+`--temperature`, `--main-rule`, `--rule`, `--backend-rule`) jest sprzeczna z plikiem wag w formacie
+backendu lub z inną opcją (reguła główna musi być wśród ocenianych reguł).
+
+**Czas** (1 rdzeń CPU): bootstrap 1000 losowań × 56 tys. wierszy × wszystkie metryki, obie reguły
+to ~7 s na model i populację. Raport z 6 modelami i `--bootstrap 2000` trwa kilka minut.
+`04_evaluate.py` liczy ECE zawsze, a przedziały ufności z `--bootstrap N` (domyślnie 1000,
+`0` = bez nich; ~10 s na pełnym val). Wyniki zapisuje w `metrics_<split>.json` pod kluczami
+`calibration` i `ci`, a wykres w `reliability_<split>.png`.
+
+Funkcje są też dostępne bezpośrednio: `src.evaluation.statistics` (`bootstrap_ci`,
+`paired_bootstrap_diff`, `ece_top_label`, `ece_classwise`, `reliability_table`,
+`calibration_summary`, `ece_consistency`, `calibrate_on_val`, `crossfit_temperature`).
+
+## 15. Po treningu: analizy do pracy
+
+Kolejność po nocnym przebiegu (wszystko wznawialne; test oceniasz dopiero w kroku 3):
+
+```powershell
+python scripts/run_all.py --stage analyses                       # 1. analizy na gotowych runach (refity, bez tuningu)
+python scripts/07_compare_runs.py --tag standard --bootstrap 1000 # 2. wybór modeli / wag na VAL (opcjonalnie)
+python scripts/08_final_report.py --feature-set triage --tag standard   # 3. RAZ: raport końcowy na TEST
+python scripts/05_explain.py --model-name ebm --global             # 4. wyjaśnienia globalne do rozdziału
+```
+
+**1. Analizy** (`--stage analyses`; `--stage all` = trening, a potem analizy). Uruchamia po kolei
+trzy skrypty z tymi samymi zabezpieczeniami co trening (osobne procesy, logi, blokada uśpienia,
+wznawianie):
+
+| skrypt | co liczy (ULEPSZENIA.md) | wynik |
+|---|---|---|
+| `09_seed_refits.py` | każdy model z najlepszymi parametrami jeszcze 3 razy z innym seedem (C1) — ile wynik zależy od losowości treningu | `runs/analyses/seeds__<zestaw>__<tag>/results.json` (średnia ± SD) |
+| `10_leave_site_out.py` | trening bez oddziału A (potem B), ocena na jego wierszach TRAIN + VAL; korekta rozkładu klas: znana i EM (C3) | `runs/analyses/site_out__…/results.json` |
+| `11_learning_curve.py` | lightgbm i xgboost na 5–100% danych dopasowania, dopasowanie potęgowe (C9) | `runs/analyses/learning_curve__…/results.json` + wykres |
+
+Każdy skrypt pomija gotowe jednostki, więc po przerwaniu uruchom to samo polecenie. Wyniki
+(`results.json`, `summary.md`, `--status`) są kumulatywne: wywołanie tylko dla części modeli lub
+oddziałów (np. `10_leave_site_out.py --sites C --models logreg`) dopisuje je do policzonych wcześniej;
+model liczony ponownie zastępuje swoje stare wyniki, a wyniki z nieaktualnego runa źródłowego
+odpadają. Raport (krok 3) pomija analizy z innych danych albo innych runów niż jego własne (z notą
+„nieaktualne”). Czas to
+mniej więcej 3× (seedy) + 2× (oddziały) + 1,9× (krzywa) czasu treningu finalnego modeli
+(`run_all.py --stage analyses --dry-run` pokazuje ETA). Postęp: `run_all.py --status`.
+Linux: `make analyses`.
+
+**2–3. Raport końcowy z domyślnymi ustawieniami** (`make final-report`): wagi `optimize` (minimum
+log loss na VAL), temperatura na VAL, reguła główna `target` (progi oczekiwanego poziomu ESI
+z celem niedotriażowania 15% w podgrupie vc + siatka bezpieczeństwa), oceniane też argmax,
+koszt i Bayes T. Raport sam wczytuje wyniki analiz z kroku 1 (sekcja 13 i kolumna „wyższość
+(C1)” w sekcji 3). Bez nich pisze, jak je uruchomić.
+
+**Jak czytać** (pełny opis sekcji: punkt 14):
+
+- **Metryka główna to QWK przy zadanym niedotriażowaniu.** Najpierw spójrz na „Punkt pracy” na
+  VAL: na krzywej niedotriażowanie – QWK progi T powinny leżeć wyraźnie nad regułą kosztową. Potem
+  sekcja 1 na TEST: czy niedotriażowanie w podgrupie vc jest blisko T (±1–2 pp)?
+- **Porównania modeli:** wyższość ogłaszaj tylko z „TAK — <zwycięzca>” w kolumnie C1 (sekcja 3);
+  zwycięzcą może być pojedynczy model, nie połączenie (kierunek: wyższe QWK / AUC, niższe
+  niedotriażowanie / log loss). Różnica istotna statystycznie, ale mniejsza niż szum seedów, to nie
+  jest wynik.
+- **Równość (sekcja 8):** różnice między podgrupami czytaj razem z kolumną przyjęć. Duża Δ
+  niedotriażowania przy podobnym odsetku przyjętych w ESI 3–5 to raczej inny profil pacjentów
+  niż gorszy model.
+- **Model a pielęgniarka (sekcje 7, 10.2):** jedyna miara niezależna od etykiety ESI. Przewaga
+  ciągłego −E[ESI] w AUC przyjęcia nie oznacza przewagi twardej decyzji 5-poziomowej.
+- **Leave-site-out (sekcja 13.2):** jeśli AUC przyjęcia się utrzymuje, a niedotriażowanie surowego
+  modelu rośnie, to problemem jest rozkład klas. Wtedy w Polsce trzeba na nowo dobrać progi
+  i rozkład.
+- Wiersze z ⚠ (EM niestabilne) i ekstrapolacje krzywej uczenia oznaczone jako niewiarygodne
+  pomijaj w pracy (powód jest w nawiasie: np. krzywa gorsza od ostatniego punktu albo cel ponad
+  10× dalej niż największa próbka).
+- **O/E** (sekcje 11 i 13.2) = obserwowane / oczekiwane: > 1 oznacza, że model zaniża częstość
+  poziomu ESI.
+
+**4. Wyjaśnienia globalne** (C11): `05_explain.py --run <run> --global` zapisuje do
+`runs/<run>/figures/global/`:
+
+- SHAP summary dla wszystkich poziomów;
+- beeswarm ESI 1 i ESI 2;
+- wykresy zależności SHAP dla top-k cech (`--top-k 6`) i parametrów życiowych;
+- `shap_mean_abs.csv`;
+- dla EBM — krzywe kształtu termów parametrów życiowych z pasmem ±1 SD między workami i linią
+  wygładzoną. Surowe krzywe EBM są postrzępione, a liczba zmian kierunku jest w
+  `global_summary.json`; w pracy opisuj linię wygładzoną.
+
+Do pracy dołącz też `docs/TRIPOD_AI.md` (lista kontrolna: pozycja → status → miejsce w repo lub
+raporcie) i `docs/LITERATURA.md` (porównanie z literaturą; liczby oznaczone „do weryfikacji”
+sprawdź w oryginałach).

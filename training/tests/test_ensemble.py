@@ -16,6 +16,7 @@ import pandas as pd
 import pytest
 
 from src.ensemble import (
+    aligned_meta,
     aligned_probas,
     apply_temperature,
     blend,
@@ -195,6 +196,18 @@ class TestRuns:
                                                       require_model=False)}
         assert loose == {"lightgbm": "20260105_000000_lightgbm_triage", "xgboost": "20260105_000100_xgboost_triage"}
 
+    def test_latest_runs_skips_refits(self, runs_dir):
+        """Refit z analiz (09/10/11) z modelem i tym samym tagiem nie wypiera runu głównego."""
+        y = _true_labels()
+        refit = write_run(runs_dir, "20260109_000000_lightgbm_triage_standard-seed1", "lightgbm",
+                          {"val": _make_proba(y, 2.0, 61)}, y, tag="standard")
+        info = json.loads((refit / "run_info.json").read_text(encoding="utf-8"))
+        info["refit_of"] = "20260102_000000_lightgbm_triage"
+        (refit / "run_info.json").write_text(json.dumps(info), encoding="utf-8")
+        latest = {r.model: r.name for r in latest_runs("triage", runs_dir=runs_dir, tag="standard")}
+        assert latest["lightgbm"] == "20260102_000000_lightgbm_triage"
+        assert list_runs(runs_dir).set_index("run").loc[refit.name, "refit_of"] == info["refit_of"]
+
     def test_latest_runs_tag_filter(self, runs_dir):
         y = _true_labels()
         p = {"val": _make_proba(y, 2.0, 60)}
@@ -306,6 +319,31 @@ class TestAlignedProbas:
         runs = latest_runs("triage", runs_dir=runs_dir)
         with pytest.raises(ValueError, match="inne etykiety"):
             aligned_probas(runs, "val")
+
+    def test_aligned_meta_follows_row_order(self, runs_dir):
+        """Kolumny meta w kolejności aligned_probas (rosnące row_id), także z przetasowanego parquet."""
+        runs = latest_runs("triage", runs_dir=runs_dir)
+        shuffled = [r for r in runs if r.model == "lightgbm"]          # zapisany z shuffle=True
+        y, _ = aligned_probas(shuffled, "val")
+        meta = aligned_meta(shuffled, "val")
+        assert list(meta.index) == sorted(meta.index)
+        np.testing.assert_array_equal(meta["target"].to_numpy(), y)
+        assert {"site", "esi", "target", "vitals_complete"} <= set(meta.columns)
+        assert "p_esi1" not in meta.columns
+        with pytest.raises(ValueError):
+            aligned_meta([], "val")
+
+    @pytest.mark.parametrize("bad_row", [[np.nan] * 5, [0.0] * 5, [0.5, np.inf, 0.1, 0.1, 0.1],
+                                         [0.6, -0.1, 0.2, 0.2, 0.1]])
+    def test_invalid_probabilities_raise(self, tmp_path, bad_row):
+        """NaN / nieskończoność / ujemne / zerowa suma wiersza → ValueError z nazwą runa i liczbą wierszy."""
+        y = _true_labels()
+        p = _make_proba(y, 2.0, seed=5)
+        p[[3, 9]] = bad_row
+        write_run(tmp_path, "20260109_000200_ebm_triage", "ebm", {"val": p}, y)
+        run = load_run(tmp_path / "20260109_000200_ebm_triage")
+        with pytest.raises(ValueError, match=r"20260109_000200_ebm_triage.*2 z 300 wierszy"):
+            aligned_probas([run], "val")
 
     def test_different_data_versions_raise(self, runs_dir):
         y = _true_labels()
@@ -502,6 +540,35 @@ class TestCompareScript:
     def test_no_runs_exit_1(self, isolated_paths):
         module = _load_compare_script()
         assert module.main(["--feature-set", "triage"]) == 1
+
+    def test_calibration_columns_and_bootstrap(self, compare_runs, capsys):
+        """ECE i temperatura T na VAL w tabeli; --bootstrap dodaje przedziały ufności (bez testu)."""
+        module = _load_compare_script()
+        out = compare_runs / "ci.md"
+        assert module.main(["--feature-set", "triage", "--tag", "standard", "--bootstrap", "40",
+                            "--out", str(out)]) == 0
+        text = out.read_text(encoding="utf-8")
+        assert "| ECE | T |" in text                                   # kalibracja na VAL w tabeli modeli
+        assert "95% przedziały ufności na VAL (bootstrap 40×)" in text
+        assert "QWK [cost]" in text and "%" in text and "[" in text
+        assert "Podgrupa *vc*" in text
+        assert "| test |" not in text
+        printed = capsys.readouterr().out
+        assert "przedziały ufności na VAL" in printed
+        out_plain = compare_runs / "plain.md"
+        assert module.main(["--feature-set", "triage", "--tag", "standard", "--out", str(out_plain)]) == 0
+        assert "przedziały ufności na VAL" not in out_plain.read_text(encoding="utf-8")   # domyślnie bez bootstrapu
+
+    def test_metrics_row_calibration(self):
+        module = _load_compare_script()
+        y = _true_labels()
+        raw = _make_proba(y, 2.0, 1)
+        p = apply_temperature(raw, fit_temperature(raw, y))           # skalibrowany punkt wyjścia
+        sharp = apply_temperature(p, 0.4)
+        row, row_sharp = module.metrics_row("m", y, p), module.metrics_row("m", y, sharp)
+        assert row["T"] == pytest.approx(1.0, abs=0.05)
+        assert 0 <= row["ECE"] < row_sharp["ECE"]
+        assert row_sharp["T"] > 1.0                                    # zbyt pewny → T > 1
 
     def test_metrics_row_vc_keys(self):
         module = _load_compare_script()

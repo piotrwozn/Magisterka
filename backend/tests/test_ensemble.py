@@ -12,10 +12,13 @@ import pytest
 
 from app.config import ensure_training_on_path, get_settings
 from app.models.ensemble import (
+    DECISION_RULES,
     ENSEMBLE_MODELS,
     MODEL_WEIGHTS,
+    DecisionRule,
     EnsembleConfig,
     apply_temperature,
+    bayes_cost_matrix,
     blend,
     cost_matrix,
     decide,
@@ -106,6 +109,25 @@ class TestLoadConfig:
         {"temperature": True},
         {"temprature": 1.2},                         # typo → unknown key
         {"weights": {"xgboost": 1}, "note": "val logloss 0.71"},
+        {"rule": "target"},                                         # cutpoints required
+        {"rule": "target", "cutpoints": [1.0, 2.0, 3.0]},           # not 4
+        {"rule": "target", "cutpoints": [1.0, 2.5, 2.0, 3.0]},      # not sorted
+        {"rule": "target", "cutpoints": [1.0, 2.0, "x", 3.0]},
+        {"rule": "target", "cutpoints": [1.0, 2.0, True, 3.0]},
+        {"rule": "target", "cutpoints": "1,2,3,4"},
+        {"rule": "target", "cutpoints": [1.0, 2.0, 3.0, float("inf")]},
+        {"rule": "target", "cutpoints": [1.0, 2.0, 2.5, 3.0], "safety_q": 0},
+        {"rule": "target", "cutpoints": [1.0, 2.0, 2.5, 3.0], "safety_q": 1.5},
+        {"rule": "target", "cutpoints": [1.0, 2.0, 2.5, 3.0], "lam": 2.0},     # key of another rule
+        {"rule": "target", "cutpoints": [1.0, 2.0, 2.5, 3.0], "safty_q": 0.1},  # typo
+        {"rule": "bayes_target"},                                   # lam required
+        {"rule": "bayes_target", "lam": 0},
+        {"rule": "bayes_target", "lam": -1.0},
+        {"rule": "bayes_target", "lam": True},
+        {"rule": "bayes_target", "lam": 2.0, "safety_q": 0.1},
+        {"rule": "cost", "cutpoints": [1.0, 2.0, 2.5, 3.0]},
+        {"cutpoints": [1.0, 2.0, 2.5, 3.0]},                        # default rule argmax
+        {"rule": "target_rule", "cutpoints": [1.0, 2.0, 2.5, 3.0]},
     ])
     def test_invalid_file_is_loud(self, tmp_path, payload):
         with pytest.raises(ValueError):
@@ -121,6 +143,29 @@ class TestLoadConfig:
         cfg = load_ensemble_config(_write(tmp_path / "w.json", {"rule": "cost", "temperature": None}))
         assert (cfg.method, cfg.temperature) == ("mean", None)
         assert EnsembleConfig().method == "mean" and EnsembleConfig().temperature is None
+
+    def test_target_rule_with_parameters(self, tmp_path):
+        cfg = load_ensemble_config(_write(tmp_path / "w.json", {
+            "weights": {"lightgbm": 1}, "rule": "target",
+            "cutpoints": [1, 1.9, 2.4, 3.0], "safety_q": 0.13,
+        }))
+        assert cfg.rule == "target"
+        assert isinstance(cfg.rule, DecisionRule)
+        assert cfg.rule.cutpoints == (1.0, 1.9, 2.4, 3.0)
+        assert cfg.rule.safety_q == 0.13
+        assert cfg.rule.spec() == {"rule": "target", "cutpoints": [1.0, 1.9, 2.4, 3.0], "safety_q": 0.13}
+
+    def test_target_rule_safety_q_optional(self, tmp_path):
+        for extra in ({}, {"safety_q": None}):
+            cfg = load_ensemble_config(_write(tmp_path / "w.json", {
+                "rule": "target", "cutpoints": [1.0, 1.9, 2.4, 3.0], **extra}))
+            assert cfg.rule.safety_q is None
+
+    def test_bayes_target_rule(self, tmp_path):
+        cfg = load_ensemble_config(_write(tmp_path / "w.json", {"rule": "bayes_target", "lam": 3.75}))
+        assert cfg.rule == "bayes_target"
+        assert cfg.rule.lam == 3.75
+        assert cfg.weights == MODEL_WEIGHTS
 
     def test_registry_loads_file_from_models_dir(self, tmp_path):
         models_dir = tmp_path / "backend" / "models"
@@ -154,6 +199,115 @@ class TestDecisionRule:
     def test_unknown_rule(self):
         with pytest.raises(ValueError):
             decide(np.full(5, 0.2), "median")
+
+    def test_rules_need_their_parameters(self):
+        assert DECISION_RULES == ("argmax", "cost", "target", "bayes_target")
+        for name in ("target", "bayes_target"):
+            with pytest.raises(ValueError):
+                decide(np.full(5, 0.2), name)
+            with pytest.raises(ValueError):
+                EnsembleConfig(rule=name)
+
+    def test_target_rule_counts_strictly_exceeded_cutpoints(self):
+        rule = DecisionRule("target", cutpoints=[0.5, 1.5, 2.5, 3.5])
+        assert decide(np.array([0.0, 0.0, 1.0, 0.0, 0.0]), rule) == 2      # EL = 2.0
+        assert decide(np.array([0.0, 0.5, 0.0, 0.5, 0.0]), rule) == 2      # EL = 2.0
+        assert decide(np.array([0.0, 0.0, 0.5, 0.5, 0.0]), rule) == 2      # EL = 2.5 = cutpoint → lower
+        assert decide(np.array([0.0, 0.0, 0.4, 0.6, 0.0]), rule) == 3      # EL = 2.6
+        assert decide(np.array([1.0, 0.0, 0.0, 0.0, 0.0]), rule) == 0
+        assert decide(np.array([0.0, 0.0, 0.0, 0.0, 1.0]), rule) == 4
+
+    def test_target_rule_safety_net_caps_at_esi3(self):
+        proba = np.array([0.05, 0.10, 0.0, 0.25, 0.60])                    # EL = 3.2 → ESI 4
+        assert decide(proba, DecisionRule("target", cutpoints=[0.5, 1.5, 2.5, 3.5])) == 3
+        assert decide(proba, DecisionRule("target", cutpoints=[0.5, 1.5, 2.5, 3.5], safety_q=0.15)) == 2
+        assert decide(proba, DecisionRule("target", cutpoints=[0.5, 1.5, 2.5, 3.5], safety_q=0.16)) == 3
+        # the net never lowers urgency
+        urgent = np.array([0.6, 0.4, 0.0, 0.0, 0.0])
+        assert decide(urgent, DecisionRule("target", cutpoints=[0.5, 1.5, 2.5, 3.5], safety_q=0.1)) == 0
+
+    def test_bayes_target_rule(self):
+        np.testing.assert_array_equal(bayes_cost_matrix(0.0), (np.arange(5)[None, :] - np.arange(5)[:, None]) ** 2.0)
+        lam = bayes_cost_matrix(4.0) - bayes_cost_matrix(0.0)
+        assert lam[:2, 2:].tolist() == [[4.0] * 3] * 2 and lam.sum() == 4.0 * 6
+        proba = np.array([0.0, 0.3, 0.7, 0.0, 0.0])
+        assert decide(proba, {"rule": "bayes_target", "lam": 0.5}) == 2
+        assert decide(proba, {"rule": "bayes_target", "lam": 5.0}) == 1   # undertriage of ESI 2 now expensive
+
+    def test_rule_is_a_str_with_parameters(self):
+        rule = DecisionRule("target", cutpoints=[1, 2, 2.5, 3], safety_q=0.1)
+        assert rule == "target" and "target" == rule and rule in DECISION_RULES
+        assert rule != DecisionRule("target", cutpoints=[1, 2, 2.5, 3])
+        assert EnsembleConfig(rule="cost") == EnsembleConfig(rule=DecisionRule("cost"))
+        import copy
+        import pickle
+        assert pickle.loads(pickle.dumps(rule)) == rule
+        assert copy.deepcopy(rule).safety_q == 0.1
+
+
+@pytest.fixture(scope="module")
+def training_decision():
+    ensure_training_on_path()
+    return pytest.importorskip("src.evaluation.decision")
+
+
+def _random_validation(seed: int, n: int = 4000) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calibrated random probabilities: labels drawn from them; ~70% "vitals complete"."""
+    rng = np.random.default_rng(seed)
+    proba = rng.dirichlet([0.3, 1.0, 1.4, 1.0, 0.5], n)
+    y = np.array([rng.choice(5, p=p) for p in proba])
+    vc = rng.random(n) < 0.7
+    return proba, y, vc
+
+
+class TestSameDecisionAsTraining:
+    """A rule fitted by training code, written to ensemble_weights.json and loaded by the
+    backend, decides exactly like training `decide_rule` (row by row)."""
+
+    @pytest.mark.parametrize("kind", ["target", "target_safety", "target_guarantee", "bayes_target"])
+    def test_fitted_rule_round_trip(self, tmp_path, training_decision, kind):
+        dec = training_decision
+        proba, y, vc = _random_validation(0)
+        if kind == "bayes_target":
+            fitted = dec.fit_bayes_rule(y, proba, 0.15, mask=vc)
+        else:
+            fitted = dec.fit_target_rule(y, proba, 0.15, guarantee=kind == "target_guarantee", mask=vc,
+                                         safety_net=kind == "target_safety")
+        if kind == "target_safety":
+            assert fitted.safety_q is not None
+        # training JSON round trip
+        restored = dec.rule_from_dict(json.loads(json.dumps(fitted.to_dict())))
+        spec = restored.spec()
+        assert spec == fitted.spec()
+        # backend loader (spec keys next to weights/method/temperature)
+        path = _write(tmp_path / "ensemble_weights.json",
+                      {"weights": {"lightgbm": 1.0}, "method": "mean", "temperature": None, **spec})
+        cfg = load_ensemble_config(path)
+        assert cfg.rule.spec() == spec
+
+        test_proba, _, _ = _random_validation(1)
+        expected = dec.decide_rule(test_proba, spec)
+        np.testing.assert_array_equal(expected, fitted.predict(test_proba))
+        got = np.array([decide(p, cfg.rule) for p in test_proba])
+        np.testing.assert_array_equal(got, expected)
+        assert len(np.unique(got)) >= 3
+
+    @pytest.mark.parametrize("rule", ["argmax", "cost"])
+    def test_simple_rules(self, training_decision, rule):
+        proba, _, _ = _random_validation(2, n=2000)
+        expected = training_decision.decide_rule(proba, {"rule": rule})
+        np.testing.assert_array_equal([decide(p, rule) for p in proba], expected)
+
+    def test_same_validation_as_training(self, training_decision):
+        assert training_decision.RULES == DECISION_RULES
+        bad = [{"rule": "target", "cutpoints": [1, 3, 2, 4]}, {"rule": "bayes_target", "lam": 0},
+               {"rule": "cost", "lam": 1.0}, {"rule": "target", "cutpoints": [1, 2, 3, 4], "safety_q": 2}]
+        for spec in bad:
+            with pytest.raises(ValueError):
+                training_decision.normalize_spec(spec)
+            with pytest.raises(ValueError):
+                DecisionRule.from_spec(spec)
+        np.testing.assert_array_equal(bayes_cost_matrix(2.5), training_decision.bayes_cost_matrix(2.5))
 
 
 class TestRunEnsemble:
@@ -189,6 +343,19 @@ class TestRunEnsemble:
         assert cat == 1
         assert conf == pytest.approx(0.4)
         assert preds[0].category == 1
+
+    def test_target_rule_on_blend_and_models(self):
+        cfg = EnsembleConfig(rule=DecisionRule("target", cutpoints=[0.5, 1.5, 2.5, 3.5], safety_q=0.3),
+                             source="test")
+        reg = _registry({
+            "catboost": [0.0, 0.1, 0.2, 0.3, 0.4],       # EL 3.0 → ESI 4
+            "lightgbm": [0.0, 0.5, 0.1, 0.0, 0.4],       # EL 2.3 → ESI 3
+        }, cfg)
+        cat, conf, preds = layer1a_ml.run_ensemble(ROW, reg)
+        # blend [0, .3, .15, .15, .4]: EL 2.65 → ESI 4, but P(ESI1-2) = 0.3 ≥ q → ESI 3
+        assert cat == 2
+        assert conf == pytest.approx(0.15)
+        assert [p.category for p in preds] == [3, 2]
 
     def test_no_weighted_model_loaded_raises(self):
         cfg = EnsembleConfig(weights={"ebm": 1.0}, source="test")

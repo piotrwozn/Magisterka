@@ -104,16 +104,20 @@ class indexes 0–4 = ESI 1–5; `conflict.message` explains escalations in Poli
 ## Ensemble weights (`backend/models/ensemble_weights.json`, optional)
 
 Default: **equal weights**, arithmetic **mean**, no temperature and the **argmax**
-decision rule. To serve the blend chosen on the VALIDATION split (training:
-`src.ensemble.optimize_weights`, `fit_temperature` or a manual blend), create
-`backend/models/ensemble_weights.json`:
+decision rule. To serve the blend and the decision rule chosen on the VALIDATION
+split, create `backend/models/ensemble_weights.json`. The training final report
+(`scripts/08_final_report.py`) writes this file as `backend_ensemble_weights.json` —
+copy it here. By hand: `src.ensemble.optimize_weights`, `fit_temperature`, and a rule
+fitted with `src.evaluation.decision` (`rule.spec()` gives the rule keys below).
 
 ```json
 {
   "weights": {"xgboost": 0.35, "lightgbm": 0.25, "catboost": 0.40},
   "method": "mean",
   "temperature": 1.12,
-  "rule": "cost"
+  "rule": "target",
+  "cutpoints": [1.03, 1.95, 2.35, 3.02],
+  "safety_q": 0.13
 }
 ```
 
@@ -129,14 +133,28 @@ decision rule. To serve the blend chosen on the VALIDATION split (training:
   before the decision rule. Fit it on val on the blend itself:
   `T = fit_temperature(blend(P_val, weights, method), y_val)` (notebook 02).
   Per-model predictions are shown unscaled. Omit (or `null`) = no scaling.
-- `rule` — `"argmax"` (default) or `"cost"`: Bayes decision with the training cost
-  matrix (undertriage 3× more expensive than overtriage), applied to the blended
-  probabilities and to each per-model prediction.
+- `rule` — the decision rule; the decision is identical to training
+  `src.evaluation.decision.decide_rule(proba, spec)` (checked by
+  `tests/test_ensemble.py` on a rule fitted by the training code):
+
+  | `rule` | extra keys | decision |
+  |---|---|---|
+  | `"argmax"` (default) | — | most probable level |
+  | `"cost"` | — | Bayes decision with the training cost matrix (undertriage 3× more expensive: `cost[t, p] = (p − t)² × 3` if `p > t`, else `(p − t)²`) |
+  | `"target"` | `cutpoints` (4 non-decreasing numbers, required), `safety_q` (number in (0, 1] or `null`, optional) | expected level `EL = Σ k·p_k` (k = 0…4); level = number of cutpoints **strictly** exceeded by EL. The ESI 2/ESI 3 cutpoint is fitted on val to an undertriage target (e.g. ≤ 15% of ESI 1–2 patients given ESI 3–5), the other three maximise QWK. Safety net: if `P(ESI1) + P(ESI2) ≥ safety_q`, at most ESI 3 |
+  | `"bayes_target"` | `lam` (number > 0, required) | Bayes decision with cost `(p − t)² + lam · 1[t ∈ ESI 1–2 and p ∈ ESI 3–5]`, `lam` fitted on val to the undertriage target |
+
+  The rule is applied to the blended (and temperature-scaled) probabilities — its
+  parameters were fitted on exactly those — and, for orientation, to each per-model
+  prediction. Cutpoints, `safety_q` and `lam` depend on the ESI distribution of the
+  data they were fitted on: refit them on local (Polish) data before clinical use.
 
 An invalid file (bad JSON, unknown key — e.g. a typo `"temprature"`, negative
-weight, unknown method or rule, temperature ≤ 0, no known model with a weight > 0)
-stops the backend at startup with a clear error — a typo must not silently fall
-back to defaults. The startup log lists the active ensemble.
+weight, unknown method or rule, temperature ≤ 0, no known model with a weight > 0,
+`"target"` without 4 sorted cutpoints, `"bayes_target"` without `lam > 0`, a rule key
+that belongs to another rule — e.g. `cutpoints` with `"cost"`) stops the backend at
+startup with a clear error — a typo must not silently fall back to defaults. The
+startup log lists the active ensemble and the rule with its parameters.
 
 ## Safety rules (`app/pipeline/safety_rules.py`)
 

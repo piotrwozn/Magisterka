@@ -10,13 +10,15 @@ Narzędzia do RĘCZNEGO łączenia modeli na predykcjach zapisanych w runs/.
     evaluate(y_val[vc], p[vc], rule="cost")             # podgrupa z kompletem HR/SBP/RR
 
 Protokół: wszystko (wagi, kalibracja, wybór modeli) dobieraj na `val`,
-raportuj na `test` dokładnie tą samą recepturą — raz, na końcu.
+raportuj na `test` dokładnie tą samą recepturą — raz, na końcu
+(`scripts/08_final_report.py`: przedziały ufności, kalibracja, plik wag dla backendu).
 Runy z wagami klas (prawdopodobieństwa nieskalibrowane) i runy bez tuningu są domyślnie
 pomijane (`latest_runs(..., include_weighted=True, require_tuned=False)` je uwzględni).
 """
 
 from src.ensemble.runs import (
     Run,
+    aligned_meta,
     aligned_probas,
     apply_temperature,
     blend,
@@ -32,6 +34,7 @@ from src.ensemble.runs import (
 
 __all__ = [
     "Run",
+    "aligned_meta",
     "aligned_probas",
     "apply_temperature",
     "blend",

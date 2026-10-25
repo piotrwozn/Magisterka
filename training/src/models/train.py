@@ -47,6 +47,8 @@ import argparse
 import json
 import math
 import os
+import re
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -58,6 +60,7 @@ from src.data.dataset import (
     data_fingerprint,
     early_stopping_split,
     ensure_prepared,
+    feature_names,
     get_xy,
     load_splits,
     manifest,
@@ -74,8 +77,11 @@ from src.utils.config import (
     DATA_VERSION,
     DEFAULT_SAMPLE_WEIGHT_STRATEGY,
     DEFAULT_TUNING_PROFILE,
+    EARLY_STOPPING_FRACTION,
     OPTUNA_STORAGE_DIR,
+    RANDOM_SEED,
     RUNS_DIR,
+    TARGET_COL,
     TUNE_SQRT_SCALED_PARAMS,
     TUNING_PROFILES,
 )
@@ -147,14 +153,16 @@ def resolve_budget(
     }
 
 
-def _scale_count_params(model_name: str, params: dict[str, Any], n_fit: int, n_fold_train: int | None) -> dict:
+def _scale_count_params(model_name: str, params: dict[str, Any], n_fit: int, n_fold_train: int | None,
+                        allow_down: bool = False) -> dict:
     """
     Parametry "liczności" (minimalna wielkość liścia) × sqrt(n_fit / n_fold_train) przed finałem:
     optimum rośnie ~ √n, a fold CV trenuje na mniejszej liczbie wierszy niż finalny model.
+    allow_down=True (refity na mniejszych danych, np. krzywa uczenia): także w dół, gdy n_fit < n_fold_train.
     Zmienia `params` w miejscu; zwraca opis zmian (pusty, gdy nic nie skalowano).
     """
     names = TUNE_SQRT_SCALED_PARAMS.get(model_name, [])
-    if not names or not n_fold_train or n_fit <= n_fold_train:
+    if not names or not n_fold_train or n_fit == n_fold_train or (n_fit < n_fold_train and not allow_down):
         return {}
     factor = math.sqrt(n_fit / n_fold_train)
     changes: dict[str, dict] = {}
@@ -675,6 +683,352 @@ def run_training(
 
 
 # ─────────────────────────────────────────
+# Refit z parametrami ukończonego runa (analizy: seedy, leave-site-out, krzywa uczenia)
+# ─────────────────────────────────────────
+# Klucze ustalane przez BIEŻĄCĄ maszynę (config.N_JOBS, hardware.device_for), nie przez run źródłowy
+REFIT_MACHINE_KEYS: tuple[str, ...] = ("n_jobs", "thread_count", "device", "task_type", "devices", "gpu_ram_part")
+# Wersja procedury refitu (DONE.json) — PODBIJ przy zmianie sposobu refitu: analizy nie użyją wtedy
+# starszych refitów ponownie (src.analysis.common.find_refit_run)
+REFIT_VERSION: int = 1
+_FRAME_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+# Nazwy zajęte w run_info.json (`n_<ramka>`) i metrykach
+_RESERVED_FRAME_NAMES: tuple[str, ...] = ("fit", "early_stopping", "features", "features_before_filter", "train")
+
+
+def refit_params(model_name: str, params: Mapping[str, Any], seed: int) -> tuple[dict[str, Any], str]:
+    """
+    Parametry finalne runa źródłowego do refitu: nowy seed (CatBoost `random_seed`, reszta
+    `random_state`), bez wątków i urządzenia — te ustala bieżąca maszyna, jak w zwykłym treningu.
+    Zwraca (parametry, nazwa parametru seeda).
+    """
+    model_name = resolve_model_name(model_name)
+    out = {k: v for k, v in params.items() if k not in REFIT_MACHINE_KEYS and k not in ("random_seed",
+                                                                                         "random_state")}
+    seed_key = "random_seed" if model_name == "catboost" else "random_state"
+    out[seed_key] = int(seed)
+    return out, seed_key
+
+
+def _refit_count_scaling(model_name: str, params: dict[str, Any], info: Mapping[str, Any], n_fit: int) -> dict:
+    """
+    Parametry liczności jak w `run_training`: wartość z tuningu × sqrt(n_fit / n_fold_train) — dla
+    NOWEJ liczby wierszy dopasowania (podzbiór oddziałów, ułamek X_fit); także w dół, gdy refit ma
+    mniej wierszy niż fold tuningu (to samo prawo √n). Przy tej samej liczbie wierszy wynik = run
+    źródłowy. Zmienia `params` w miejscu.
+    """
+    if not info.get("tuned"):
+        return {}
+    tuning = info.get("tuning") or {}
+    adjustments = info.get("tuning_adjustments") or {}
+    for name, change in (adjustments.get("params") or {}).items():
+        if name in params and isinstance(change, Mapping) and "tuned" in change:
+            params[name] = change["tuned"]            # z powrotem wartość z tuningu (przed skalowaniem)
+    n_fold_train = adjustments.get("n_fold_train") or tuning.get("n_fold_train")
+    tuned_names = set(tuning.get("best_params") or {}) | set(adjustments.get("params") or {})
+    subset = {k: params[k] for k in tuned_names if k in params}
+    scaling = _scale_count_params(model_name, subset, n_fit, n_fold_train, allow_down=True)
+    params.update(subset)
+    return scaling
+
+
+def _refit_features(run_dir: Path, info: Mapping[str, Any], feature_set: str) -> list[str]:
+    """Cechy runa źródłowego: cały zestaw albo (filtr cech) lista z feature_importance.csv."""
+    names = feature_names(feature_set)
+    if not info.get("feature_filter"):
+        return names
+    path = run_dir / "feature_importance.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"{run_dir.name}: run z filtrem cech bez feature_importance.csv — "
+                                f"nie da się odtworzyć listy cech do refitu")
+    kept = set(pd.read_csv(path, encoding="utf-8")["feature"].astype(str))
+    return [n for n in names if n in kept]
+
+
+def _stratified_subset(y: pd.Series, n_keep: int, seed: int) -> np.ndarray:
+    """Pozycje stratyfikowanego (po klasie) podzbioru `n_keep` wierszy; bez stratyfikacji, gdy klasa za mała."""
+    from sklearn.model_selection import train_test_split
+
+    positions = np.arange(len(y))
+    try:
+        keep, _ = train_test_split(positions, train_size=n_keep, random_state=seed, stratify=np.asarray(y))
+    except ValueError:
+        keep = np.random.default_rng(seed).choice(positions, size=n_keep, replace=False)
+    return np.sort(keep)
+
+
+def refit_from_run(
+    run_dir: Path | str,
+    *,
+    seed: int,
+    tag: str,
+    train_rows_mask: Callable[[pd.DataFrame], np.ndarray] | None = None,
+    train_rows_label: str | None = None,
+    fit_fraction: float | None = None,
+    eval_frames: Mapping[str, pd.DataFrame] | None = None,
+    eval_splits: tuple[str, ...] = ("val", "test"),
+    es_split_seed: int | None = None,
+    save_model: bool = False,
+    analysis: str | None = None,
+    unit: str | None = None,
+) -> dict:
+    """
+    Refit modelu z UKOŃCZONEGO runa: ta sama ścieżka treningu finalnego co `run_training`
+    (`get_model` + `model.fit` z early stopping na 10% TRAIN), parametry finalne z run_info.json,
+    nowy seed — BEZ tuningu. Dane jak w runie źródłowym (jego train_sample / eval_sample, te same
+    próbki), więc refit runa smoke trwa sekundy, a runa pełnego — tyle co jego trening finalny.
+
+    Parameters
+    ----------
+    run_dir : katalog runa źródłowego (z DONE.json; dane o tej samej wersji i odcisku co bieżące).
+    seed : seed modelu (`random_state` / CatBoost `random_seed`).
+    tag : dopisek nazwy nowego runa, np. 'standard-seed1' (nie może być tagiem zwykłego runa profilu).
+    train_rows_mask : funkcja (ramka TRAIN po próbce) → maska wierszy do treningu (np. inne oddziały);
+        `train_rows_label` — jej opis do run_info.json.
+    fit_fraction : (0, 1] — stratyfikowany ułamek zbioru dopasowania X_fit (po wydzieleniu early
+        stopping; zbiór ES bez zmian); parametry liczności skalowane do nowej liczby wierszy.
+    eval_frames : {nazwa: ramka z kolumnami meta + cechami} — predykcje i metryki tylko na tych
+        ramkach (`predictions_<nazwa>.parquet`, klucze `<nazwa>_<reguła>_<metryka>`);
+        None → splity `eval_splits` (domyślnie val i test) z próbką eval_sample runa źródłowego.
+    eval_splits : standardowe splity do predykcji, gdy eval_frames=None (np. ('val',) — krzywa uczenia).
+    es_split_seed : seed podziału fit / early stopping (None = jak w runie źródłowym).
+    save_model : zapis model.joblib (domyślnie nie — refity służą analizom, a bez pliku modelu
+        `latest_runs` nigdy nie weźmie ich jako głównego runa).
+    analysis, unit : opis analizy i jednostki (DONE.json / run_info.json; wznawianie analiz).
+
+    Katalog nowego runa: `runs/<czas>_<model>_<cechy>_<tag>/` z metrics.json, predykcjami,
+    run_info.json, report.md i NA KOŃCU DONE.json z `custom: true` i `refit_of: <run źródłowy>`
+    (orkiestrator, leaderboard i łączenie modeli nie traktują go jak głównego runa; bez
+    leaderboard_row.json).
+
+    Returns
+    -------
+    dict: run_name, run_dir, model_name, feature_set, metrics, model_path, predictions
+    ({ramka: ścieżka}), refit_of, seed.
+    """
+    source = Path(run_dir)
+    info_path, done_path = source / "run_info.json", source / DONE_JSON
+    if not info_path.exists() or not done_path.exists():
+        raise FileNotFoundError(f"{source}: brak run_info.json albo DONE.json — refit tylko z ukończonego runa")
+    src = json.loads(info_path.read_text(encoding="utf-8"))
+    if src.get("refit_of"):
+        raise ValueError(f"{source.name} jest refitem ({src['refit_of']}) — podaj run źródłowy")
+    if not tag or tag == src.get("tag"):
+        raise ValueError(f"Refit wymaga własnego tagu (różnego od tagu runa źródłowego '{src.get('tag')}')")
+    if fit_fraction is not None and not 0 < float(fit_fraction) <= 1:
+        raise ValueError(f"fit_fraction musi być w (0, 1], podano {fit_fraction}")
+    if eval_frames is None and (not eval_splits or any(name not in ("val", "test") for name in eval_splits)):
+        raise ValueError(f"eval_splits: dozwolone 'val' i 'test', podano {list(eval_splits)}")
+    for name in eval_frames or {}:
+        if not _FRAME_NAME.match(str(name)) or name in _RESERVED_FRAME_NAMES:
+            raise ValueError(f"Nazwa ramki ewaluacji '{name}' — dozwolone małe litery, cyfry i '_' "
+                             f"(bez {', '.join(_RESERVED_FRAME_NAMES)})")
+
+    model_name = resolve_model_name(src["model"])
+    feature_set = resolve_feature_set(src["feature_set"])
+    ensure_prepared()
+    fingerprint = data_fingerprint()
+    if src.get("data_version") != DATA_VERSION or src.get("data_fingerprint") != fingerprint:
+        raise RuntimeError(
+            f"{source.name}: run z innych danych ({src.get('data_version')}, odcisk {src.get('data_fingerprint')}) "
+            f"niż bieżące ({DATA_VERSION}, {fingerprint}) — wytrenuj go ponownie (run_all.py)")
+    train_sample, eval_sample = src.get("train_sample"), src.get("eval_sample")
+    features = _refit_features(source, src, feature_set)
+
+    log.info("═" * 64)
+    log.info(f" REFIT {model_name} · {feature_set} · z {source.name} · seed {seed} · tag '{tag}'"
+             + (f" · {analysis}" if analysis else "") + (f" [{unit}]" if unit else ""))
+    log.info("═" * 64)
+
+    # 1. Dane — te same próbki co run źródłowy
+    names = ("train",) if eval_frames is not None else ("train", *eval_splits)
+    splits = load_splits(names, feature_set=feature_set)
+    df_train = sample_frame(splits["train"], train_sample)
+    if train_rows_mask is not None:
+        mask = np.asarray(train_rows_mask(df_train), dtype=bool)
+        if mask.shape != (len(df_train),):
+            raise ValueError(f"train_rows_mask: maska {mask.shape} ≠ liczba wierszy TRAIN ({len(df_train)},)")
+        df_train = df_train.loc[mask]
+        if df_train.empty:
+            raise ValueError("train_rows_mask nie zostawiła żadnego wiersza TRAIN")
+    if eval_frames is None:
+        frames = {name: sample_frame(splits[name], eval_sample) for name in eval_splits}
+    else:
+        frames = dict(eval_frames)
+    del splits
+    X_train, y_train = get_xy(df_train, feature_set)
+    class_counts = np.bincount(np.asarray(y_train), minlength=len(CLASS_NAMES)).tolist()
+
+    uses_es = MODEL_REGISTRY[model_name].supports_early_stopping
+    es_seed = RANDOM_SEED if es_split_seed is None else int(es_split_seed)
+    if uses_es:
+        try:
+            X_fit, y_fit, X_es, y_es = early_stopping_split(X_train, y_train, seed=es_seed)
+        except ValueError as exc:            # klasa z 1 wizytą po filtrze oddziałów — bez stratyfikacji
+            from sklearn.model_selection import train_test_split
+
+            log.warning(f"Podział early stopping bez stratyfikacji ({exc})")
+            X_fit, X_es, y_fit, y_es = train_test_split(X_train, y_train, test_size=EARLY_STOPPING_FRACTION,
+                                                        random_state=es_seed)
+    else:
+        X_fit, y_fit, X_es, y_es = X_train, y_train, None, None
+    if fit_fraction is not None and float(fit_fraction) < 1:
+        n_keep = min(len(X_fit), max(2 * len(CLASS_NAMES), int(round(float(fit_fraction) * len(X_fit)))))
+        keep = _stratified_subset(y_fit, n_keep, int(seed))
+        X_fit, y_fit = X_fit.iloc[keep], y_fit.iloc[keep]
+    n_es = 0 if X_es is None else len(X_es)
+
+    # 2. Parametry: finalne z runa źródłowego, nowy seed, liczności do nowej liczby wierszy
+    params, seed_key = refit_params(model_name, src.get("params") or {}, seed)
+    scaling = _refit_count_scaling(model_name, params, src, len(X_fit))
+    if scaling:
+        log.info(f"Skalowanie parametrów liczności ×{scaling['factor']} (fold {scaling['n_fold_train']:,} → "
+                 f"fit {scaling['n_fit']:,}): {scaling['params']}")
+    strategy = src.get("sample_weight_strategy") or "none"
+    optuna_cw = None
+    if src.get("weights_strategy") == "optuna_qwk" and src.get("class_weights"):
+        optuna_cw = {int(k): float(v) for k, v in src["class_weights"].items()}
+
+    run_id, run_name, new_dir = _new_run_dir(model_name, feature_set, tag)
+    log.info(f"Run: {run_name} | fit {len(X_fit):,}" + (f" (+{n_es:,} early stopping)" if uses_es else "")
+             + " | ramki: " + ", ".join(f"{k} {len(v):,}" for k, v in frames.items()))
+
+    # 3. Trening finalny — ta sama ścieżka co run_training
+    model = get_model(model_name, params=params)
+    model.optuna_class_weights = optuna_cw
+    model.fit(
+        X_fit[features], y_fit,
+        X_val=X_es[features] if X_es is not None else None, y_val=y_es,
+        sample_weight_strategy=strategy,
+        run_id=run_id,
+        feature_set=feature_set,
+    )
+
+    # 4. Predykcje + metryki na ramkach ewaluacji
+    metrics: dict[str, Any] = {}
+    predictions: dict[str, str] = {}
+    for name, frame in frames.items():
+        X_eval, y_eval = get_xy(frame, feature_set)
+        proba = model.predict_proba(X_eval[features])
+        metrics.update(_evaluate(frame, y_eval, proba, name))
+        path = new_dir / f"predictions_{name}.parquet"
+        _predictions_frame(frame, proba).to_parquet(path, index=False)
+        predictions[name] = str(path)
+
+    model_path = model.save(new_dir / "model.joblib") if save_model else None
+    try:
+        hardware = hardware_summary()
+    except Exception as exc:  # noqa: BLE001 — opis sprzętu nie może przerwać zapisu wyników
+        hardware = {"error": f"{type(exc).__name__}: {exc}"}
+
+    tuning = src.get("tuning") or {}
+    refit = {
+        "refit_version": REFIT_VERSION,
+        "source_run": source.name,
+        "analysis": analysis,
+        "unit": unit,
+        "seed": int(seed),
+        "seed_param": seed_key,
+        "source_seed": (src.get("params") or {}).get(seed_key),
+        "es_split_seed": es_seed,
+        "train_rows": train_rows_label or ("maska" if train_rows_mask is not None else "cały TRAIN runa"),
+        "n_train_rows": int(len(df_train)),
+        "fit_fraction": None if fit_fraction is None else float(fit_fraction),
+        "eval_frames": list(frames),
+        "count_scaling": scaling or None,
+        "study_name": tuning.get("study_name"),
+        "best_trial": tuning.get("best_trial"),
+    }
+    info = {
+        "run_name": run_name,
+        "model": model_name,
+        "feature_set": feature_set,
+        "profile": src.get("profile"),
+        "tag": tag,
+        "custom": True,
+        "overrides": ["refit"],
+        "refit_of": source.name,
+        "refit": refit,
+        "n_features": len(features),
+        "n_features_before_filter": src.get("n_features_before_filter"),
+        "feature_filter": bool(src.get("feature_filter")),
+        "sample_weight_strategy": strategy,
+        "weights_strategy": src.get("weights_strategy"),
+        "class_weights": src.get("class_weights"),
+        "tuned": bool(src.get("tuned")),
+        "tune_metric": src.get("tune_metric"),
+        "budget": src.get("budget"),
+        "custom_params": src.get("custom_params"),
+        "params": model.params,
+        "device": {
+            "requested": model.requested_device,
+            "actual": model.actual_device,
+            "fallback_reason": model.device_fallback,
+        },
+        "best_iteration": model.best_iteration,
+        "iteration_cap": model.iteration_cap,
+        "data_version": DATA_VERSION,
+        "data_fingerprint": fingerprint,
+        "split_strategy": manifest().get("split_strategy"),
+        "early_stopping": uses_es,
+        "n_fit": int(len(X_fit)),
+        "n_early_stopping": int(n_es),
+        "class_counts_train": class_counts,
+        **{f"n_{name}": int(len(frame)) for name, frame in frames.items()},
+        "train_sample": train_sample,
+        "eval_sample": eval_sample,
+        "training_duration_s": model.training_duration_s,
+        "tuning": None,
+        "hardware": hardware,
+        "class_names": CLASS_NAMES,
+        "proba_columns": PROBA_COLS,
+    }
+    _write_json(new_dir / "run_info.json", info)
+    _write_json(new_dir / "metrics.json", metrics)
+    _write_refit_report(new_dir / "report.md", info, metrics)
+    write_json_atomic(new_dir / DONE_JSON, {
+        "run_name": run_name,
+        "model": model_name,
+        "feature_set": feature_set,
+        "tag": tag,
+        "profile": src.get("profile"),
+        "tuned": bool(src.get("tuned")),
+        "custom": True,
+        "overrides": ["refit"],
+        "refit_of": source.name,
+        "refit_version": REFIT_VERSION,
+        "analysis": analysis,
+        "unit": unit,
+        "seed": int(seed),
+        "budget": src.get("budget"),
+        "data_version": DATA_VERSION,
+        "data_fingerprint": fingerprint,
+        "study_name": tuning.get("study_name"),
+        "best_trial": tuning.get("best_trial"),
+        "device": info["device"],
+        "actual_device": model.actual_device,
+        "finished_at": datetime.now().isoformat(timespec="seconds"),
+    }, ensure_ascii=True, default=_json_default)
+
+    summary = []
+    for name in frames:
+        key = f"{name}_argmax_quadratic_weighted_kappa"
+        if key in metrics:
+            summary.append(f"{name}: QWK {metrics[key]:.4f}, log loss {metrics.get(f'{name}_argmax_log_loss', float('nan')):.4f}")
+    log.info(f"Refit gotowy ({model.training_duration_s or 0:.1f} s): " + "; ".join(summary) + f" → {new_dir}")
+    return {
+        "run_name": run_name,
+        "run_dir": str(new_dir),
+        "model_name": model_name,
+        "feature_set": feature_set,
+        "metrics": metrics,
+        "model_path": str(model_path) if model_path else None,
+        "predictions": predictions,
+        "refit_of": source.name,
+        "seed": int(seed),
+    }
+
+
+# ─────────────────────────────────────────
 # Raport markdown
 # ─────────────────────────────────────────
 def _fmt(v) -> str:
@@ -842,6 +1196,42 @@ def _write_report(path: Path, info: dict, metrics: dict, importances: pd.DataFra
                       f"ESI pielęgniarki {_fmt(metrics.get('test_admission_auc_nurse_esi'))}."]
     lines += ["", "### Macierz pomyłek (test, argmax)", ""]
     lines += _confusion_lines(metrics, "test_argmax_confusion_matrix")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_refit_report(path: Path, info: dict, metrics: dict) -> None:
+    """Krótki raport refitu: źródło, seed, dane i metryki na każdej ramce ewaluacji."""
+    refit = info["refit"]
+    device = info.get("device") or {}
+    lines = [
+        f"# {info['run_name']} — refit",
+        "",
+        f"- refit runa `{refit['source_run']}` (parametry finalne z run_info.json, bez tuningu); "
+        f"seed `{refit['seed_param']}` = {refit['seed']} (źródło: {refit.get('source_seed')})",
+        f"- analiza: `{refit.get('analysis') or '—'}`" + (f", jednostka `{refit['unit']}`" if refit.get("unit") else ""),
+        f"- model `{info['model']}`, cechy `{info['feature_set']}` ({info['n_features']}), wagi `{info['weights_strategy']}`",
+        f"- dane `{info['data_version']}` (odcisk `{info['data_fingerprint']}`); wiersze TRAIN: {refit['train_rows']} "
+        f"({refit['n_train_rows']:,}); fit {info['n_fit']:,}"
+        + (f" (ułamek {refit['fit_fraction']:g} X_fit)" if refit.get("fit_fraction") is not None else "")
+        + (f" + early stopping {info['n_early_stopping']:,} (seed podziału {refit['es_split_seed']})"
+           if info.get("early_stopping") else ""),
+        f"- urządzenie: żądane `{device.get('requested')}`, faktyczne `{device.get('actual')}`"
+        + (f" — **GPU → CPU: {device['fallback_reason']}**" if device.get("fallback_reason") else ""),
+        f"- czas treningu: {info['training_duration_s'] or 0:.1f} s"
+        + (f"; najlepsza iteracja {info['best_iteration']} z limitu {info['iteration_cap']}"
+           if info.get("best_iteration") is not None else ""),
+    ]
+    if refit.get("count_scaling"):
+        changes = ", ".join(f"`{k}` {v['tuned']:.4g} → {v['final']:.4g}"
+                            for k, v in refit["count_scaling"]["params"].items())
+        lines.append(f"- skalowanie parametrów liczności ×{refit['count_scaling']['factor']}: {changes}")
+    lines += ["", "## Metryki", ""]
+    columns = []
+    for name in refit["eval_frames"]:
+        columns += [(f"{name} · argmax", f"{name}_argmax"), (f"{name} · koszt", f"{name}_cost")]
+    lines += _metric_table(metrics, columns, LEADERBOARD_METRICS)
+    if any(name == "test" for name in refit["eval_frames"]):
+        lines += ["", "Test — tylko do raportu końcowego (nie do wyboru modeli, wag ani progów)."]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

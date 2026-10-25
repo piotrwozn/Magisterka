@@ -7,6 +7,11 @@ Wykresy:
     3. Calibration plot (reliability diagram)
     4. Feature importances (top-N bar)
     5. Training history (loss/error per iteration)
+    6. Reliability diagram per poziom ESI + top-label, z liczebnością binów (plot_reliability)
+    7. Wykres leśny metryk z przedziałami ufności (plot_metric_ci)
+    8. Kompromis undertriage–QWK reguł decyzyjnych (plot_tradeoff; dane: decision.tradeoff_curve)
+    9. Krzywa decyzyjna — net benefit (plot_decision_curve; dane: report_sections)
+   10. Zależność SHAP od wartości cechy (plot_shap_dependence) i kształt termu EBM (plot_ebm_shape)
 
 Kolory poziomów ESI = kolory TOPSOR (ESI 1 czerwony, …, ESI 5 niebieski),
 przypisane po indeksie klasy 0–4 — nie po nazwie.
@@ -342,3 +347,457 @@ def plot_training_history(
     axes[0].set_title(title, fontsize=13)
     plt.tight_layout()
     return _save_or_show(fig, save_path, show)
+
+
+# ─────────────────────────────────────────
+# Wykres niezawodności (reliability diagram) — panel na każdy poziom ESI + top-label
+# ─────────────────────────────────────────
+# Kolor panelu „top-label” (nie jest poziomem ESI — neutralny grafit)
+TOP_LABEL_COLOR = "#37474F"
+# Kolejne zestawy prawdopodobieństw na jednym wykresie (np. przed / po temperaturze)
+_SET_STYLES: list[tuple[str, str]] = [("-", "o"), ("--", "s"), (":", "^")]
+_INK = "#263238"          # tekst i obwódki znaczników (żółty TOPSOR ginie na białym tle)
+_GRID = "#B0BEC5"
+
+
+def _as_proba_sets(proba: np.ndarray | dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    if isinstance(proba, dict):
+        if not proba:
+            raise ValueError("Pusty słownik prawdopodobieństw")
+        if len(proba) > len(_SET_STYLES):
+            raise ValueError(f"Najwyżej {len(_SET_STYLES)} zestawy prawdopodobieństw na jednym wykresie")
+        return {str(k): np.asarray(v, dtype=float) for k, v in proba.items()}
+    return {"": np.asarray(proba, dtype=float)}
+
+
+def plot_reliability(
+    y_true: np.ndarray,
+    proba: np.ndarray | dict[str, np.ndarray],
+    class_names: list[str] | None = None,
+    path: Path | str | None = None,
+    n_bins: int = 15,
+    *,
+    title: str | None = None,
+    strategy: str = "uniform",
+    min_count: int = 10,
+    show: bool = False,
+):
+    """
+    Wykres niezawodności: panel „top-label” (pewność najbardziej prawdopodobnego poziomu vs
+    trafność) i po jednym panelu jeden-przeciw-reszcie dla każdego poziomu ESI (kolory TOPSOR).
+
+    Pod każdym panelem — liczebność binów (skala log) dla pierwszego zestawu. Idealna
+    kalibracja = przekątna; punkty PONIŻEJ przekątnej = model zbyt pewny siebie.
+
+    Parameters
+    ----------
+    proba : (n, 5) albo {etykieta: (n, 5)} — do 3 zestawów na tych samych panelach
+            (np. {"przed T": p, "po T": apply_temperature(p, T)}); ECE każdego w legendzie.
+    path  : plik PNG (None → bez zapisu).
+    min_count : biny z mniejszą liczbą wierszy nie trafiają na krzywą (szum pojedynczych
+            pacjentów); ECE i histogram liczone ze wszystkich.
+    """
+    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+
+    from src.evaluation.statistics import calibration_error, reliability_table
+
+    if class_names is None:
+        class_names = CLASS_NAMES
+    sets = _as_proba_sets(proba)
+    y = np.asarray(y_true)
+    n_classes = next(iter(sets.values())).shape[1]
+    panels: list[tuple[str, int | None, str]] = [("Najbardziej prawdopodobny poziom (top-label)", None,
+                                                    TOP_LABEL_COLOR)]
+    panels += [(class_names[k] if k < len(class_names) else f"klasa {k}", k,
+                _class_color(k) or TOP_LABEL_COLOR) for k in range(n_classes)]
+
+    n_cols = 3
+    n_rows = int(np.ceil(len(panels) / n_cols))
+    fig = plt.figure(figsize=(5.0 * n_cols, 5.6 * n_rows))
+    outer = GridSpec(n_rows, n_cols, figure=fig, hspace=0.32, wspace=0.28)
+
+    for i, (label, class_idx, color) in enumerate(panels):
+        r, c = divmod(i, n_cols)
+        cell = GridSpecFromSubplotSpec(2, 1, subplot_spec=outer[r, c], height_ratios=[4, 1], hspace=0.08)
+        ax = fig.add_subplot(cell[0])
+        ax_hist = fig.add_subplot(cell[1], sharex=ax)
+        ax.plot([0, 1], [0, 1], linestyle="--", color=_GRID, linewidth=1.2, label="idealna kalibracja")
+        for j, (set_label, p) in enumerate(sets.items()):
+            table = reliability_table(y, p, class_idx=class_idx, n_bins=n_bins, strategy=strategy)
+            if class_idx is None:
+                hits = (p.argmax(axis=1) == y).astype(float)
+                ece = calibration_error(p.max(axis=1), hits, n_bins, strategy)[0]
+            else:
+                ece = calibration_error(p[:, class_idx], (y == class_idx).astype(float), n_bins, strategy)[0]
+            linestyle, marker = _SET_STYLES[j]
+            name = f"{set_label}: ECE = {ece:.3f}" if set_label else f"ECE = {ece:.3f}"
+            curve = table[table["count"] >= min_count]
+            ax.plot(curve["mean_pred"], curve["observed_freq"], linestyle=linestyle, marker=marker,
+                    color=color, markeredgecolor=_INK, markeredgewidth=0.8, markersize=6, linewidth=2,
+                    label=name)
+            if j == 0:
+                widths = (table["bin_high"] - table["bin_low"]).to_numpy()
+                ax_hist.bar(table["bin_low"], table["count"], width=widths * 0.92, align="edge",
+                            color=color, edgecolor=_INK, linewidth=0.4, alpha=0.85)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.set_title(label, fontsize=11, color=_INK)
+        ax.set_ylabel("odsetek trafień" if class_idx is None else f"odsetek {label}", fontsize=10)
+        ax.grid(alpha=0.3)
+        ax.legend(loc="best", fontsize=8, framealpha=0.9, edgecolor="none")
+        plt.setp(ax.get_xticklabels(), visible=False)
+        ax_hist.set_yscale("log")
+        ax_hist.set_ylabel("n", fontsize=9)
+        ax_hist.set_xlabel("pewność (max p)" if class_idx is None else "przewidywane p", fontsize=10)
+        ax_hist.grid(alpha=0.3, axis="y")
+
+    fig.suptitle(title or "Kalibracja (wykres niezawodności)", fontsize=13, color=_INK, y=0.94)
+    return _save_or_show(fig, path, show)
+
+
+# ─────────────────────────────────────────
+# Wykres leśny (forest plot) metryk z przedziałami ufności
+# ─────────────────────────────────────────
+_GROUP_STYLES: list[tuple[str, str]] = [("#37474F", "o"), ("#00897B", "s"), ("#8E24AA", "D")]
+
+
+def plot_metric_ci(
+    df: pd.DataFrame,
+    path: Path | str | None = None,
+    *,
+    title: str | None = None,
+    highlight: list[str] | None = None,
+    metric_labels: dict[str, str] | None = None,
+    show: bool = False,
+):
+    """
+    Wykres leśny: wartość i przedział ufności każdego modelu / połączenia.
+
+    df : kolumny `label`, `value`, `ci_low`, `ci_high`; opcjonalnie `metric` (osobny panel na
+         każdą metrykę) i `group` (np. 'całość' / 'vc' — przesunięte znaczniki w jednym wierszu,
+         różny kształt i kolor, z legendą). Kolejność wierszy = kolejność etykiet w df (pierwsza u góry).
+    highlight : etykiety wyróżnione pogrubieniem (np. wybrane połączenie).
+    metric_labels : metryka → podpis osi X.
+    """
+    required = {"label", "value", "ci_low", "ci_high"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Brak kolumn {sorted(missing)} w tabeli do wykresu leśnego")
+    data = df.copy()
+    if "metric" not in data.columns:
+        data["metric"] = ""
+    if "group" not in data.columns:
+        data["group"] = ""
+    labels = list(dict.fromkeys(data["label"]))
+    metrics = list(dict.fromkeys(data["metric"]))
+    groups = list(dict.fromkeys(data["group"]))
+    if len(groups) > len(_GROUP_STYLES):
+        raise ValueError(f"Najwyżej {len(_GROUP_STYLES)} grupy na wykresie leśnym")
+    highlight = set(highlight or [])
+    positions = {label: len(labels) - 1 - i for i, label in enumerate(labels)}
+    # Pierwsza grupa u góry wiersza
+    offsets = np.linspace(0.18, -0.18, len(groups)) if len(groups) > 1 else np.array([0.0])
+
+    fig, axes = plt.subplots(1, len(metrics), figsize=(4.2 * len(metrics) + 1.5, 0.45 * len(labels) + 1.6),
+                             sharey=True, squeeze=False)
+    for ax, metric in zip(axes[0], metrics, strict=True):
+        part = data[data["metric"] == metric]
+        for g, group in enumerate(groups):
+            rows = part[part["group"] == group]
+            if rows.empty:
+                continue
+            color, marker = _GROUP_STYLES[g]
+            ypos = np.array([positions[label] for label in rows["label"]]) + offsets[g]
+            values = rows["value"].to_numpy(dtype=float)
+            low = rows["ci_low"].to_numpy(dtype=float)
+            high = rows["ci_high"].to_numpy(dtype=float)
+            # Przedział rysowany wprost od ci_low do ci_high: wartość punktowa metryki obciążonej
+            # (np. ECE) może leżeć poza przedziałem percentylowym — errorbar by tego nie przyjął
+            ok = np.isfinite(low) & np.isfinite(high)
+            ax.hlines(ypos[ok], low[ok], high[ok], color=color, linewidth=1.6)
+            for edge in (low, high):
+                ax.plot(edge[ok], ypos[ok], linestyle="none", marker="|", markersize=8, color=color)
+            ax.plot(values, ypos, linestyle="none", marker=marker, markersize=6, color=color,
+                    label=str(group) if group else None)
+        ax.set_xlabel((metric_labels or {}).get(metric, metric), fontsize=10)
+        ax.grid(alpha=0.3, axis="x")
+    axes[0][0].set_yticks([positions[label] for label in labels])
+    axes[0][0].set_yticklabels(labels)
+    for tick in axes[0][0].get_yticklabels():
+        if tick.get_text() in highlight:
+            tick.set_fontweight("bold")
+    axes[0][0].set_ylim(-0.7, len(labels) - 0.3)
+    if len(groups) > 1:
+        handles, names = axes[0][0].get_legend_handles_labels()
+        fig.legend(handles, names, loc="upper right", fontsize=9, frameon=False, ncol=len(groups))
+    fig.suptitle(title or "Metryki z 95% przedziałami ufności", fontsize=12, color=_INK)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return _save_or_show(fig, path, show)
+
+
+# ─────────────────────────────────────────
+# Kompromis undertriage–QWK reguł decyzyjnych (C6)
+# ─────────────────────────────────────────
+# metoda → (podpis, kolor, styl linii, znacznik)
+_TRADEOFF_STYLES: dict[str, tuple[str, str, str, str]] = {
+    "cost": ("reguła kosztowa, mnożnik k", "#546E7A", "-", "o"),
+    "target": ("B1: EL + progi (cel undertriage)", "#00897B", "-", "D"),
+    "target_safety": ("B1 + siatka bezpieczeństwa (B2)", "#004D40", "--", "d"),
+    "bayes_target": ("B4: decyzja Bayesa, λ do celu", "#8E24AA", "-", "s"),
+}
+
+
+def plot_tradeoff(
+    df: pd.DataFrame,
+    path: Path | str | None = None,
+    *,
+    chosen: dict | None = None,
+    title: str | None = None,
+    show: bool = False,
+):
+    """
+    Wykres kompromisu: undertriage ESI1–2 → ESI3–5 [%] (oś X) vs QWK (oś Y).
+
+    df : wynik `src.evaluation.decision.tradeoff_curve` (kolumny method, target, param,
+         undertriage, qwk). Linie: reguła kosztowa (punkty podpisane k), reguły z celem T;
+         argmax jako pojedynczy punkt.
+    chosen : wybrany punkt pracy, np. {"method": "target_safety", "target": 0.15} albo
+             {"method": "cost", "param": 3} — wyróżniony gwiazdką (brak takiego wiersza →
+             ostrzeżenie, wykres bez wyróżnienia).
+    """
+    missing = {"method", "undertriage", "qwk"} - set(df.columns)
+    if missing:
+        raise ValueError(f"Brak kolumn {sorted(missing)} w tabeli kompromisu")
+    data = df.copy()
+    for col in ("target", "param"):
+        if col not in data.columns:
+            data[col] = np.nan
+    data = data.dropna(subset=["undertriage", "qwk"])
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.4))
+    for method, (label, color, linestyle, marker) in _TRADEOFF_STYLES.items():
+        part = data[data["method"] == method].sort_values("undertriage")
+        if part.empty:
+            continue
+        # Siatka bezpieczeństwa zmienia mało decyzji — krzywa B1+B2 leży prawie na B1: puste znaczniki
+        ax.plot(part["undertriage"] * 100, part["qwk"], linestyle=linestyle, marker=marker, color=color,
+                markeredgecolor=_INK if method != "target_safety" else color, markeredgewidth=0.8,
+                markerfacecolor="white" if method == "target_safety" else color,
+                markersize=5, linewidth=1.8 if method != "target_safety" else 1.2, label=label)
+        if method == "cost":
+            for _, row in part.iterrows():
+                ax.annotate(f"k={row['param']:g}", (row["undertriage"] * 100, row["qwk"]),
+                            textcoords="offset points", xytext=(4, -11), fontsize=7.5, color=color)
+    argmax = data[data["method"] == "argmax"]
+    if not argmax.empty:
+        row = argmax.iloc[0]
+        ax.plot(row["undertriage"] * 100, row["qwk"], linestyle="none", marker="o", markersize=9,
+                markerfacecolor="white", markeredgecolor=_INK, markeredgewidth=1.5, zorder=5, label="argmax")
+
+    if chosen:
+        sel = data["method"] == chosen.get("method")
+        if chosen.get("target") is not None:
+            sel &= np.isclose(data["target"].astype(float), float(chosen["target"]))
+        if chosen.get("param") is not None:
+            sel &= np.isclose(data["param"].astype(float), float(chosen["param"]))
+        if sel.any():
+            row = data[sel].iloc[0]
+            ax.plot(row["undertriage"] * 100, row["qwk"], linestyle="none", marker="*", markersize=17,
+                    color="#D32F2F", markeredgecolor=_INK, markeredgewidth=0.8, zorder=6,
+                    label="wybrany punkt pracy")
+            ax.annotate(f"undertriage {row['undertriage']:.1%}, QWK {row['qwk']:.3f}",
+                        (row["undertriage"] * 100, row["qwk"]), textcoords="offset points",
+                        xytext=(10, -16), fontsize=8.5, color=_INK)
+        else:
+            log.warning(f"plot_tradeoff: brak wiersza dla wybranego punktu pracy {chosen}")
+
+    ax.set_xlabel("undertriage ESI1–2 → ESI3–5 [%] (mniej = bezpieczniej)", fontsize=10)
+    ax.set_ylabel("QWK", fontsize=10)
+    ax.grid(alpha=0.35, color=_GRID, linewidth=0.6)
+    ax.set_xlim(left=0)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.legend(fontsize=8.5, frameon=False, loc="lower right")
+    ax.set_title(title or "Kompromis undertriage – QWK reguł decyzyjnych", fontsize=12, color=_INK)
+    fig.tight_layout()
+    return _save_or_show(fig, path, show)
+
+
+# ─────────────────────────────────────────
+# Krzywa decyzyjna (decision curve analysis, C7)
+# ─────────────────────────────────────────
+_DCA_COLORS: list[str] = ["#00897B", "#8E24AA", "#F57C00", "#1E88E5", "#6D4C41"]
+
+
+def plot_decision_curve(
+    curves: dict[str, tuple[np.ndarray, np.ndarray]],
+    path: Path | str | None = None,
+    *,
+    points: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    treat_all: tuple[np.ndarray, np.ndarray] | None = None,
+    title: str | None = None,
+    xlabel: str = "próg prawdopodobieństwa p_t",
+    show: bool = False,
+):
+    """
+    Net benefit (Vickers i Elkin 2006) w funkcji progu p_t.
+
+    curves    : {etykieta: (progi, net benefit)} — wyniki ciągłe (leczymy, gdy ryzyko ≥ p_t),
+    points    : {etykieta: (progi, net benefit)} — decyzje o stałej klasyfikacji (reguła, ESI ≤ 2
+                pielęgniarki): linia przerywana, bo NB zależy od p_t tylko przez wagę FP,
+    treat_all : (progi, NB „wszyscy”); „nikt” = 0 (linia pozioma).
+    """
+    fig, ax = plt.subplots(figsize=(8.5, 5.4))
+    values: list[np.ndarray] = []
+    for i, (label, (pt, nb)) in enumerate(curves.items()):
+        ax.plot(pt, nb, color=_DCA_COLORS[i % len(_DCA_COLORS)], linewidth=2.0, label=label)
+        values.append(np.asarray(nb, dtype=float))
+    for j, (label, (pt, nb)) in enumerate((points or {}).items()):
+        color = _DCA_COLORS[(len(curves) + j) % len(_DCA_COLORS)]
+        ax.plot(pt, nb, color=color, linewidth=1.4, linestyle="--", label=label)
+        values.append(np.asarray(nb, dtype=float))
+    if treat_all is not None:
+        ax.plot(treat_all[0], treat_all[1], color="#90A4AE", linewidth=1.4, linestyle=":",
+                label="wszyscy jako pilni (treat all)")
+    ax.axhline(0.0, color=_INK, linewidth=1.0, label="nikt (treat none)")
+    finite = np.concatenate([v[np.isfinite(v)] for v in values]) if values else np.array([0.0])
+    top = float(finite.max()) if finite.size else 0.0
+    ax.set_ylim(bottom=-0.05 * max(top, 0.01), top=max(top * 1.12, 0.01))
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_ylabel("net benefit (na pacjenta)", fontsize=10)
+    ax.grid(alpha=0.35, color=_GRID, linewidth=0.6)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.legend(fontsize=8.5, frameon=False, loc="upper right")
+    ax.set_title(title or "Krzywa decyzyjna (net benefit)", fontsize=12, color=_INK)
+    fig.tight_layout()
+    return _save_or_show(fig, path, show)
+
+
+# ─────────────────────────────────────────
+# Zależność SHAP od wartości cechy (C11)
+# ─────────────────────────────────────────
+def _binned_mean(x: np.ndarray, v: np.ndarray, n_bins: int = 20, min_count: int = 10) -> tuple[np.ndarray, np.ndarray]:
+    """Średnia v w kwantylowych binach x (biny z < min_count wierszami pomijane)."""
+    ok = np.isfinite(x) & np.isfinite(v)
+    x, v = x[ok], v[ok]
+    if len(x) == 0:
+        return np.empty(0), np.empty(0)
+    n_bins = int(min(n_bins, max(2, len(x) // (2 * min_count))))     # mała próbka → mniej binów
+    edges = np.unique(np.quantile(x, np.linspace(0, 1, n_bins + 1)))
+    if len(edges) < 2:
+        return np.array([x.mean()]), np.array([v.mean()])
+    idx = np.clip(np.searchsorted(edges[1:-1], x, side="right"), 0, len(edges) - 2)
+    centers, means = [], []
+    for b in range(len(edges) - 1):
+        sel = idx == b
+        if sel.sum() >= min_count:
+            centers.append(float(np.median(x[sel])))
+            means.append(float(v[sel].mean()))
+    return np.asarray(centers), np.asarray(means)
+
+
+def plot_shap_dependence(
+    x: np.ndarray,
+    shap_by_class: dict[int, np.ndarray],
+    feature: str,
+    path: Path | str | None = None,
+    *,
+    output_space: str = "log-odds",
+    title: str | None = None,
+    show: bool = False,
+):
+    """
+    Wartość cechy (oś X) vs wartość SHAP dla wybranych poziomów ESI (np. {0: …, 1: …} = ESI 1 i 2),
+    w kolorach TOPSOR; linia = średnia SHAP w binach kwantylowych. Braki cechy (NaN) jako osobny
+    punkt „brak” z lewej strony osi — model uczy się też samego braku pomiaru.
+    """
+    x = np.asarray(x, dtype=float)
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    finite = np.isfinite(x)
+    lo, hi = (float(np.nanmin(x)), float(np.nanmax(x))) if finite.any() else (0.0, 1.0)
+    span = hi - lo if hi > lo else 1.0
+    x_missing = lo - 0.08 * span
+    for class_idx, values in shap_by_class.items():
+        values = np.asarray(values, dtype=float)
+        color = _class_color(class_idx) or TOP_LABEL_COLOR
+        name = CLASS_NAMES[class_idx] if 0 <= class_idx < len(CLASS_NAMES) else f"klasa {class_idx}"
+        ax.scatter(x[finite], values[finite], s=6, alpha=0.18, color=color, edgecolors="none")
+        cx, cy = _binned_mean(x[finite], values[finite])
+        if len(cx):
+            ax.plot(cx, cy, color=color, linewidth=2.2, marker="o", markersize=3.5,
+                    markeredgecolor=_INK, markeredgewidth=0.5, label=f"{name}: średnia w binach")
+        if (~finite).any():
+            ax.errorbar([x_missing], [float(values[~finite].mean())], yerr=[[float(values[~finite].std())],
+                                                                             [float(values[~finite].std())]],
+                        fmt="s", color=color, markeredgecolor=_INK, capsize=3, markersize=6)
+    if (~finite).any():
+        ax.axvline(lo - 0.04 * span, color=_GRID, linewidth=0.8, linestyle=":")
+        ax.annotate(f"brak\n(n={int((~finite).sum())})", (x_missing, ax.get_ylim()[0]), textcoords="offset points",
+                    xytext=(0, 4), ha="center", fontsize=7.5, color=_INK)
+    ax.axhline(0.0, color=_GRID, linewidth=1.0)
+    ax.set_xlabel(feature, fontsize=10)
+    ax.set_ylabel(f"SHAP ({output_space})", fontsize=10)
+    ax.grid(alpha=0.3, color=_GRID, linewidth=0.6)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(fontsize=8, frameon=False, loc="best")
+    ax.set_title(title or f"Zależność SHAP — {feature}", fontsize=11, color=_INK)
+    fig.tight_layout()
+    return _save_or_show(fig, path, show)
+
+
+# ─────────────────────────────────────────
+# Kształt termu EBM (C11)
+# ─────────────────────────────────────────
+def plot_ebm_shape(
+    grid: np.ndarray,
+    curve: np.ndarray,
+    feature: str,
+    path: Path | str | None = None,
+    *,
+    sd: np.ndarray | None = None,
+    smooth: np.ndarray | None = None,
+    missing: float | None = None,
+    reference: float | None = None,
+    ylabel: str = "Δ log-odds ESI 1–2 vs ESI 3–5",
+    note: str | None = None,
+    title: str | None = None,
+    show: bool = False,
+):
+    """
+    Funkcja kształtu jednego termu EBM: surowa (schodkowa) krzywa, opcjonalnie ±1 SD między
+    workami (pasmo) i wygładzona linia (przerywana); `missing` — wartość termu dla braku pomiaru,
+    `reference` — wartość cechy, względem której liczono Δ (pionowa linia).
+    """
+    grid = np.asarray(grid, dtype=float)
+    curve = np.asarray(curve, dtype=float)
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    if sd is not None:
+        sd = np.asarray(sd, dtype=float)
+        ax.fill_between(grid, curve - sd, curve + sd, step="post", color="#00897B", alpha=0.18,
+                        linewidth=0, label="±1 SD między workami (bagging)")
+    ax.step(grid, curve, where="post", color="#00897B", linewidth=1.6, label="EBM (surowa krzywa)")
+    if smooth is not None:
+        ax.plot(grid, np.asarray(smooth, dtype=float), color=_INK, linewidth=2.0, linestyle="--",
+                label="wygładzona (do opisu w pracy)")
+    if missing is not None and np.isfinite(missing):
+        ax.axhline(float(missing), color="#D32F2F", linewidth=1.0, linestyle=":",
+                   label=f"brak pomiaru: {missing:+.2f}")
+    if reference is not None:
+        ax.axvline(float(reference), color=_GRID, linewidth=1.0, linestyle="--")
+    ax.axhline(0.0, color=_GRID, linewidth=1.0)
+    ax.set_xlabel(feature, fontsize=10)
+    ax.set_ylabel(ylabel, fontsize=10)
+    ax.grid(alpha=0.3, color=_GRID, linewidth=0.6)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.legend(fontsize=8, frameon=False, loc="best")
+    ax.set_title(title or f"EBM — kształt termu {feature}", fontsize=11, color=_INK)
+    if note:
+        fig.text(0.01, 0.005, note, fontsize=7.5, color=_INK, ha="left", va="bottom")
+        fig.tight_layout(rect=(0, 0.04, 1, 1))
+    else:
+        fig.tight_layout()
+    return _save_or_show(fig, path, show)

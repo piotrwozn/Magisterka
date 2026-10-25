@@ -23,6 +23,8 @@ log = get_logger(__name__)
 
 PROBA_COLS = [f"p_{name.lower()}" for name in CLASS_NAMES]
 VITALS_COMPLETE_COL = "vitals_complete"     # = src.data.prepare.VITALS_COMPLETE_COL
+# Kolumny meta w predykcjach (bez prawdopodobieństw), które `aligned_meta` zwraca, jeśli są
+META_COLUMNS = ("site", "esi", "target", VITALS_COMPLETE_COL, "admitted")
 DONE_JSON = "DONE.json"                     # = src.models.train.DONE_JSON (run ukończony)
 _EPS = 1e-12
 
@@ -116,6 +118,7 @@ def list_runs(runs_dir: Path | str | None = None) -> pd.DataFrame:
             "eval_sample": info.get("eval_sample"),
             "done": (run_dir / DONE_JSON).exists(),
             "has_model": (run_dir / "model.joblib").exists(),
+            "refit_of": info.get("refit_of"),
         })
     return pd.DataFrame(rows)
 
@@ -151,6 +154,11 @@ def latest_runs(
     if table.empty:
         return []
     table = table[table["feature_set"] == resolve_feature_set(feature_set)]
+    # Refity z analiz (09/10/11, `refit_of`) nigdy nie są "najnowszym runem" modelu
+    refits = table["refit_of"].notna()
+    if refits.any():
+        log.info(f"latest_runs: pomijam {int(refits.sum())} refit(y) z analiz (refit_of)")
+        table = table[~refits]
     if not include_samples:
         table = table[table["train_sample"].isna() & table["eval_sample"].isna()]
     if require_done:
@@ -188,8 +196,10 @@ def aligned_probas(
     """
     Prawdopodobieństwa wszystkich runów na tym samym zbiorze wierszy (po `row_id`).
 
-    Sprawdza: ten sam zbiór wierszy, identyczną etykietę dla każdego `row_id` i tę samą wersję
-    danych we wszystkich runach (inaczej ValueError — łącz tylko runy z jednego przygotowania).
+    Sprawdza: ten sam zbiór wierszy, identyczną etykietę dla każdego `row_id`, tę samą wersję
+    danych we wszystkich runach (inaczej ValueError — łącz tylko runy z jednego przygotowania)
+    i poprawność prawdopodobieństw (skończone, nieujemne, dodatnia suma wiersza — inaczej
+    ValueError z nazwą runa i liczbą złych wierszy).
 
     Returns
     -------
@@ -210,9 +220,11 @@ def aligned_probas(
                     f"wiersz po wierszu")
 
     frames: dict[str, pd.DataFrame] = {}
+    run_names: dict[str, str] = {}
     for run in runs:
         key = run.model if sum(r.model == run.model for r in runs) == 1 else run.name
         frames[key] = run.predictions(split).set_index("row_id").sort_index()
+        run_names[key] = run.name
     ids = [set(df.index) for df in frames.values()]
     common = set.intersection(*ids)
     if any(len(i) != len(common) for i in ids):
@@ -226,7 +238,7 @@ def aligned_probas(
         if not np.array_equal(df["target"].to_numpy(), y):
             raise ValueError(f"Run '{key}' ma inne etykiety niż '{first_key}' dla tych samych row_id — "
                              f"runy pochodzą z różnych przygotowań danych")
-    probas = {k: _normalize(df[PROBA_COLS].to_numpy(dtype=float)) for k, df in frames.items()}
+    probas = {k: _normalize(_checked_proba(df, run_names[k], split)) for k, df in frames.items()}
     if not return_vc:
         return y, probas
     vc_mask = None
@@ -235,6 +247,32 @@ def aligned_probas(
         if values.notna().any():
             vc_mask = values.fillna(0).to_numpy() == 1
     return y, probas, vc_mask
+
+
+def aligned_meta(runs: list[Run], split: str = "val") -> pd.DataFrame:
+    """
+    Kolumny meta splitu (oddział, ESI, target, vitals_complete, admitted — te, które są
+    w predykcjach) z indeksem `row_id` w KOLEJNOŚCI `aligned_probas` (rosnące row_id).
+
+    Wywołuj po `aligned_probas` (ta sprawdza, że wszystkie runy mają te same wiersze i etykiety).
+    """
+    if not runs:
+        raise ValueError("Brak runów")
+    df = runs[0].predictions(split).set_index("row_id").sort_index()
+    return df[[c for c in META_COLUMNS if c in df.columns]].copy()
+
+
+def _checked_proba(df: pd.DataFrame, run_name: str, split: str) -> np.ndarray:
+    """p_esi1..p_esi5 runa; NaN / nieskończoność / wartości ujemne / zerowa suma wiersza → ValueError."""
+    proba = df[PROBA_COLS].to_numpy(dtype=float)
+    bad = ~np.isfinite(proba).all(axis=1) | (proba < 0).any(axis=1)
+    bad |= ~(np.where(bad, 1.0, proba.sum(axis=1)) > 0)
+    if bad.any():
+        examples = ", ".join(str(i) for i in df.index[bad][:5])
+        raise ValueError(f"Run '{run_name}' ({split}): {int(bad.sum()):,} z {len(proba):,} wierszy ma "
+                         f"prawdopodobieństwa NaN / nieskończone / ujemne albo o zerowej sumie "
+                         f"(row_id: {examples}) — popraw predykcje")
+    return proba
 
 
 def _normalize(proba: np.ndarray) -> np.ndarray:
