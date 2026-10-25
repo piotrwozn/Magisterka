@@ -20,7 +20,7 @@ import pytest
 
 from src.llm_eval.client import OllamaChat
 from tests.fake_ollama import FakeOllama, Reply
-from tests.test_llm_eval_esi import N_CASES, decision_from_prompt, llm_esi_env  # noqa: F401 (fixture)
+from tests.test_llm_eval_esi import N_CASES, decision_from_prompt, env_paths, llm_esi_env  # noqa: F401 (fixture)
 
 
 def _first_user(req: dict[str, Any]) -> str:

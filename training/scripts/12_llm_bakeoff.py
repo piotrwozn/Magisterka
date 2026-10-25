@@ -256,11 +256,19 @@ def _dry_run(args: argparse.Namespace, parts: list[str], models: list[str], clie
             print(f"  Egzaminy: nie udało się wczytać pytań ({exc}) — szacunek dla N={args.n_exam + args.n_pes}")
         opts = {**DEFAULT_OPTIONS, "temperature": args.temperature, "seed": args.seed}
         rows += estimate_exams(items, models, cache, think, prices, args.n_exam + args.n_pes, options=opts)
+    cases_ok, cases_detail = True, ""
+    if "esi" in parts or "tools" in parts:
+        from src.llm_eval.esi_cases import cases_status
+
+        cases_ok, cases_detail = cases_status(args.recipe)
     for part in ("esi", "tools"):
         if part in parts:
             fn, why = load_entry(*PART_ENTRY[part])
-            status = "dostępna" if fn else f"pominięta ({why})"
-            print(f"  Część {part}: {args.n_cases} przypadków — {status} (szacunek wg założeń, bez pamięci podręcznej)")
+            if fn is None or not cases_ok:
+                print(f"  Część {part}: zostanie POMINIĘTA — {why or cases_detail}")
+                continue
+            print(f"  Część {part}: {args.n_cases} przypadków ({cases_detail}); szacunek wg założeń, "
+                  f"bez pamięci podręcznej")
             for model in models:
                 est = estimate_part(part, model, args.n_cases, prices)
                 rows.append({**est, "uncached_calls": est["calls"], "uncached_cost_usd": est["cost_usd"]})

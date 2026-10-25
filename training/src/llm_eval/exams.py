@@ -384,18 +384,6 @@ def parse_answer(content: str | None) -> str | None:
         return weak[-1]
     first = _LINE_RE.match(lines[0])
     return first.group(1) if first else None
-    matches = _ANSWER_RE.findall(text)
-    if matches:
-        return matches[-1]
-    lone = _LONE_RE.match(text)
-    if lone:
-        return lone.group(1)
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    for line in (lines[-1], lines[0]) if lines else ():
-        m = _LINE_RE.match(line)
-        if m:
-            return m.group(1)
-    return None
 
 
 # ─────────────────────────────────────────

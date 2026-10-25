@@ -622,7 +622,9 @@ def run_tools_part(
     items_frame(items, extra).to_csv(out / "tools_items.csv", index=False, encoding="utf-8")
     pd.DataFrame([{"model": m, **{k: v for k, v in s.items() if not isinstance(v, list)}}
                   for m, s in summary.items()]).to_csv(out / "tools_summary.csv", index=False, encoding="utf-8")
-    traj = JsonlWriter(out / "tools_trajectories.jsonl")
+    traj_path = out / "tools_trajectories.jsonl"
+    traj_path.unlink(missing_ok=True)              # trajektorie TEGO przebiegu (ten sam --out → bez dopisywania)
+    traj = JsonlWriter(traj_path)
     for it in items:
         traj.write({"model": it["model"], "case_id": it["case_id"], "trajectory": it.get("trajectory"),
                     "explanation": it.get("explanation")})

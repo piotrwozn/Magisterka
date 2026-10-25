@@ -806,11 +806,16 @@ def prepare_context(
     tag: str | None = None,
     strata: dict[int, int] | None = None,
 ) -> EsiContext:
-    """Receptura → predyktor → przypadki. Brak runów / receptury → CasesUnavailable."""
+    """Receptura → predyktor → przypadki. Brak runów / receptury / danych → CasesUnavailable."""
+    from src.data.dataset import is_prepared
+
     try:
         recipe = resolve_recipe(recipe_path, runs_dir=runs_dir, feature_set=feature_set, tag=tag)
     except (FileNotFoundError, ValueError) as exc:
         raise CasesUnavailable(f"Nie da się ustalić receptury decyzji: {exc}") from exc
+    if not is_prepared():
+        raise CasesUnavailable("Brak aktualnych splitów danych ESI (data/processed/esi) — przypadki budujemy z "
+                               "wierszy VAL; uruchom python scripts/02_preprocess.py (albo trening run_all.py)")
     predictor = RecipePredictor(recipe)
     cases, predictor, shap = build_cases(recipe, predictor, n_cases=n_cases, seed=seed, strata=strata)
     if not cases:
@@ -852,6 +857,41 @@ def try_prepare_context(**kwargs: Any) -> tuple[EsiContext | None, str | None]:
     return ctx, None
 
 
+def cases_status(recipe_path: Path | str | None = None, runs_dir: Path | str | None = None,
+                 feature_set: str = "triage", tag: str | None = None) -> tuple[bool, str]:
+    """
+    Szybkie sprawdzenie do planu (--dry-run), BEZ ładowania modeli i danych: czy części esi/tools
+    mają z czego zbudować przypadki. Zwraca (gotowe, opis źródła receptury albo powód pominięcia).
+    """
+    from src.data.dataset import is_prepared
+
+    try:
+        if recipe_path:
+            recipe = load_recipe(recipe_path, runs_dir)
+            runs = [r for k, r in zip(recipe.keys, recipe.runs) if float(recipe.weights.get(k, 0.0)) > 0]
+            source = f"receptura {Path(recipe_path).as_posix()}"
+        else:
+            runs = latest_runs(feature_set, tag=tag, runs_dir=runs_dir, require_tuned=True)
+            source = "najnowsze runy po tuningu"
+            if not runs:
+                runs = latest_runs(feature_set, tag=tag, runs_dir=runs_dir, require_tuned=True,
+                                   include_samples=True)
+                source = "runy na próbkach (np. smoke) — wyłącznie test"
+            if not runs:
+                return False, ("brak ukończonych runów po tuningu — wytrenuj modele (scripts/run_all.py) "
+                               "albo podaj --recipe runs/final_report__*/recipe.json")
+    except CasesUnavailable as exc:
+        return False, str(exc)
+    except (FileNotFoundError, ValueError, KeyError) as exc:
+        return False, f"nie da się wczytać receptury: {exc}"
+    no_model = [r.name for r in runs if not (r.path / "model.joblib").exists()]
+    if no_model:
+        return False, f"runy bez pliku model.joblib: {', '.join(no_model)}"
+    if not is_prepared():
+        return False, "brak aktualnych splitów danych ESI (data/processed/esi) — uruchom scripts/02_preprocess.py"
+    return True, f"{source}: {', '.join(r.model for r in runs)}"
+
+
 __all__ = [
     "CasesUnavailable",
     "EsiCase",
@@ -861,6 +901,7 @@ __all__ = [
     "ShapHelper",
     "allocate_strata",
     "build_cases",
+    "cases_status",
     "describe_patient",
     "format_feature_value",
     "load_recipe",
