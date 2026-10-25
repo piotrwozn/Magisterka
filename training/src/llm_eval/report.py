@@ -6,12 +6,14 @@ Raport porównania modeli (report.md, po polsku, tabele gotowe do pracy) i wybó
 
 Kryterium wyboru (uzgodnione z promotorem / autorem pracy)
     1. GŁÓWNE: trafność w protokole abstaining_substitution na LEK + PES (egzaminy NASK).
-       Modele, których sparowana różnica z najlepszym ma 95% przedział zawierający 0
-       (bootstrap; obok dokładny test McNemara), są z nim w REMISIE.
+       Model jest z najlepszym w REMISIE, chyba że różnica jest istotna w OBU testach: 95%
+       przedział sparowanego bootstrapu Δ nie zawiera 0 ORAZ dokładny test McNemara p < 0,05
+       (`exams.is_tie` — ta sama reguła w tabeli porównań i w wyborze).
     2. Remis rozstrzyga protokół standardowy (ta sama reguła remisu, sparowanie na tych samych
        pytaniach), a dalej metryki części „esi”: wynik `ranking_score` ({model: liczba}, im
-       więcej, tym lepiej) z wyników `run_esi_part` — gdy go brak, decyduje wartość punktowa
-       (raport zaznacza wtedy remis statystyczny).
+       więcej, tym lepiej) z wyników `run_esi_part` albo średnia składników ESI_SCORE_COMPONENTS
+       liczonych na WSZYSTKICH przypadkach (`esi_scores`) — gdy go brak, decyduje wartość
+       punktowa (raport zaznacza wtedy remis statystyczny).
     Możliwość wdrożenia w szpitalu NIE jest kryterium — tylko notatką przy każdym modelu.
 
 Sekcje części „esi” i „tools” dostarczają ich moduły (markdown zaczynający się od nagłówków ###);
@@ -27,7 +29,15 @@ import numpy as np
 
 from src.evaluation.report_sections import Fmt, fnum, md_table
 from src.llm_eval.client import canonical_model
-from src.llm_eval.exams import PROTOCOL_LABELS, PROTOCOLS, SPLIT_LABELS, SPLITS, paired_bootstrap_delta
+from src.llm_eval.exams import (
+    PROTOCOL_LABELS,
+    PROTOCOLS,
+    SPLIT_LABELS,
+    SPLITS,
+    is_tie,
+    mcnemar_exact,
+    paired_bootstrap_delta,
+)
 from src.llm_eval.pricing import PRICING_SOURCE, format_usd
 
 PRIMARY_PROTOCOL = "abstaining_substitution"
@@ -35,9 +45,11 @@ SECONDARY_PROTOCOL = "standard"
 
 SELECTION_CRITERION: str = (
     "Kryterium główne: trafność w protokole abstaining_substitution (NASK) na pytaniach LEK + PES. "
-    "Modele, których sparowana różnica z najlepszym ma 95% przedział zawierający 0, są z nim w remisie; "
-    "remis rozstrzyga trafność w protokole standardowym (ta sama reguła), a następnie wynik części ESI "
-    "(średnia: poprawna struktura, zgodność poziomu ESI, pokrycie cech SHAP, brak halucynacji, język polski)."
+    "Model jest w remisie z najlepszym, chyba że różnica jest istotna w obu testach: 95% przedział "
+    "sparowanego bootstrapu różnicy nie zawiera 0 i dokładny test McNemara daje p < 0,05. "
+    "Remis rozstrzyga trafność w protokole standardowym (ta sama reguła), a następnie wynik części ESI "
+    "(średnia na wszystkich przypadkach: poprawna struktura, zgodność poziomu ESI, pokrycie cech SHAP, brak "
+    "halucynacji, język polski; niepoprawna odpowiedź liczy się jako porażka w każdym składniku)."
 )
 
 # Notatki o możliwości wdrożenia lokalnego (NIE kryterium). Źródła: notatki badawcze 2026-10-25
@@ -90,7 +102,11 @@ def _acc(exams: dict[str, Any], model: str, protocol: str) -> float:
 
 
 # Wynik części ESI do rozstrzygania remisów, gdy część nie podała własnego `ranking_score`:
-# średnia (równe wagi) z poniższych odsetków w `summary[model]` (brakujące pomijane).
+# średnia (równe wagi) z poniższych odsetków w `summary[model]` (brakujące pomijane). Składniki
+# po `valid_rate` są w podsumowaniu liczone tylko na POPRAWNYCH odpowiedziach — tu przechodzą na
+# wszystkie przypadki (× valid_rate; niepoprawna odpowiedź = poziom niezgodny, pokrycie 0,
+# halucynacja, nie po polsku), inaczej model z 2/40 poprawnymi, ale „idealnymi” odpowiedziami
+# wygrywałby z modelem rzetelnym.
 ESI_SCORE_COMPONENTS: tuple[tuple[str, bool], ...] = (
     ("valid_rate", False),            # poprawna struktura odpowiedzi
     ("level_match_rate", False),      # przytoczony poziom ESI = decyzja systemu
@@ -98,12 +114,18 @@ ESI_SCORE_COMPONENTS: tuple[tuple[str, bool], ...] = (
     ("hallucination_rate", True),     # zmyślone pomiary (odwrócone: 1 − odsetek)
     ("polish_rate", False),           # odpowiedź po polsku
 )
+ESI_SCORE_FORMULA: str = (
+    "wynik ESI = średnia z: odsetka poprawnych odpowiedzi oraz odsetków WSZYSTKICH przypadków z poprawną "
+    "odpowiedzią, która ma poziom zgodny z decyzją / pokrycie cech SHAP / brak zmyślonych liczb / język polski "
+    "(niepoprawna odpowiedź = porażka w każdym składniku)"
+)
 
 
 def esi_scores(esi: dict[str, Any] | None) -> dict[str, float]:
     """
     {model: wynik ∈ [0, 1]} z wyników części ESI: `ranking_score` / `score` podany przez część,
-    a gdy go brak — średnia ESI_SCORE_COMPONENTS z `summary[model]`; brak danych → {}.
+    a gdy go brak — średnia ESI_SCORE_COMPONENTS z `summary[model]` (ESI_SCORE_FORMULA: odsetki
+    warunkowe na poprawnych odpowiedziach × valid_rate, czyli na wszystkich przypadkach); brak danych → {}.
     """
     if not isinstance(esi, dict) or esi.get("skipped"):
         return {}
@@ -117,8 +139,19 @@ def esi_scores(esi: dict[str, Any] | None) -> dict[str, float]:
     for model, s in summary.items():
         if not isinstance(s, dict):
             continue
-        vals = [(1.0 - v) if invert else v for key, invert in ESI_SCORE_COMPONENTS
-                if (v := fnum(s.get(key))) is not None]
+        valid = fnum(s.get("valid_rate"))
+        vals = []
+        for key, invert in ESI_SCORE_COMPONENTS:
+            v = fnum(s.get(key))
+            if key == "valid_rate" or valid is None:
+                if v is not None:                       # bez valid_rate: jak dotąd (odsetki wprost)
+                    vals.append((1.0 - v) if invert else v)
+                continue
+            if v is None:
+                if valid == 0.0 and key in s:           # brak poprawnych odpowiedzi → składnik = 0
+                    vals.append(0.0)
+                continue
+            vals.append(valid * ((1.0 - v) if invert else v))
         if vals:
             out[str(model)] = float(np.mean(vals))
     return out
@@ -128,10 +161,11 @@ def esi_scores(esi: dict[str, Any] | None) -> dict[str, float]:
 # Wybór modelu
 # ─────────────────────────────────────────
 def _tied(corr: dict[str, np.ndarray] | None, a: str, b: str, n_boot: int, seed: int) -> bool | None:
+    """Remis wg reguły `exams.is_tie` (bootstrap Δ i dokładny McNemar muszą oba wskazać różnicę)."""
     if not corr or a not in corr or b not in corr:
         return None
     boot = paired_bootstrap_delta(corr[a], corr[b], n_boot=n_boot, seed=seed)
-    return boot["ci_low"] is not None and boot["ci_low"] <= 0 <= boot["ci_high"]
+    return is_tie(boot, mcnemar_exact(corr[a], corr[b])["p_mcnemar"])
 
 
 def select_model(exams: dict[str, Any] | None, esi: dict[str, Any] | None = None,
@@ -168,7 +202,8 @@ def select_model(exams: dict[str, Any] | None, esi: dict[str, Any] | None = None
     if len(g1) == 1:
         winner, decided = best, "primary"
         why = (f"{best} ma najwyższą trafność w protokole abstaining_substitution, a różnica z każdym innym "
-               f"modelem jest istotna (95% przedział sparowanej różnicy nie zawiera 0).")
+               f"modelem jest istotna (95% przedział sparowanej różnicy nie zawiera 0 i dokładny test McNemara "
+               f"p < 0,05).")
     else:
         best2 = max(g1, key=lambda m: (_acc(exams, m, SECONDARY_PROTOCOL), _acc(exams, m, PRIMARY_PROTOCOL)))
         g2 = [best2] + [m for m in g1 if m != best2
@@ -261,7 +296,8 @@ def exams_markdown(exams: dict[str, Any], fmt: Fmt | None = None) -> list[str]:
         "",
         "Protokoły: **standardowy** (pytanie bez zmian) i **abstaining_substitution** (tekst poprawnej opcji "
         "zastąpiony zdaniem „żadna z odpowiedzi nie jest poprawna”; litera poprawnej odpowiedzi bez zmian). "
-        f"Prompt NASK „prev_method” (po polsku), rozumowanie modelu: `think={exams.get('think')}`. "
+        f"Prompt NASK „prev_method” (po polsku), rozumowanie modelu: `think={exams.get('think')}` (wartość "
+        "faktycznie wysyłana do każdego modelu — kolumna „think (wysyłane)” w „Warunkach pomiaru”). "
         "Odpowiedź bez rozpoznawalnej litery i błąd API po wszystkich ponowieniach liczone są jako błędne.",
         "",
     ]
@@ -296,7 +332,9 @@ def exams_markdown(exams: dict[str, Any], fmt: Fmt | None = None) -> list[str]:
                                 "p (McNemar, dokładny)", "Wniosek"], rows), ""]
     lines += ["Δ w punktach procentowych (model − najlepszy), przedział z bootstrapu sparowanego "
               f"({exams.get('n_boot', 2000)} losowań pytań). Kolumna „tylko model / tylko najlepszy” — liczba pytań, "
-              "na które poprawnie odpowiedział tylko jeden z dwóch modeli (pary niezgodne testu McNemara).", ""]
+              "na które poprawnie odpowiedział tylko jeden z dwóch modeli (pary niezgodne testu McNemara). "
+              "„Istotnie gorszy” tylko wtedy, gdy oba testy wskazują różnicę (przedział nie zawiera 0 i p < 0,05); "
+              "w każdym innym przypadku remis.", ""]
 
     lines += ["### Luka standard − abstaining (wskaźnik „bias” NASK)", ""]
     rows = [[f"`{g['model']}`", fmt.pct(g.get("acc_standard")), fmt.pct(g.get("acc_abstaining")),
@@ -356,9 +394,22 @@ def uses_cloud(meta: dict[str, Any]) -> bool:
     return server.get("mode") == "cloud" or remote or any(canonical_model(m) != m for m in models)
 
 
-def selection_markdown(sel: dict[str, Any], fmt: Fmt | None = None, cloud: bool = True) -> list[str]:
+def excluded_banner(excluded: dict[str, Any] | None) -> list[str]:
+    """Ostrzeżenie: ranking bez modeli wyłączonych po teście łączności (wybór niepełny)."""
+    if not excluded:
+        return []
+    names = ", ".join(f"`{m}`" for m in excluded)
+    return [f"> **Uwaga:** wybór bez modelu(-i) {names} — wyłączone po teście łączności (powód w „Warunkach "
+            "pomiaru”), więc nie ma ich w żadnej części ani w rankingu. Uruchom to samo polecenie ponownie, gdy "
+            "model odpowiada (gotowe odpowiedzi pozostałych modeli zostaną wzięte z pamięci podręcznej), zanim "
+            "użyjesz wyniku w pracy.", ""]
+
+
+def selection_markdown(sel: dict[str, Any], fmt: Fmt | None = None, cloud: bool = True,
+                       excluded: dict[str, Any] | None = None) -> list[str]:
     fmt = fmt or Fmt()
     lines = ["## Wybór modelu", "", sel.get("criterion", SELECTION_CRITERION), ""]
+    lines += excluded_banner(excluded)
     if sel.get("winner"):
         lines += [f"**Wybrany model: `{sel['winner']}`.** {sel.get('explanation', '')}", ""]
     else:
@@ -376,11 +427,20 @@ def selection_markdown(sel: dict[str, Any], fmt: Fmt | None = None, cloud: bool 
     if rows:
         lines += [md_table(["#", "Model", "Abstaining (LEK+PES)", "Standard (LEK+PES)", "Remis z najlepszym",
                             "Wynik ESI"], rows), ""]
+        if any(r.get("esi_score") is not None for r in sel.get("ranking", [])):
+            lines += [f"Wynik ESI: {ESI_SCORE_FORMULA} (gdy część nie podała własnego wyniku).", ""]
     lines += ["### Możliwość wdrożenia (notatka, nie kryterium)", ""]
     for r in sel.get("ranking", []):
         lines.append(f"- `{r['model']}` — {r.get('note') or deployability_note(r['model'])}")
     lines += ["", CLOUD_NOTE if cloud else "Pomiar wykonano na lokalnym serwerze Ollamy (bez chmury).", ""]
     return lines
+
+
+def _think_text(sent: Any, requested: Any) -> str:
+    """Wartość `think` wysyłana do modelu (None przy żądanej wartości = serwer odrzucił pole)."""
+    if sent is not None:
+        return str(sent)
+    return "domyślne modelu" if requested is None else "pominięte (serwer odrzucił think) — domyślne modelu"
 
 
 def meta_markdown(meta: dict[str, Any]) -> list[str]:
@@ -400,7 +460,7 @@ def meta_markdown(meta: dict[str, Any]) -> list[str]:
         sent = effective.get(m, meta.get("think"))
         rows.append([f"`{m}`", info.get("api_model", m), (info.get("digest") or "—")[:12],
                      d.get("family") or "—", d.get("parameter_size") or "—", d.get("quantization_level") or "—",
-                     info.get("remote_model") or "—", "domyślne modelu" if sent is None else str(sent),
+                     info.get("remote_model") or "—", _think_text(sent, meta.get("think")),
                      info.get("error") or ""])
     if rows:
         lines += [md_table(["Model (tag)", "Nazwa w API", "Digest", "Rodzina", "Parametry", "Kwantyzacja",
@@ -418,9 +478,13 @@ def render_report(meta: dict[str, Any], parts: dict[str, Any], part_markdown: di
     fmt = Fmt(decimal_comma=decimal_comma)
     date = meta.get("started_at") or datetime.now().isoformat(timespec="seconds")
     lines = [f"# Porównanie modeli językowych do wyjaśnień triażu ESI — {date[:10]}", ""]
+    excluded = meta.get("excluded_models") or {}
     if selection.get("winner"):
+        without = (" — **bez** " + ", ".join(f"`{m}`" for m in excluded)) if excluded else ""
         lines += [f"**Wynik w skrócie:** wybrany model `{selection['winner']}` "
-                  f"(rozstrzygnięcie: {_decided_label(selection.get('decided_by'))}). Szczegóły w sekcji „Wybór modelu”.", ""]
+                  f"(rozstrzygnięcie: {_decided_label(selection.get('decided_by'))}){without}. "
+                  "Szczegóły w sekcji „Wybór modelu”.", ""]
+    lines += excluded_banner(excluded)
     lines += api_error_banner(parts)
     lines += ["## Warunki pomiaru", ""] + meta_markdown(meta)
 
@@ -436,7 +500,7 @@ def render_report(meta: dict[str, Any], parts: dict[str, Any], part_markdown: di
             lines += [f"## {title}", ""]
         lines += [md, ""] if md else [_skip_text(parts.get(part), part), ""]
     lines += ["## Koszty i zużycie tokenów", ""] + costs_markdown(costs, fmt)
-    lines += selection_markdown(selection, fmt, cloud=uses_cloud(meta))
+    lines += selection_markdown(selection, fmt, cloud=uses_cloud(meta), excluded=excluded)
     lines += limitations_markdown(parts)
     lines += files_markdown(parts)
     return "\n".join(lines)
@@ -481,7 +545,8 @@ def files_markdown(parts: dict[str, Any]) -> list[str]:
     """Spis plików przebiegu (ścieżki względem katalogu przebiegu)."""
     lines = ["## Pliki przebiegu", "",
              "- `run_info.json` — warunki pomiaru (polecenie, tagi modeli, /api/show, wersja serwera, daty); "
-             "`bakeoff.log` — log; `results.json` — wszystkie liczby; `raw_responses.jsonl` — surowe odpowiedzi."]
+             "`bakeoff.log` — log; `results.json` — wszystkie liczby; `raw_responses.jsonl` — surowe odpowiedzi "
+             "tego przebiegu (także z pamięci podręcznej)."]
     if _ran(parts.get("exams")):
         lines.append("- `exam_items.csv` (wylosowane pytania), `exam_responses.csv` (odpowiedź każdego modelu), "
                      "`exam_metrics.csv` (metryki model × protokół × egzamin).")
@@ -532,10 +597,12 @@ __all__ = [
     "CLOUD_NOTE",
     "api_error_banner",
     "DEPLOYABILITY_NOTES",
+    "ESI_SCORE_FORMULA",
     "SELECTION_CRITERION",
     "costs_markdown",
     "deployability_note",
     "esi_scores",
+    "excluded_banner",
     "exams_markdown",
     "files_markdown",
     "limitations_markdown",

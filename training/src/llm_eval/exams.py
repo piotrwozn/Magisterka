@@ -29,14 +29,19 @@ Próba (seed 42, identyczna dla każdego modelu)
 
 Prompt (polski, metoda „prev_method” NASK): systemowy „Twoje zadanie to udzielenie odpowiedzi na
 test medyczny dla lekarzy. … Odpowiedz w sposób:\\nPrawidłowa odpowiedź to B.”, w wiadomości
-użytkownika pytanie. Litera wyciągana z OSTATNIEGO „odpowiedź to X” / „Answer: X”, samotnej litery
-albo linii „X. …”; rozumowanie (thinking) jest ignorowane. Brak litery = odpowiedź błędna,
-liczona osobno (odsetek błędów parsowania); błąd API po wszystkich ponowieniach — też błędna
-i liczona osobno (ponowne uruchomienie ponawia tylko te pozycje).
+użytkownika pytanie. Litera wyciągana z OSTATNIEGO „odpowiedź to X” / „Answer: X”, litery w
+nawiasie po deklaracji („Prawidłowa odpowiedź to: … (C)”), samotnej litery albo linii „X. …”;
+rozumowanie (thinking) jest ignorowane. W protokole abstaining odpowiedź podana TEKSTEM opcji
+(„Prawidłowa odpowiedź to: żadna z odpowiedzi nie jest poprawna”) oznacza literę tej opcji.
+Brak litery = odpowiedź błędna, liczona osobno (odsetek błędów parsowania); błąd API po
+wszystkich ponowieniach — też błędna i liczona osobno (ponowne uruchomienie ponawia tylko te pozycje).
 
 Metryki (model × protokół × egzamin): trafność z dokładnym przedziałem Clopper–Pearsona,
 odsetek błędów parsowania i API, opóźnienie, tokeny, koszt; porównanie parami z najlepszym
 modelem (dokładny test McNemara + sparowany bootstrap Δ) i luka standard − abstaining.
+Reguła remisu (`is_tie`): model jest „istotnie gorszy” od najlepszego tylko wtedy, gdy OBA testy
+to potwierdzają — 95% przedział bootstrapu Δ nie zawiera 0 ORAZ dokładny McNemar p < 0,05;
+w każdym innym przypadku remis (raport nie może pisać „istotnie gorszy” obok p ≥ 0,05).
 """
 
 from __future__ import annotations
@@ -378,27 +383,43 @@ _ADJ = r"(?:prawidłow\w*|poprawn\w*|właściw\w*|correct|final|ostateczn\w*|ko�
 _LINK = r"(?:\s+(?:to|jest|brzmi|is))"
 # Silne wzorce: jawna deklaracja odpowiedzi („Prawidłowa odpowiedź to B”, „Odpowiedź prawidłowa: B”,
 # „odpowiedź to B”, „Answer: B”). Słabe: samo „odpowiedź X” (np. w uzasadnieniu „odpowiedź A jest błędna”).
-_STRONG_RES = tuple(re.compile(p + _LETTER_TAIL) for p in (
+_STRONG_PREFIXES: tuple[str, ...] = (
     rf"(?i:{_ADJ}\s+{_KW}{_LINK}*)",
     rf"(?i:{_KW}\s+{_ADJ}{_LINK}*)",
     rf"(?i:{_KW}{_LINK}+)",
     rf"(?i:{_KW})\s*[:：]",
-))
+)
+_STRONG_RES = tuple(re.compile(p + _LETTER_TAIL) for p in _STRONG_PREFIXES)
 _WEAK_RE = re.compile(rf"(?i:{_KW}){_LINK}*" + _LETTER_TAIL, )
+# Deklaracja bez litery wprost, z literą w nawiasie dalej w tej samej linii („Prawidłowa odpowiedź
+# to: żadna z odpowiedzi nie jest poprawna (C).”) — pierwszy nawias po deklaracji.
+_PAREN_RES = tuple(re.compile(p + r"[^\n()\[\]]{1,200}?[(\[]\s*([A-E])\s*[)\]]") for p in _STRONG_PREFIXES)
+# Deklaracja, po której model przepisał TEKST opcji „żadna z odpowiedzi nie jest poprawna” (abstaining)
+_ABSTAIN_RX = r"(?i:[żz]adna\s+z\s+odpowiedzi\s+nie\s+jest\s+poprawn\w*)"
+_ABSTAIN_DECL_RES = tuple(re.compile(p + r"[\s:：\-–—=]*[\*_\"'„”«»(\[]*\s*" + _ABSTAIN_RX)
+                          for p in _STRONG_PREFIXES)
+_ABSTAIN_ANY_RE = re.compile(_ABSTAIN_RX)
 _LONE_RE = re.compile(r"^[\s\*_\"'„”«»(\[]*([A-E])[\s\.\)\]\*_\"'”»:]*$")
 _LINE_RE = re.compile(r"^[\s\*_\"'„«(\[]*([A-E])(?:[\.\)\]:]|\*\*|\s*$)")
 
 
-def parse_answer(content: str | None) -> str | None:
+def parse_answer(content: str | None, abstain_letter: str | None = None) -> str | None:
     """
     Litera A–E z odpowiedzi modelu albo None. Kolejność: OSTATNIA jawna deklaracja („Prawidłowa
     odpowiedź to X”, „Odpowiedź prawidłowa: X”, „odpowiedź to X”, „Answer: X”), samotna litera
-    („B”, „**B.**”), ostatnia linia zaczynająca się od „X.” / „X)” / „X”, ostatnie słabe
-    „odpowiedź X”, pierwsza linia „X. …”. Rozumowanie (thinking) nie jest tu przekazywane.
+    („B”, „**B.**”), ostatnia linia zaczynająca się od „X.” / „X)” / „X”, deklaracja z literą w
+    nawiasie dalej w linii („… to: <tekst opcji> (C).”), ostatnie słabe „odpowiedź X”, pierwsza
+    linia „X. …”. Rozumowanie (thinking) nie jest tu przekazywane.
+
+    abstain_letter (protokół abstaining_substitution: litera opcji „żadna z odpowiedzi nie jest
+    poprawna”) — odpowiedź podana tekstem tej opcji też ją wskazuje: po deklaracji („Prawidłowa
+    odpowiedź to: żadna z odpowiedzi nie jest poprawna”, ten sam poziom co litera w nawiasie) albo,
+    gdy nie znaleziono żadnej litery, gdziekolwiek w odpowiedzi („Żadna z odpowiedzi nie jest poprawna.”).
     """
     text = str(content or "").strip()
     if not text:
         return None
+    abstain = abstain_letter if abstain_letter in LETTERS else None
     strong = [(m.end(), m.group(1)) for rx in _STRONG_RES for m in rx.finditer(text)]
     if strong:
         return max(strong)[1]
@@ -409,11 +430,18 @@ def parse_answer(content: str | None) -> str | None:
     last = _LINE_RE.match(lines[-1])
     if last:
         return last.group(1)
+    declared = [(m.end(), m.group(1)) for rx in _PAREN_RES for m in rx.finditer(text)]
+    if abstain:
+        declared += [(m.end(), abstain) for rx in _ABSTAIN_DECL_RES for m in rx.finditer(text)]
+    if declared:
+        return max(declared)[1]
     weak = _WEAK_RE.findall(text)
     if weak:
         return weak[-1]
     first = _LINE_RE.match(lines[0])
-    return first.group(1) if first else None
+    if first:
+        return first.group(1)
+    return abstain if abstain and _ABSTAIN_ANY_RE.search(text) else None
 
 
 # ─────────────────────────────────────────
@@ -436,7 +464,8 @@ def plan_jobs(items: pd.DataFrame, models: Sequence[str], think: Any = "low",
 
 def _row(job: dict[str, Any], res: ChatResult, cached: bool) -> dict[str, Any]:
     item = job["item"]
-    predicted = parse_answer(res.content) if res.ok else None
+    abstain = item["answer"] if job["protocol"] == "abstaining_substitution" else None
+    predicted = parse_answer(res.content, abstain_letter=abstain) if res.ok else None
     return {
         "model": job["model"], "protocol": job["protocol"], "item_id": item["item_id"], "split": item["split"],
         "exam_name": item["exam_name"], "answer": item["answer"], "predicted": predicted,
@@ -530,6 +559,23 @@ def paired_bootstrap_delta(a: np.ndarray, b: np.ndarray, n_boot: int = 2000, see
     return {"delta": float(d.mean()), "ci_low": float(low), "ci_high": float(high), "n": int(n)}
 
 
+TIE_ALPHA: float = 0.05
+
+
+def is_tie(boot: dict[str, Any], p_mcnemar: float | None, alpha: float = TIE_ALPHA) -> bool:
+    """
+    Remis (różnica nieistotna), chyba że OBA testy wskazują różnicę: 95% przedział bootstrapu Δ
+    nie zawiera 0 i dokładny McNemar p < alpha. Percentylowy bootstrap bywa liberalniejszy od
+    dokładnego testu (mało par niezgodnych) — jedna, zachowawcza reguła usuwa sprzeczność
+    „istotnie gorszy” przy p ≥ 0,05 w tym samym wierszu raportu.
+    """
+    if boot.get("ci_low") is None or boot.get("ci_high") is None:
+        return True
+    ci_excludes_zero = not (boot["ci_low"] <= 0 <= boot["ci_high"])
+    exact_significant = p_mcnemar is not None and p_mcnemar < alpha
+    return not (ci_excludes_zero and exact_significant)
+
+
 def correctness_matrix(responses: pd.DataFrame, items: pd.DataFrame, protocol: str,
                        models: Sequence[str], split: str = "all") -> dict[str, np.ndarray]:
     """{model: wektor trafień} wyrównany do kolejności pytań (brak wiersza = błędna)."""
@@ -603,7 +649,7 @@ def evaluate(responses: pd.DataFrame, items: pd.DataFrame, models: Sequence[str]
                     continue
                 boot = paired_bootstrap_delta(corr[model], corr[best], n_boot=n_boot, seed=seed)
                 mc = mcnemar_exact(corr[model], corr[best])
-                tied = boot["ci_low"] is not None and boot["ci_low"] <= 0 <= boot["ci_high"]
+                tied = is_tie(boot, mc["p_mcnemar"])
                 rows.append({"model": model, "vs": best, **boot, "model_only": mc["a_only"],
                              "best_only": mc["b_only"], "p_mcnemar": mc["p_mcnemar"],
                              "tied_with_best": bool(tied)})
@@ -627,8 +673,7 @@ def pairwise(responses: pd.DataFrame, items: pd.DataFrame, protocol: str, a: str
     corr = correctness_matrix(responses, items, protocol, [a, b])
     boot = paired_bootstrap_delta(corr[a], corr[b], n_boot=n_boot, seed=seed)
     mc = mcnemar_exact(corr[a], corr[b])
-    return {**boot, "p_mcnemar": mc["p_mcnemar"],
-            "tied": bool(boot["ci_low"] is not None and boot["ci_low"] <= 0 <= boot["ci_high"])}
+    return {**boot, "p_mcnemar": mc["p_mcnemar"], "tied": bool(is_tie(boot, mc["p_mcnemar"]))}
 
 
 # ─────────────────────────────────────────
@@ -701,6 +746,7 @@ __all__ = [
     "PES_SPECIALTY_PATTERNS",
     "PROTOCOLS",
     "SYSTEM_PROMPT_PL",
+    "TIE_ALPHA",
     "abstaining_mask",
     "build_messages",
     "correctness_matrix",
@@ -708,6 +754,7 @@ __all__ = [
     "estimate_exams",
     "evaluate",
     "free_form_mask",
+    "is_tie",
     "load_exam_file",
     "load_exam_sources",
     "load_hf_split",

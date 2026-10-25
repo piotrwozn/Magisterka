@@ -858,7 +858,9 @@ def run_esi_part(
     files = {"cases": str(context.save(out / "esi_cases.json"))}
     raw = raw_log if raw_log is not None else JsonlWriter(out / RAW_FILE)
     concurrency = int(getattr(client, "concurrency", 3) or 3)
-    work = [(m, c) for m in models for c in context.cases]
+    # Przeplot przypadek → model (jak egzaminy): limit planu / awaria chmury pod koniec przebiegu
+    # rozkłada się na wszystkie modele, a nie tylko na ostatnie z listy.
+    work = [(m, c) for c in context.cases for m in models]
     log.info(f"Część ESI: {len(models)} model(e) × {len(context.cases)} przypadków = {len(work)} pozycji "
              f"(równolegle {concurrency})")
 

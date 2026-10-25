@@ -610,7 +610,9 @@ def run_tools_part(
     think = parse_think(think)
     raw = raw_log if raw_log is not None else JsonlWriter(out / RAW_FILE)
     concurrency = int(getattr(client, "concurrency", 3) or 3)
-    work = [(m, c) for m in models for c in context.cases]
+    # Przeplot przypadek → model (jak egzaminy): limit planu / awaria chmury pod koniec przebiegu
+    # rozkłada się na wszystkie modele, a nie tylko na ostatnie z listy.
+    work = [(m, c) for c in context.cases for m in models]
     log.info(f"Część narzędziowa: {len(models)} model(e) × {len(context.cases)} przypadków (≤ {max_steps} kroków)")
 
     def worker(model: str, case: EsiCase) -> dict[str, Any]:

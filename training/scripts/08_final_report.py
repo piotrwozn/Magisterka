@@ -1163,7 +1163,7 @@ def write_tables(table_dir: Path, ctx: dict[str, Any]) -> list[str]:
     for name, df in tables.items():
         if df is None or df.empty:
             continue
-        write_text_atomic(table_dir / name, df.to_csv(index=False))
+        write_text_atomic(table_dir / name, df.to_csv(index=False, lineterminator="\n"))
         written.append(name)
     return written
 

@@ -415,6 +415,21 @@ class TestEsiPart:
         assert "## Część ESI" in md and "`good:cloud`" in md and "| Model |" in md
         assert json.loads(Path(files["cases"]).read_text(encoding="utf-8"))["summary"]["n_cases"] == N_CASES
 
+    def test_requests_interleave_models_case_by_case(self, llm_esi_env, tmp_path):
+        """Kolejność pracy przypadek → model: limit / awaria chmury pod koniec rozkłada się na wszystkie modele."""
+        from src.llm_eval.explain_task import run_esi_part
+
+        with FakeOllama() as srv:
+            srv.add_model("good:cloud", good_responder)
+            srv.add_model("other:cloud", good_responder)
+            client = OllamaChat(base_url=srv.base_url, max_retries=0, backoff_base_s=0.0, concurrency=1)
+            res = run_esi_part(client, ["good:cloud", "other:cloud"], out_dir=tmp_path, context=llm_esi_env.ctx,
+                               write_ratings=False)
+            sequence = [b["model"] for b in srv.chat_requests()]
+        assert sequence[:4] == ["good:cloud", "other:cloud"] * 2
+        assert [it["model"] for it in res["items"][:2]] == ["good:cloud", "other:cloud"]
+        assert res["items"][0]["case_id"] == res["items"][1]["case_id"]
+
     def test_api_errors_are_reported_not_raised(self, llm_esi_env, tmp_path):
         from src.llm_eval.explain_task import run_esi_part
 
@@ -477,6 +492,34 @@ class TestRatings:
         assert result["markdown"].index("`m-good`") < result["markdown"].index("`m-bad`")
         written = write_scores(result, tmp_path)
         assert Path(written["md"]).read_text(encoding="utf-8").startswith("## Ślepa ocena")
+
+    def test_sheet_id_depends_on_content_and_template_has_single_line_breaks(self, llm_esi_env, tmp_path,
+                                                                            monkeypatch):
+        """Pilotaż i przebieg końcowy na tych samych danych → inny klucz localStorage; CSV bez \\r\\r\\n."""
+        import os
+
+        from src.llm_eval.ratings import write_rating_sheet
+
+        ctx = llm_esi_env.ctx
+        models = ["m1", "m2"]
+
+        def items(text: str) -> list[dict]:
+            return [{"model": m, "case_id": c.case_id,
+                     "explanation": {"poziom_esi": c.decision_esi, "uzasadnienie": f"{text} {m}",
+                                     "kluczowe_czynniki": [], "sugestia_eskalacji": {"czy": False}}}
+                    for m in models for c in ctx.cases]
+
+        monkeypatch.setattr(os, "linesep", "\r\n")                   # pandas: domyślny koniec linii jak na Windows
+        pilot = write_rating_sheet(tmp_path / "pilot", ctx, items("pilotaż"), models, seed=42)
+        final = write_rating_sheet(tmp_path / "final", ctx, items("wersja końcowa"), models, seed=42)
+        same = write_rating_sheet(tmp_path / "again", ctx, items("wersja końcowa"), models, seed=42)
+        ids = [json.loads(Path(f["ratings_key"]).read_text(encoding="utf-8"))["sheet_id"] for f in (pilot, final, same)]
+        assert ids[0] != ids[1] and ids[1] == ids[2]                   # ten sam arkusz ponownie → oceny zostają
+        assert f'data-sheet="{ids[1]}"' in Path(final["ratings_html"]).read_text(encoding="utf-8")
+        data = Path(final["ratings_template"]).read_bytes()
+        assert b"\r\r\n" not in data and data.count(b"\n") == 1 + len(models) * N_CASES
+        if os.name != "nt":
+            assert b"\r" not in data
 
     def test_excel_semicolon_cp1250_sheet(self, tmp_path):
         """Szablon zapisany w polskim Excelu (średniki, Windows-1250) też jest wczytywany."""

@@ -14,7 +14,9 @@ odpowiedź. Zapisywane są TYLKO udane odpowiedzi (error = None): błędy sieci 
 ponawiane przy następnym uruchomieniu.
 
 Plik jest dopisywany linia po linii (flush po każdej), więc przerwanie (Ctrl+C, restart) gubi
-co najwyżej ostatnią, uciętą linię — przy wczytaniu jest pomijana (ostrzeżenie w logu).
+co najwyżej ostatnią, uciętą linię — przy wczytaniu jest pomijana (ostrzeżenie w logu), także gdy
+cięcie wypadło w środku wielobajtowego znaku UTF-8 (polskie litery). Pierwszy zapis po takim
+cięciu zaczyna się od nowej linii, więc nowy rekord nie skleja się z uciętym.
 Kolejne zapisy tego samego klucza: wygrywa ostatni. `fresh=True` (CLI --fresh) — odczyt
 ignoruje istniejące wpisy, nowe odpowiedzi są dopisywane (nadpisują stare przy następnym odczycie).
 """
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,22 +57,37 @@ class ResponseCache:
         self.hits = 0
         self.misses = 0
         self.writes = 0
+        self._tail_checked = False
         if not self.fresh:
             self._load()
+
+    def _tail_newline(self) -> str:
+        """'\\n', gdy plik kończy się uciętą linią (bez znaku końca linii) — inaczej ''."""
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                if fh.tell() == 0:
+                    return ""
+                fh.seek(-1, os.SEEK_END)
+                return "" if fh.read(1) == b"\n" else "\n"
+        except FileNotFoundError:
+            return ""
 
     def _load(self) -> None:
         if not self.path.exists():
             return
         bad = 0
-        with open(self.path, encoding="utf-8") as fh:
-            for line in fh:
-                if not line.strip():
+        # Bajty, nie tekst: linia ucięta w środku znaku UTF-8 (np. „ł”) to tylko jedna zła linia,
+        # a nie UnicodeDecodeError całego pliku (dekodowanie wewnątrz try).
+        with open(self.path, "rb") as fh:
+            for raw in fh:
+                if not raw.strip():
                     continue
                 try:
-                    rec = json.loads(line)
+                    rec = json.loads(raw.decode("utf-8"))
                     key = (str(rec["part"]), str(rec["model"]), str(rec["item_id"]), str(rec["prompt_hash"]))
                     result = rec["result"]
-                except (ValueError, KeyError, TypeError):
+                except (ValueError, KeyError, TypeError):      # UnicodeDecodeError ⊂ ValueError
                     bad += 1
                     continue
                 if isinstance(result, dict) and not result.get("error"):
@@ -107,6 +125,9 @@ class ResponseCache:
         line = json.dumps(rec, ensure_ascii=False, default=str) + "\n"
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            if not self._tail_checked:          # ucięta ostatnia linia → nowy rekord od nowej linii
+                line = self._tail_newline() + line
+                self._tail_checked = True
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(line)
                 fh.flush()

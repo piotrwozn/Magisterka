@@ -308,6 +308,19 @@ def _preflight(client: Any, models: list[str], think: Any) -> dict[str, str]:
     return failed
 
 
+def sent_think(client: Any, models: list[str], think: Any) -> dict[str, Any]:
+    """{model: think faktycznie wysyłane} — po odrzuceniu `think` przez serwer (400) model idzie bez niego (None)."""
+    return {m: client.effective_think(m, think) for m in models}
+
+
+def start_fresh(path: Path) -> None:
+    """Plik TEGO przebiegu od zera (ten sam --out → bez duplikatów); zablokowany (Windows) → tylko ostrzeżenie."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning(f"Nie udało się wyczyścić {path.name} ({exc}) — nowe rekordy zostaną dopisane na końcu")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     from src.llm_eval.cache import ResponseCache
     from src.llm_eval.client import DEFAULT_BASE_URL, OllamaChat, is_cloud_url, parse_think
@@ -404,12 +417,14 @@ def _run(args: argparse.Namespace, parts: list[str], models: list[str], think: A
         excluded = _preflight(client, models, think)
         models = [m for m in models if m not in excluded]
         meta["excluded_models"] = excluded
+        meta["think_effective"] = sent_think(client, meta["models"], think)   # test mógł trafić na 400 „think”
+        write_json_atomic(out_dir / "run_info.json", jsonable(meta))
         if not models:
             log.error("Żaden model nie odpowiada — sprawdź demon Ollamy (`ollama serve`, `ollama signin`) "
                       "albo klucz API; nic nie zostało policzone")
-            write_json_atomic(out_dir / "run_info.json", jsonable(meta))
             return 1
 
+    start_fresh(out_dir / "raw_responses.jsonl")      # odpowiedzi z pamięci podręcznej i tak są zapisywane ponownie
     raw_log = JsonlWriter(out_dir / "raw_responses.jsonl")
     results: dict[str, Any] = {}
     part_md: dict[str, str] = {}
@@ -464,6 +479,7 @@ def _run(args: argparse.Namespace, parts: list[str], models: list[str], think: A
     exams_res = results.get("exams") if isinstance(results.get("exams"), dict) and results["exams"].get("metrics") else None
     selection = select_model(exams_res, results.get("esi"), n_boot=args.n_boot, seed=args.seed)
     meta["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    meta["think_effective"] = sent_think(client, meta["models"], think)   # odrzucenia `think` w trakcie przebiegu
     meta["cache_stats"] = cache.stats()
     meta["usage_this_run"] = client.usage
     report = render_report(meta, results, part_md, selection, costs, decimal_comma=args.decimal_comma)

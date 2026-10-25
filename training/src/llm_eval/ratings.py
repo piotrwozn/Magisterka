@@ -16,6 +16,7 @@ oceny zapisują się w przeglądarce (localStorage) i eksportują do CSV w forma
 
 from __future__ import annotations
 
+import hashlib
 import html
 import io
 import json
@@ -208,6 +209,18 @@ def render_sheet(ctx: EsiContext, outputs: dict[str, dict[str, dict[str, Any] | 
             f'{"".join(blocks)}</main><script>{js}</script></body></html>')
 
 
+def content_digest(ctx: EsiContext, outputs: dict[str, dict[str, Any]], key: dict[str, dict[str, str]]) -> str:
+    """
+    Krótki skrót treści arkusza (źródła przypadków, wyjaśnienia, przydział liter) — część klucza
+    localStorage: arkusz z inną treścią (np. pilotaż vs przebieg końcowy na tych samych danych)
+    nie dostaje cudzych zapisanych ocen; ten sam arkusz wygenerowany ponownie — zachowuje je.
+    """
+    payload = {"cases": [[c.case_id, c.sources(ctx.recipe_text)] for c in ctx.cases],
+               "outputs": outputs, "key": key}
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+
+
 def write_rating_sheet(out_dir: Path | str, ctx: EsiContext, items: list[dict[str, Any]],
                        models: Sequence[str], seed: int = 42) -> dict[str, str]:
     """
@@ -219,14 +232,16 @@ def write_rating_sheet(out_dir: Path | str, ctx: EsiContext, items: list[dict[st
     for it in items:
         outputs.setdefault(it["model"], {})[it["case_id"]] = it.get("explanation")
     key = assign_letters([c.case_id for c in ctx.cases], list(models), seed=seed)
-    sheet_id = f"{ctx.recipe.data_fingerprint or 'esi'}-{seed}-{len(ctx.cases)}-{len(models)}"
+    sheet_id = f"{ctx.recipe.data_fingerprint or 'esi'}-{seed}-{len(ctx.cases)}-{len(models)}-" \
+               f"{content_digest(ctx, outputs, key)}"
     sheet_dir = out / RATINGS_DIR
     html_path = write_text_atomic(sheet_dir / "ratings.html", render_sheet(ctx, outputs, key, sheet_id))
     rows = [{"oceniajacy": "", "case_id": cid, "litera": letter, **{s: "" for s in SCALES},
              HALLUCINATION_COL: "", "komentarz": ""}
             for cid, mapping in key.items() for letter in mapping]
     template = sheet_dir / "ratings_template.csv"
-    write_text_atomic(template, pd.DataFrame(rows, columns=TEMPLATE_COLUMNS).to_csv(index=False))
+    # lineterminator="\n": write_text_atomic sam zamienia \n na \r\n na Windows (inaczej \r\r\n = puste wiersze w Excelu)
+    write_text_atomic(template, pd.DataFrame(rows, columns=TEMPLATE_COLUMNS).to_csv(index=False, lineterminator="\n"))
     key_path = write_json_atomic(out / KEY_FILE, {"seed": seed, "models": list(models), "sheet_id": sheet_id,
                                                   "cases": key})
     return {"ratings_html": str(html_path), "ratings_template": str(template), "ratings_key": str(key_path)}

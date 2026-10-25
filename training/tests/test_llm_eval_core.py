@@ -286,6 +286,39 @@ def test_cache_roundtrip_skips_errors_and_survives_truncation(tmp_path):
     assert again.stats()["hits"] == 1
 
 
+def test_cache_survives_cut_inside_multibyte_char_and_does_not_glue_next_record(tmp_path):
+    """Przerwany zapis ucięty w środku „ł” (2 bajty UTF-8): wczytanie działa, następny rekord nie skleja się."""
+    path = tmp_path / "responses.jsonl"
+    cache = ResponseCache(path)
+    h = prompt_hash(MSG, think="low")
+    cache.put("esi", "m", "C01", h, ChatResult(content="Pacjentka zgłosiła ból", model="m"))
+    cache.put("esi", "m", "C02", h, ChatResult(content="Tętno przyśpieszone, duszność — pilny łóżkowy", model="m"))
+    data = path.read_bytes()
+    cut = data.rindex("ł".encode()) + 1                 # po pierwszym bajcie (0xc5) znaku „ł”
+    assert data[cut - 1] == 0xC5
+    path.write_bytes(data[:cut])
+    with pytest.raises(UnicodeDecodeError):
+        path.read_text(encoding="utf-8")                        # dowód: plik naprawdę ucięty w środku znaku
+
+    again = ResponseCache(path)                                 # dawniej: UnicodeDecodeError przy każdym `run`
+    assert again.get("esi", "m", "C01", h) is not None and again.get("esi", "m", "C02", h) is None
+    assert again.put("esi", "m", "C03", h, ChatResult(content="Żółć", model="m"))
+    third = ResponseCache(path)
+    assert ChatResult.from_dict(third.get("esi", "m", "C03", h)).content == "Żółć"   # nie sklejony z uciętą linią
+    assert third.get("esi", "m", "C01", h) is not None and len(third) == 2
+
+
+def test_cache_fresh_write_after_cut_line_starts_new_line(tmp_path):
+    path = tmp_path / "responses.jsonl"
+    path.write_bytes(b'{"part": "exams", "model": "m", "item_id": "x", "prompt_ha')     # tylko ucięta linia
+    cache = ResponseCache(path, fresh=True)
+    h = prompt_hash(MSG)
+    cache.put("exams", "m", "standard:1", h, ChatResult(content="B", model="m"))
+    cache.put("exams", "m", "standard:2", h, ChatResult(content="C", model="m"))
+    again = ResponseCache(path)
+    assert len(again) == 2 and ChatResult.from_dict(again.get("exams", "m", "standard:1", h)).content == "B"
+
+
 def test_prompt_hash_depends_on_every_input():
     base = prompt_hash(MSG, think="low", options={"temperature": 0})
     assert base == prompt_hash(MSG, think="low", options={"temperature": 0})
@@ -412,10 +445,91 @@ def test_esi_scores_from_part_summary():
                "b": {"valid_rate": 0.5, "level_match_rate": None, "shap_coverage": 0.2, "hallucination_rate": 0.5,
                      "polish_rate": 1.0}}
     scores = esi_scores({"skipped": None, "summary": summary})
-    assert scores["a"] == pytest.approx(0.92) and scores["b"] == pytest.approx((0.5 + 0.2 + 0.5 + 1.0) / 4)
+    # składniki warunkowe (na poprawnych odpowiedziach) × valid_rate; brak level_match przy valid > 0 → pominięty
+    assert scores["a"] == pytest.approx(0.92)
+    assert scores["b"] == pytest.approx((0.5 + 0.5 * 0.2 + 0.5 * 0.5 + 0.5 * 1.0) / 4)
     assert esi_scores({"ranking_score": {"a": 2}, "summary": summary}) == {"a": 2.0}
     assert esi_scores({"skipped": "brak runów", "summary": summary}) == {}
     assert esi_scores(None) == {}
+
+
+def test_esi_score_does_not_reward_model_with_few_valid_outputs():
+    """2/40 poprawnych, ale „idealnych” odpowiedzi nie może wygrać z rzetelnym modelem 40/40."""
+    from src.llm_eval.report import esi_scores, select_model
+
+    summary = {
+        "rzadko": {"valid_rate": 2 / 40, "level_match_rate": 1.0, "shap_coverage": 1.0, "hallucination_rate": 0.0,
+                   "polish_rate": 1.0},
+        "rzetelny": {"valid_rate": 1.0, "level_match_rate": 0.9, "shap_coverage": 0.3, "hallucination_rate": 0.2,
+                     "polish_rate": 1.0},
+        "nic": {"valid_rate": 0.0, "level_match_rate": None, "shap_coverage": None, "hallucination_rate": None,
+                "polish_rate": None},
+    }
+    scores = esi_scores({"summary": summary})
+    assert scores["rzadko"] == pytest.approx(0.05) and scores["rzetelny"] == pytest.approx(0.8)
+    assert scores["nic"] == 0.0
+    exams = _fake_exams({"rzadko": (0.70, 0.50), "rzetelny": (0.70, 0.50)})
+    sel = select_model(exams, {"summary": summary}, n_boot=300)
+    assert sel["winner"] == "rzetelny" and sel["decided_by"] == "esi"
+
+
+def test_tie_rule_needs_both_bootstrap_and_exact_mcnemar():
+    """0/4 pary niezgodne przy N=30: przedział bootstrapu bez 0, ale p(McNemar)=0,125 → remis, nie „istotnie gorszy”."""
+    import pandas as pd
+
+    from src.llm_eval.exams import (
+        correctness_matrix,
+        evaluate,
+        is_tie,
+        mcnemar_exact,
+        paired_bootstrap_delta,
+    )
+    from src.llm_eval.report import exams_markdown, select_model
+
+    n = 30
+    best = np.ones(n, dtype=bool)
+    other = best.copy()
+    other[:4] = False
+    boot = paired_bootstrap_delta(other, best, n_boot=2000, seed=42)
+    p = mcnemar_exact(other, best)["p_mcnemar"]
+    assert boot["ci_high"] < 0 and p == pytest.approx(0.125)        # sprzeczność obu testów (stara reguła: „gorszy”)
+    assert is_tie(boot, p)
+    assert not is_tie({"ci_low": -0.3, "ci_high": -0.1}, 0.001)       # oba testy: różnica → istotnie gorszy
+    assert is_tie({"ci_low": -0.3, "ci_high": 0.01}, 0.001)           # przedział z 0 → remis
+    assert is_tie({"ci_low": None, "ci_high": None}, None)
+
+    items = pd.DataFrame({"item_id": [str(i) for i in range(n)], "split": ["r_lek"] * n})
+    rows = [{"model": m, "protocol": proto, "item_id": str(i), "split": "r_lek", "correct": bool(vec[i]),
+             "parse_ok": True, "error": None, "latency_s": 1.0, "prompt_tokens": 1, "completion_tokens": 1,
+             "cached": False}
+            for m, vec in (("best", best), ("other", other)) for proto in ("standard", "abstaining_substitution")
+            for i in range(n)]
+    responses = pd.DataFrame(rows)
+    res = evaluate(responses, items, ["best", "other"], n_boot=2000)
+    res["models"] = ["best", "other"]
+    res["_correctness"] = {proto: correctness_matrix(responses, items, proto, ["best", "other"])
+                           for proto in ("standard", "abstaining_substitution")}
+    row = res["paired_vs_best"]["abstaining_substitution"]["rows"][0]
+    assert row["model"] == "other" and row["tied_with_best"] and row["p_mcnemar"] == pytest.approx(0.125)
+    text = "\n".join(exams_markdown(res))
+    assert "| 0 / 4 | 0.125 | remis (różnica nieistotna) |" in text and "| istotnie gorszy |" not in text
+    sel = select_model(res, n_boot=2000)
+    assert set(sel["primary_tie"]) == {"best", "other"} and sel["decided_by"] == "point_estimate"
+
+
+def test_report_warns_prominently_about_excluded_models():
+    from src.llm_eval.report import render_report, select_model
+
+    exams = _fake_exams({"a": (0.80, 0.40), "b": (0.90, 0.70)})
+    sel = select_model(exams, n_boot=300)
+    meta = {"models": ["a", "b", "c"], "excluded_models": {"c": "HTTP 503"}, "think": "low"}
+    text = render_report(meta, {"exams": exams}, {}, sel, [])
+    head = text.split("## Warunki pomiaru")[0]
+    assert "**bez** `c`" in head and "wybór bez modelu(-i) `c`" in head
+    choice = text.split("## Wybór modelu")[1]
+    assert "wybór bez modelu(-i) `c`" in choice
+    plain = render_report({**meta, "excluded_models": {}}, {"exams": exams}, {}, sel, [])
+    assert "wybór bez modelu" not in plain and "**bez**" not in plain
 
 
 def test_think_rejection_is_remembered_per_model(srv):

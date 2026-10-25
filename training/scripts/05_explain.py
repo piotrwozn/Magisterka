@@ -253,7 +253,7 @@ def run_global(model: Any, X_all: pd.DataFrame, out_dir: Path, *, size: int, top
             table["suma"] = table[CLASS_NAMES[:mean_abs.shape[0]]].sum(axis=1)
             table = table.sort_values("ESI1+ESI2", ascending=False)
             table.index.name = "cecha"
-            (out_dir / "shap_mean_abs.csv").write_text(table.to_csv(), encoding="utf-8")
+            (out_dir / "shap_mean_abs.csv").write_text(table.to_csv(lineterminator="\n"), encoding="utf-8")
             files.append("shap_mean_abs.csv")
             listed = [values[:, c, :] for c in range(values.shape[1])]
             for path in (shap_summary_plot(listed, shown, save_path=out_dir / "shap_summary_all_levels.png"),

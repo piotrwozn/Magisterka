@@ -197,6 +197,10 @@ class TestToolsPart:
         row = dict(case.base_row, triage_vital_o2=85.0)
         assert wi["id_zrodla"] == "T2" and wi["poziom_esi_po"] == predict_row(ctx, row)[1]
 
+        # przeplot przypadek → model (awaria pod koniec przebiegu nie trafia tylko w ostatni model z listy)
+        assert [it["model"] for it in res["items"][:3]] == models
+        assert len({it["case_id"] for it in res["items"][:3]}) == 1
+
         agent, lost, text = (res["summary"][m] for m in models)
         assert agent["completion_rate"] == 1.0 and agent["valid_tool_call_rate"] == 1.0
         assert agent["hallucinated_tools"] == 0 and agent["avg_steps"] == 2.0

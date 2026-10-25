@@ -156,6 +156,41 @@ def test_parse_answer(text, expected):
     assert parse_answer(text) == expected
 
 
+@pytest.mark.parametrize("text,abstain,expected", [
+    # protokół abstaining: odpowiedź podana tekstem opcji „żadna z odpowiedzi nie jest poprawna”
+    ("Prawidłowa odpowiedź to: żadna z odpowiedzi nie jest poprawna (C).", "C", "C"),
+    ("Odpowiedź prawidłowa: żadna z odpowiedzi nie jest poprawna, czyli C", "C", "C"),
+    ("Żadna z odpowiedzi nie jest poprawna.", "C", "C"),
+    ("Zadna z odpowiedzi nie jest poprawna", "A", "A"),                    # bez polskich znaków
+    ("Odpowiedź A jest błędna, bo dotyczy innej choroby.\nPrawidłowa odpowiedź to: **żadna z odpowiedzi nie "
+     "jest poprawna**", "E", "E"),                                        # deklaracja wygrywa ze słabym „odpowiedź A”
+    ("Prawidłowa odpowiedź to B", "C", "B"),                              # jawna litera ma pierwszeństwo
+    ("B. żadna z odpowiedzi nie jest poprawna", "B", "B"),
+    # protokół standardowy (bez litery opcji abstain): tekst sam nie wskazuje litery
+    ("Żadna z odpowiedzi nie jest poprawna.", None, None),
+    ("Odpowiedź prawidłowa: żadna z odpowiedzi nie jest poprawna, czyli C", None, None),
+    # litera w nawiasie po deklaracji (każdy protokół)
+    ("Prawidłowa odpowiedź to: żadna z odpowiedzi nie jest poprawna (C).", None, "C"),
+    ("Prawidłowa odpowiedź to: zapalenie płuc (B).", None, "B"),
+    ("Prawidłowa odpowiedź to C. Opcja (A) jest błędna.", None, "C"),     # nawias nie przebija jawnej litery
+    ("Odpowiedź jest trudna (np. kilka opcji) i nie wiem", None, None),
+])
+def test_parse_answer_abstain_text_and_parenthesized_letter(text, abstain, expected):
+    assert parse_answer(text, abstain_letter=abstain) == expected
+
+
+def test_abstain_text_answer_scored_only_in_abstaining_protocol():
+    from src.llm_eval.client import ChatResult
+    from src.llm_eval.exams import _row
+
+    item = {"item_id": "q1", "split": SPLIT_LEK, "exam_name": "LEK", "answer": "C"}
+    res = ChatResult(content="Żadna z odpowiedzi nie jest poprawna.", model="m")
+    abst = _row({"model": "m", "protocol": "abstaining_substitution", "item": item}, res, cached=False)
+    std = _row({"model": "m", "protocol": "standard", "item": item}, res, cached=False)
+    assert abst["predicted"] == "C" and abst["correct"] and abst["parse_ok"]
+    assert std["predicted"] is None and not std["correct"] and not std["parse_ok"]
+
+
 # ─────────────────────────────────────────
 # Losowanie próby
 # ─────────────────────────────────────────
@@ -395,6 +430,38 @@ def test_cli_rejects_cloud_without_key_and_bad_args(cli, tmp_path):
     assert cli.main(["run", "--base-url", "https://ollama.com", "--parts", "exams"]) == 2
     assert cli.main(["run", "--parts", "exams,zle"]) == 2
     assert cli.main(["run", "--think", "bardzo"]) == 2
+
+
+@pytest.mark.parametrize("preflight", [True, False])
+def test_cli_reports_think_actually_sent_and_rerun_does_not_duplicate_raw(cli, srv, nask_csv, tmp_path, preflight):
+    """Model odrzucający `think` (400): raport i run_info.json pokazują, że szedł BEZ think; ten sam --out
+    drugi raz nie podwaja raw_responses.jsonl."""
+    key = answer_key_from_frame(pd.read_csv(nask_csv, encoding="utf-8"))
+    oracle = exam_oracle(key, p_correct=0.8, seed=3)
+    srv.add_model("fake-a", exam_oracle(key, p_correct=0.95, seed=1))
+    srv.add_model("bez-think", lambda req: Reply(status=400, error="think value is not supported for this model")
+                  if "think" in req else oracle(req))
+    argv = ["run", "--parts", "exams", "--models", "fake-a,bez-think", "--base-url", srv.base_url,
+            "--exam-file", str(nask_csv), "--n-exam", "10", "--n-pes", "5", "--n-boot", "100",
+            "--out", str(tmp_path / "r"), "--cache", str(tmp_path / "c.jsonl")] + ([] if preflight else ["--no-preflight"])
+    assert cli.main(argv) == 0
+    out = tmp_path / "r"
+    info = json.loads((out / "run_info.json").read_text(encoding="utf-8"))
+    assert info["think_effective"] == {"fake-a": "low", "bez-think": None}
+    report = (out / "report.md").read_text(encoding="utf-8")
+    meta_rows = {line.split(" | ")[0]: line for line in report.split("## Warunki pomiaru")[1].split("## ")[0]
+                 .splitlines() if line.startswith("| `")}
+    assert "| pominięte (serwer odrzucił think) — domyślne modelu |" in meta_rows["| `bez-think`"]
+    assert "| low |" in meta_rows["| `fake-a`"]
+    bodies = srv.chat_requests("bez-think")
+    assert any("think" in b for b in bodies) and sum("think" not in b for b in bodies) >= 30
+    raw_first = (out / "raw_responses.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(raw_first) == 2 * 2 * 15                                # 2 modele × 2 protokoły × 15 pytań
+
+    assert cli.main(argv) == 0                                          # ten sam --out (np. dopełnienie błędów)
+    raw_second = (out / "raw_responses.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(raw_second) == len(raw_first)
+    assert all(json.loads(line)["cached"] for line in raw_second)
 
 
 def test_cli_excludes_dead_model_after_preflight(cli, srv, nask_csv, tmp_path):

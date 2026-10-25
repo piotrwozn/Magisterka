@@ -11,10 +11,15 @@ Wybieramy **model z najlepszym wynikiem w NASZYM pomiarze**:
 
 1. **Kryterium główne:** trafność na polskich pytaniach egzaminacyjnych (LEK + PES) w protokole
    **abstaining_substitution** zbioru NASK (protokół „prawdziwej kompetencji”, zob. punkt 2).
-2. **Remis** (95% przedział sparowanej różnicy z najlepszym modelem zawiera 0) rozstrzyga
-   trafność w protokole **standardowym** (ta sama reguła remisu), a dalej wynik części **esi**
-   (średnia: poprawna struktura odpowiedzi, poziom ESI zgodny z decyzją, pokrycie cech SHAP,
-   brak zmyślonych pomiarów, odpowiedź po polsku).
+2. **Remis.** Model jest w remisie z najlepszym, chyba że różnica jest istotna w **obu** testach:
+   95% przedział sparowanego bootstrapu różnicy nie zawiera 0 **i** dokładny test McNemara daje
+   p < 0,05 (percentylowy bootstrap bywa liberalniejszy od testu dokładnego przy małej liczbie par
+   niezgodnych — jedna, zachowawcza reguła sprawia, że raport nigdy nie pisze „istotnie gorszy”
+   obok p ≥ 0,05). Remis rozstrzyga trafność w protokole **standardowym** (ta sama reguła), a dalej
+   wynik części **esi**: średnia z odsetka poprawnych odpowiedzi oraz odsetków **wszystkich**
+   przypadków z poprawną odpowiedzią, która ma poziom ESI zgodny z decyzją, pokrywa cechy SHAP, nie
+   zmyśla pomiarów i jest po polsku (niepoprawna odpowiedź = porażka w każdym składniku, więc model
+   z kilkoma poprawnymi, ale „idealnymi” odpowiedziami nie wygrywa z modelem rzetelnym).
 3. **Możliwość wdrożenia w szpitalu nie jest kryterium** — raport podaje ją jako notatkę przy
    każdym modelu (licencja, rozmiar, czy da się uruchomić lokalnie).
 
@@ -36,7 +41,10 @@ poprawna” (litera poprawnej odpowiedzi bez zmian), dokładnie jak w skrypcie N
 „najczęstszy”, „z wyjątkiem”… i pytania, które NASK przenosi do części otwartej). Model, który
 rozpoznaje wzorzec odpowiedzi zamiast wiedzy, traci tu najwięcej — w pracy NASK najlepsze modele
 traciły ok. 30 pp. Losujemy tylko pytania kwalifikujące się do obu protokołów, więc luka
-standard − abstaining jest sparowana na identycznych pytaniach.
+standard − abstaining jest sparowana na identycznych pytaniach. Literę odpowiedzi skrypt wyciąga z
+ostatniej deklaracji („Prawidłowa odpowiedź to B”), także z litery w nawiasie po deklaracji
+(„… to: <tekst opcji> (C)”); w protokole abstaining odpowiedź podana samym tekstem opcji
+(„Żadna z odpowiedzi nie jest poprawna.”) liczy się jako litera tej opcji.
 
 **Przypadki ESI.** Każdy przypadek to polski opis pacjenta (wiek, płeć, sposób przybycia,
 parametry z jednostkami, skargi główne, tlenoterapia) [S1], decyzja systemu z
@@ -117,7 +125,12 @@ pamięć podręczną. Błędy 429 / 5xx / przekroczony czas są ponawiane z wyk�
 `--max-retries 5`); model, który zawiódł 20 razy z rzędu, jest w tym przebiegu pomijany (jego
 pozycje liczą się jako błędne, raport ostrzega na górze — uruchom polecenie ponownie). Na początku
 skrypt wysyła do każdego modelu krótkie zapytanie testowe i wyłącza modele, które nie odpowiadają
-(`--no-preflight` wyłącza ten test).
+(`--no-preflight` wyłącza ten test) — wtedy „Wynik w skrócie” i sekcja „Wybór modelu” ostrzegają,
+że wybór pominął te modele; przed użyciem wyniku uruchom polecenie ponownie. Linia pamięci
+podręcznej ucięta przy awarii (także w środku polskiego znaku) jest przy wczytaniu pomijana, a
+następny zapis zaczyna się od nowej linii. Części esi i tools wysyłają zapytania w kolejności
+przypadek → model (jak egzaminy), więc limit planu albo awaria chmury pod koniec przebiegu nie
+uderza tylko w ostatni model z listy.
 
 **Kody wyjścia:** 0 — OK; 1 — któraś część się nie udała; 2 — złe argumenty, brak klucza API
 albo pytań; 130 — Ctrl+C.
@@ -128,7 +141,7 @@ albo pytań; 130 — Ctrl+C.
 |---|---|---|
 | `--parts` | `exams,esi,tools` | które części liczyć |
 | `--models` | 4 modele chmurowe | tagi Ollamy po przecinku |
-| `--think` | `low` | rozumowanie: `low` / `medium` / `high` / `max` / `true` / `false` / `default`; model bez żądanego poziomu dostaje najbliższy obsługiwany wg `/api/show` (albo `true`, gdy ma tylko włącz/wyłącz), a model, który odrzuci `think`, dostaje zapytanie bez niego — wartość faktycznie wysyłana jest w raporcie (kolumna „think (wysyłane)”) i w logu |
+| `--think` | `low` | rozumowanie: `low` / `medium` / `high` / `max` / `true` / `false` / `default`; model bez żądanego poziomu dostaje najbliższy obsługiwany wg `/api/show` (albo `true`, gdy ma tylko włącz/wyłącz), a model, który odrzuci `think`, dostaje zapytanie bez niego — wartość faktycznie wysyłana (po teście łączności i na koniec przebiegu; odrzucone = „pominięte (serwer odrzucił think)”) jest w raporcie (kolumna „think (wysyłane)”), w `run_info.json` (`think_effective`) i w logu |
 | `--n-exam`, `--n-pes` | 300, 200 | liczba pytań LEK i maks. liczba pytań PES |
 | `--n-cases` | 40 | liczba przypadków ESI (części esi i tools) |
 | `--recipe` | — | `recipe.json` z `runs/final_report__*/` |
@@ -151,7 +164,7 @@ Katalog `runs/llm_bakeoff/<czas>/`:
 | `report.md` | raport po polsku, tabele gotowe do pracy |
 | `run_info.json`, `bakeoff.log` | warunki pomiaru: polecenie, data, wersja serwera Ollamy, `/api/show` każdego modelu (rodzina, parametry, kwantyzacja, model zdalny, digest), modele wyłączone po teście łączności |
 | `results.json` | wszystkie liczby (do własnych tabel i wykresów) |
-| `raw_responses.jsonl` | surowe odpowiedzi modeli (także z pamięci podręcznej) |
+| `raw_responses.jsonl` | surowe odpowiedzi modeli w TYM przebiegu (także z pamięci podręcznej); ponowne uruchomienie z tym samym `--out` zapisuje plik od nowa (bez duplikatów) |
 | `exam_items.csv`, `exam_responses.csv`, `exam_metrics.csv` | wylosowane pytania, odpowiedź każdego modelu, metryki model × protokół × egzamin |
 | `esi_cases.json`, `esi_items.csv`, `esi_summary.csv` | przypadki (z recepturą i SHAP), wynik każdego wyjaśnienia, metryki na model |
 | `tools_items.csv`, `tools_summary.csv`, `tools_trajectories.jsonl` | część narzędziowa i kroki agenta |
@@ -160,11 +173,13 @@ Katalog `runs/llm_bakeoff/<czas>/`:
 
 Sekcje `report.md`:
 
-1. **Wynik w skrócie** i ewentualne ostrzeżenie o błędach API (wtedy uruchom polecenie ponownie).
+1. **Wynik w skrócie** i ewentualne ostrzeżenia: o błędach API albo o modelach wyłączonych po
+   teście łączności (w obu przypadkach uruchom polecenie ponownie).
 2. **Warunki pomiaru** — data, serwer, tagi i informacje `/api/show` (do sekcji „metody”).
 3. **Polskie egzaminy lekarskie** — trafność [95% CI] (poprawne/wszystkie) dla LEK, PES i razem
    w obu protokołach; porównanie z najlepszym modelem (Δ w pp z 95% CI z bootstrapu sparowanego,
-   pary niezgodne i p z dokładnego testu McNemara; „remis” = przedział zawiera 0); luka
+   pary niezgodne i p z dokładnego testu McNemara; „istotnie gorszy” tylko, gdy przedział nie
+   zawiera 0 i p < 0,05, w przeciwnym razie „remis”); luka
    standard − abstaining (duża luka = model zgaduje wzorzec odpowiedzi); opóźnienia i tokeny.
 4. **Część ESI** i **część narzędziowa** — tabele metryk (definicje pod tabelami).
 5. **Koszty i zużycie tokenów** — pozycje, tokeny, mediana czasu na pozycję i koszt wg cennika
@@ -185,8 +200,9 @@ pracy, że modele są równoważne w granicach błędu.
    w losowej kolejności (inna w każdym przypadku); nazw modeli i ESI z triażu nie widać.
 2. Oceniający wpisuje inicjały, ocenia każde wyjaśnienie w skalach 1–5 — **zgodność kliniczna**,
    **przydatność** dla triażysty, **jasność** — i zaznacza **halucynację** (informacje sprzeczne z
-   danymi albo zmyślone). Oceny zapisują się w przeglądarce; na końcu „Pobierz CSV”
-   (`oceny_<inicjały>.csv`). Zamiast HTML można wypełnić `ratings_template.csv` w arkuszu
+   danymi albo zmyślone). Oceny zapisują się w przeglądarce (osobno dla każdego arkusza — klucz
+   zawiera skrót treści, więc oceny z pilotażu nie wypełnią się w arkuszu końcowym); na końcu
+   „Pobierz CSV” (`oceny_<inicjały>.csv`). Zamiast HTML można wypełnić `ratings_template.csv` w arkuszu
    (w polskim Excelu otwórz go przez Dane → Z tekstu/CSV; zapis ze średnikami i w kodowaniu
    Windows-1250 też jest wczytywany).
 3. Zbierz pliki i policz wyniki (klucz `key.json` z tego samego przebiegu):
