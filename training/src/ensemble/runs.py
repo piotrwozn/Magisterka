@@ -118,6 +118,7 @@ def list_runs(runs_dir: Path | str | None = None) -> pd.DataFrame:
             "eval_sample": info.get("eval_sample"),
             "done": (run_dir / DONE_JSON).exists(),
             "has_model": (run_dir / "model.joblib").exists(),
+            "refit_of": info.get("refit_of"),
         })
     return pd.DataFrame(rows)
 
@@ -153,6 +154,11 @@ def latest_runs(
     if table.empty:
         return []
     table = table[table["feature_set"] == resolve_feature_set(feature_set)]
+    # Refity z analiz (09/10/11, `refit_of`) nigdy nie są "najnowszym runem" modelu
+    refits = table["refit_of"].notna()
+    if refits.any():
+        log.info(f"latest_runs: pomijam {int(refits.sum())} refit(y) z analiz (refit_of)")
+        table = table[~refits]
     if not include_samples:
         table = table[table["train_sample"].isna() & table["eval_sample"].isna()]
     if require_done:

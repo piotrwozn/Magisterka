@@ -5,6 +5,8 @@ Wspólne elementy analiz (seedy, leave-site-out, krzywa uczenia).
                             i runów niestandardowych) — źródło parametrów do refitu,
     find_refit_run(...)     gotowy refit danej jednostki (wznawianie po awarii bez ponownego treningu),
     UnitStore               pliki jednostek units/<jednostka>.json, plan.json, results.json,
+    merge_units(...)        wyniki kumulatywne: jednostki tego wywołania + wcześniejsze z innych grup
+                            (np. inne modele) z tym samym runem źródłowym,
     Eta                     postęp i szacowany czas reszty,
     evaluate(...)           metryki na predykcjach (reguły decyzyjne, prawdopodobieństwa, podgrupa vc),
     analyses_status(...)    postęp analiz z plików (dla `run_all.py --status`; bez treningu i modeli).
@@ -37,12 +39,17 @@ log = get_logger(__name__)
 ANALYSES_SUBDIR = "analyses"
 ANALYSIS_KINDS: tuple[str, ...] = ("seeds", "site_out", "learning_curve")
 # Podbij przy zmianie metryk jednostek — jednostki zostaną przeliczone z predykcji gotowych refitów
-METRICS_VERSION = 1
+# (2: O/E = obserwowane / oczekiwane; korekta rozkładu względem rozkładu ważonego wagami klas)
+METRICS_VERSION = 2
 PROBA_COLS: list[str] = [f"p_{name.lower()}" for name in config.CLASS_NAMES]
 
 
 class NoSourceRuns(RuntimeError):
     """Brak ukończonych, dostrojonych runów profilu — najpierw trening (run_all.py)."""
+
+
+class AnalysisArgumentError(ValueError):
+    """Złe argumenty analizy (np. oddział, którego nie ma w danych) — skrypt kończy się kodem 2."""
 
 
 # ─────────────────────────────────────────
@@ -276,6 +283,11 @@ class UnitStore:
     def write_plan(self, payload: Mapping[str, Any]) -> None:
         write_json(self.root / "plan.json", {**payload, "written_at": now_iso()})
 
+    def planned_units(self) -> list[dict]:
+        """Pełne opisy jednostek z poprzedniego plan.json (bez pola 'model' — stary format, pomijane)."""
+        plan = read_json(self.root / "plan.json") or {}
+        return [dict(u) for u in plan.get("units") or [] if isinstance(u, Mapping) and u.get("unit") and u.get("model")]
+
     def write_results(self, payload: Mapping[str, Any]) -> Path:
         return write_json(self.root / "results.json", payload)
 
@@ -284,6 +296,35 @@ class UnitStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, "\n".join(lines) + "\n")
         return path
+
+
+def merge_units(
+    previous: Sequence[Mapping[str, Any]],
+    current: Sequence[Mapping[str, Any]],
+    group: Callable[[Mapping[str, Any]], Any],
+    current_sources: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """
+    Wyniki analizy są KUMULATYWNE: jednostki tego wywołania + jednostki z poprzedniego planu
+    z grup (`group(u)`, np. model albo oddział/model), których to wywołanie nie liczy — o ile ich
+    run źródłowy jest nadal najnowszym runem źródłowym modelu (`current_sources`). Grupa liczona
+    teraz zastępuje swoje stare jednostki w całości (np. inna liczba seedów); jednostki starego
+    runa źródłowego odpadają. Kolejność: modele jak w rejestrze (w modelu — kolejność jednostek).
+    """
+    from src.models import MODEL_REGISTRY
+
+    groups = {group(u) for u in current}
+    names = {str(u["unit"]) for u in current}
+    kept = [dict(u) for u in previous
+            if group(u) not in groups and str(u["unit"]) not in names
+            and current_sources.get(str(u.get("model"))) == u.get("source_run")]
+    order = {m: i for i, m in enumerate(MODEL_REGISTRY)}
+    return sorted(kept + [dict(u) for u in current], key=lambda u: order.get(str(u.get("model")), len(order)))
+
+
+def current_source_names(feature_set: str, tag: str, runs_dir: Path | str | None = None) -> dict[str, str]:
+    """{model: nazwa najnowszego runa źródłowego} dla WSZYSTKICH modeli (do łączenia planów)."""
+    return {m: r.name for m, r in source_runs(feature_set, tag, None, runs_dir).items()}
 
 
 def analysis_progress(path: Path) -> dict[str, Any] | None:
@@ -515,6 +556,7 @@ def fit_population_mask(vc: np.ndarray | None) -> np.ndarray | None:
 __all__ = [
     "ANALYSIS_KINDS",
     "METRICS_VERSION",
+    "AnalysisArgumentError",
     "Eta",
     "NoSourceRuns",
     "UnitStore",
@@ -524,6 +566,7 @@ __all__ = [
     "analysis_dir",
     "analysis_progress",
     "clean_json",
+    "current_source_names",
     "decision_module",
     "default_tag",
     "evaluate",
@@ -533,6 +576,7 @@ __all__ = [
     "format_duration",
     "load_predictions",
     "mean_sd",
+    "merge_units",
     "proba_metrics",
     "read_json",
     "require_source_runs",

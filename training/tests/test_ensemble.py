@@ -196,6 +196,18 @@ class TestRuns:
                                                       require_model=False)}
         assert loose == {"lightgbm": "20260105_000000_lightgbm_triage", "xgboost": "20260105_000100_xgboost_triage"}
 
+    def test_latest_runs_skips_refits(self, runs_dir):
+        """Refit z analiz (09/10/11) z modelem i tym samym tagiem nie wypiera runu głównego."""
+        y = _true_labels()
+        refit = write_run(runs_dir, "20260109_000000_lightgbm_triage_standard-seed1", "lightgbm",
+                          {"val": _make_proba(y, 2.0, 61)}, y, tag="standard")
+        info = json.loads((refit / "run_info.json").read_text(encoding="utf-8"))
+        info["refit_of"] = "20260102_000000_lightgbm_triage"
+        (refit / "run_info.json").write_text(json.dumps(info), encoding="utf-8")
+        latest = {r.model: r.name for r in latest_runs("triage", runs_dir=runs_dir, tag="standard")}
+        assert latest["lightgbm"] == "20260102_000000_lightgbm_triage"
+        assert list_runs(runs_dir).set_index("run").loc[refit.name, "refit_of"] == info["refit_of"]
+
     def test_latest_runs_tag_filter(self, runs_dir):
         y = _true_labels()
         p = {"val": _make_proba(y, 2.0, 60)}

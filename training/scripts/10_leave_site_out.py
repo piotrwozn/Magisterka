@@ -14,9 +14,11 @@ Użycie (z katalogu training/):
 
 Refity: runs/<czas>_<model>_<cechy>_<tag>-siteout<S>/ (DONE.json `custom: true`, `refit_of`).
 Wynik: runs/analyses/site_out__<cechy>__<tag>/results.json + summary.md. Wznawialne (--force: od nowa).
+Wyniki są kumulatywne: wywołanie z innymi oddziałami / modelami dopisuje je do policzonych wcześniej.
 Czas: ≈ liczba oddziałów × czas treningu finalnego każdego modelu.
 
-Kody wyjścia: 0 = OK, 1 = któraś jednostka nieudana, 2 = brak runów źródłowych / złe argumenty,
+Kody wyjścia: 0 = OK, 1 = któraś jednostka nieudana, 2 = brak runów źródłowych / złe argumenty
+(także oddział, którego nie ma w danych),
 130 = Ctrl+C.
 """
 
@@ -43,7 +45,7 @@ def run(argv: list[str] | None = None) -> int:
 
     disable_power_throttling()
     try:
-        from src.analysis.common import NoSourceRuns
+        from src.analysis.common import AnalysisArgumentError, NoSourceRuns
         from src.analysis.site_out import parse_sites, run_leave_site_out
         from src.utils.logger import get_logger
 
@@ -56,7 +58,7 @@ def run(argv: list[str] | None = None) -> int:
         try:
             results = run_leave_site_out(feature_set=args.feature_set, tag=args.tag,
                                          models=parse_model_list(args.models), sites=sites, force=args.force)
-        except NoSourceRuns as exc:
+        except (NoSourceRuns, AnalysisArgumentError) as exc:
             log.error(str(exc))
             return 2
     except KeyboardInterrupt:

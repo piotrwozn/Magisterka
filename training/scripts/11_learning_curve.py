@@ -11,6 +11,7 @@ Użycie (z katalogu training/):
 runs/<czas>_<model>_<cechy>_<tag>-lc<ułamek>/ (DONE.json `custom: true`, `refit_of`; predykcje tylko
 na val). Wynik: runs/analyses/learning_curve__<cechy>__<tag>/results.json, summary.md,
 learning_curve.png. Wznawialne (--force: od nowa). Czas ≈ suma ułamków × czas treningu finalnego.
+Wyniki są kumulatywne: wywołanie dla innych modeli dopisuje je do policzonych wcześniej.
 
 Kody wyjścia: 0 = OK, 1 = któraś jednostka nieudana, 2 = brak runów źródłowych / złe argumenty,
 130 = Ctrl+C.

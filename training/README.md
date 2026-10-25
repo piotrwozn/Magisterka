@@ -20,6 +20,8 @@ cd C:\dev\Magisterka\training            # w aktywnym venv (instalacja: niżej)
 python scripts/00_check_env.py           # 1. kontrola środowiska: GPU, RAM, dysk, wersje, dane
 python scripts/run_all.py --profile smoke   # 2. test całego pipeline'u: 5–10 min
 python scripts/run_all.py                # 3. właściwy przebieg na noc (profil standard)
+python scripts/run_all.py --stage analyses  # 4. po treningu: analizy do pracy (seedy, oddziały, krzywa uczenia)
+python scripts/08_final_report.py --tag standard   # 5. raz, na końcu: raport końcowy na TEST (punkt 15)
 ```
 
 Po awarii, restarcie albo Ctrl+C uruchom **to samo polecenie** — gotowe modele zostaną pominięte,
@@ -205,6 +207,7 @@ Zbiory `val` i `test` nie biorą udziału w tuningu ani w treningu.
 | `--lanes auto\|1\|2` | tory równoległe |
 | `--force` | trenuj ponownie także gotowe modele (ukończone próby Optuny i tak zostaną użyte); po przerwaniu polecenie wznowienia zachowuje `--force` tylko dla niedokończonych modeli |
 | `--fail-fast` | pierwszy nieudany model zatrzymuje kolejne (domyślnie pozostałe trenują dalej) |
+| `--stage train\|analyses\|all` | `train` (domyślnie) — tuning i trening; `analyses` — analizy do pracy na gotowych runach (punkt 15); `all` — jedno i drugie |
 | `--dry-run` | pokaż plan, ETA i polecenia, nic nie uruchamiaj |
 | `--status` | stan z plików-znaczników, nic nie uruchamiaj |
 | `--skip-preflight`, `--no-keep-awake` | pomiń kontrolę środowiska / blokadę uśpienia |
@@ -284,6 +287,11 @@ Podsumowanie i porównanie pokazują **tylko metryki VAL**. Zbiór testowy oceni
 - `overtriage_rate` — ESI 4–5 → ESI 1–2;
 - `mistriage_under` / `mistriage_over` — błąd o dowolny poziom;
 - `auc_macro`, `log_loss`, `brier` — jakość prawdopodobieństw; `expected_cost` — średni koszt decyzji.
+
+Raport końcowy (punkt 14) dodaje reguły dopasowywane na VAL z celem niedotriażowania T
+(`src/evaluation/decision.py`): **`target`** (progi oczekiwanego poziomu ESI + siatka
+bezpieczeństwa) i **`bayes_target`** (decyzja Bayesa z karą λ za ESI 1–2 → 3–5). Przy tym samym
+niedotriażowaniu mają wyraźnie wyższe QWK niż reguła kosztowa (ULEPSZENIA.md, B1–B4).
 
 Klucze w `metrics.json`: `{split}_{reguła}_{metryka}`, a dla podgrupy vc `{split}_vc_{reguła}_{metryka}`.
 
@@ -421,10 +429,14 @@ python scripts/03_train.py --model xgboost --tune --profile quick    # jeden mod
 python scripts/03_train.py --model all                               # 6 modeli bez tuningu (tag `standard-notune`)
 python scripts/04_evaluate.py --run <run>                            # wykresy, metryki, ECE i 95% CI na val
 python scripts/05_explain.py --model-name xgboost --n-patients 5     # SHAP + kontrola reguł ESI
+python scripts/05_explain.py --run <run> --global                    # SHAP globalny, zależności, kształty EBM
 python scripts/06_cross_validate.py --model lightgbm                 # k-fold CV na TRAIN
 python scripts/07_compare_runs.py --tag standard                     # porównanie na val
 python scripts/07_compare_runs.py --tag standard --bootstrap 1000     # + 95% przedziały ufności (val)
 python scripts/08_final_report.py --tag standard --weights wagi.json  # raport końcowy na TEST (punkt 14)
+python scripts/09_seed_refits.py --tag standard                      # refity z innymi seedami (punkt 15)
+python scripts/10_leave_site_out.py --tag standard                   # walidacja z wyłączeniem oddziału
+python scripts/11_learning_curve.py --tag standard                   # krzywa uczenia
 streamlit run app/streamlit_app.py                                   # demo (requirements-app.txt)
 ```
 
@@ -486,18 +498,29 @@ bo PowerShell potrafi zgubić cudzysłowy w JSON-ie. Skrót na Linuksie: `make f
 
 | sekcja `report.md` | zawartość |
 |---|---|
-| Receptura | runy, wagi, temperatura (połączenia i każdego modelu), reguły, najlepszy pojedynczy model (najniższy log loss na VAL), wynik na VAL dla porównania |
+| Receptura | runy, wagi, temperatura (połączenia i każdego modelu), najlepszy pojedynczy model (najniższy log loss na VAL); **reguły decyzyjne** dopasowane na VAL (progi, q siatki, λ) i ich wynik na VAL (reguły dopasowywane — cross-fitting) |
+| Punkt pracy (VAL) | kompromis niedotriażowanie – QWK: koszt k = 1…10, progi T, progi T + siatka, Bayes T dla T = 10/15/20%; wykres `tradeoff_val.png` z wybranym punktem |
 | Jak czytać | krótka instrukcja do tabel (poniżej to samo szerzej) |
-| 1. Wynik końcowy | połączenie: 15 metryk z 95% CI, cała populacja i podgrupa vc, obie reguły |
-| 2. Połączenie i modele | każdy model (z własną temperaturą z VAL) obok połączenia, z CI; wykresy leśne `forest_test_*.png` |
-| 3. Różnice sparowane | Δ = połączenie − najlepszy pojedynczy model dla QWK, niedotriażowania i log loss: przedział i p |
+| 1. Wynik końcowy | połączenie: metryki z 95% CI dla wszystkich reguł (argmax, koszt, progi T, Bayes T), cała populacja i podgrupa vc |
+| 2. Połączenie i modele | każdy model (z własną temperaturą i własnymi regułami z VAL) obok połączenia, reguła główna i argmax; wykresy leśne `forest_test_*.png` |
+| 3. Różnice sparowane | Δ = połączenie − najlepszy pojedynczy model dla QWK, niedotriażowania i log loss: przedział, p i **wyższość wg reguły C1** (CI bez 0, Δ większa od minimalnej istotnej różnicy i od 2 × SD seedów) |
 | 4. Kalibracja | ECE, MCE, log loss, Brier przed i po temperaturze; ECE idealnie skalibrowanego modelu (szum); wykres `reliability_test_blend.png` |
-| 5. Macierze pomyłek | liczby i % wiersza dla każdej reguły (+ wykresy, także dla podgrupy vc) |
+| 5. Macierze pomyłek | liczby i % wiersza dla reguły głównej i argmax (+ wykresy, także dla podgrupy vc) |
 | 6. Oddziały | połączenie na każdym oddziale z CI |
-| 7. Przyjęcia | AUC pilności względem przyjęcia do szpitala (model vs ESI z triażu) i odsetek przyjęć wg poziomu; gdy kolumny `admitted` nie ma ani w predykcjach, ani w przygotowanym splicie — sekcja pominięta |
+| 7. Przyjęcia | AUC pilności względem przyjęcia do szpitala (model vs ESI z triażu), odsetek przyjęć wg poziomu, AUC w podgrupach (7.1) i niezgodność model–pielęgniarka a przyjęcia (7.2); bez kolumny `admitted` (ani w predykcjach, ani w splicie) — pominięte |
+| 8. Podgrupy i równość | płeć, wiek 18–39/40–64/65–79/80+, sposób przybycia, oddział, vc: QWK, niedotriażowanie, Δ względem grupy odniesienia (Newcombe), przetriażowanie, krytyczne pominięcie; undertriage „zakotwiczone w przyjęciu” — model vs pielęgniarka. Atrybuty z przygotowanego splitu (join po `row_id`; inny odcisk danych = sekcja bez atrybutów) |
+| 9. Analiza błędów | niedotriażowanie wg pary ESI i grupy dolegliwości (`cc_group_*`), przyjęcia niedotriażowanych ESI 2 (szum etykiet) |
+| 10. Krzywe decyzyjne | net benefit: wykrywanie ESI 1–2 i przyjęcie do szpitala (model vs reguła pielęgniarki „ESI ≤ 2”, Δ z CI) |
+| 11. Kalibracja per poziom i oddział | O/E każdego poziomu ESI, kalibracja „in the large” i nachylenie dla P(ESI 1–2) |
+| 12. Odsyłanie i conformal | odsyłanie 10/20/30% najbardziej niepewnych do pielęgniarki; zbiory conformal 90% (LAC i warunkowe po ESI) |
+| 13. Analizy dodatkowe | podsumowanie `runs/analyses/` (seedy, leave-site-out, krzywa uczenia) albo nota, jak je uruchomić |
 
 Poza tym: `metrics.json` (wszystkie liczby, także porównania połączenia z każdym modelem),
-`recipe.json` (receptura do odtworzenia, commit gita, argumenty) i `backend_ensemble_weights.json`.
+`recipe.json` (receptura do odtworzenia, commit gita, argumenty, dopasowane reguły) i
+`backend_ensemble_weights.json` (wagi, metoda, temperatura i reguła główna z parametrami, np.
+`"rule": "target", "cutpoints": […], "safety_q": 0.13` — format `backend/app/models/ensemble.py`).
+Sekcja bez danych (brak `admitted`, atrybutów pacjentów, wyników analiz, za mała podgrupa) jest
+pomijana z notą w `report.md`, a nie przerywa raportu.
 
 ### Co znaczą liczby
 
@@ -548,7 +571,12 @@ Poza tym: `metrics.json` (wszystkie liczby, także porównania połączenia z ka
 | `--weights JSON\|plik.json\|optimize\|equal` | wagi połączenia (domyślnie `optimize` = minimalny log loss na VAL; `equal` = równe wagi — w testach wyraźnie gorsze); model spoza wag ma wagę 0, ale w tabelach jest oceniany osobno; z pliku w formacie backendu przejmowane są też `method`, `rule` i (nie)obecność temperatury |
 | `--method mean\|geometric` | średnia arytmetyczna albo geometryczna prawdopodobieństw (domyślnie z pliku wag, inaczej `mean`) |
 | `--temperature fit\|none` | temperatura połączenia dopasowana na VAL (domyślnie z pliku wag, inaczej `fit`) |
-| `--rule argmax\|cost\|both` | reguły w raporcie (domyślnie obie); `--backend-rule` — reguła w pliku dla backendu (domyślnie `cost` przy `both`) |
+| `--main-rule target\|bayes_target\|cost\|argmax` | reguła główna: tabele szczegółowe, podgrupy, błędy i plik dla backendu (domyślnie `target`; z pliku wag — jego `rule`); dawna nazwa `--backend-rule` |
+| `--target-undertriage T` | cel niedotriażowania ESI 1–2 → 3–5 reguł `target` i `bayes_target` na VAL (domyślnie 0,15) |
+| `--guarantee` | próg tak, by górna granica Clopper–Pearsona niedotriażowania na VAL była ≤ T (ostrożniej o ~1 pp) |
+| `--safety-net` / `--no-safety-net` | siatka bezpieczeństwa: P(ESI 1)+P(ESI 2) ≥ q → najwyżej ESI 3 (domyślnie włączona; q dobrane na VAL) |
+| `--fit-population vc\|all` | wiersze VAL do dopasowania progów: vc (komplet HR/SBP/RR, jak TOPSOR; domyślnie) albo cały VAL |
+| `--rule all\|both\|<reguła>` | reguły w tabelach (domyślnie `all` = wszystkie cztery; `both` = argmax + koszt jak dawniej; jedna reguła = tylko ta i ona trafia do backendu) |
 | `--bootstrap N` | liczba losowań (domyślnie 2000); `--alpha 0.05`, `--seed 42` |
 | `--decimal-comma` | przecinek dziesiętny w `report.md` (typografia polska) |
 | `--out DIR`, `--no-plots`, `--n-bins 15` | katalog raportu, bez wykresów, biny ECE |
@@ -557,8 +585,10 @@ Poza tym: `metrics.json` (wszystkie liczby, także porównania połączenia z ka
 przygotowań danych, gdy ten sam model występuje dwa razy, gdy predykcje val/test mają różne wiersze
 lub etykiety (np. inne `--eval-sample`), gdy w predykcjach są prawdopodobieństwa NaN / nieskończone /
 ujemne albo wiersz o zerowej sumie (komunikat podaje run i liczbę złych wierszy), gdy wagi są błędne
-(model spoza runów, waga ujemna, same zera) albo gdy jawna opcja (`--method`, `--temperature`,
-`--rule`, `--backend-rule`) jest sprzeczna z plikiem wag w formacie backendu.
+(model spoza runów, waga ujemna, same zera), gdy reguła w pliku wag jest niepoprawna (np. `target`
+bez `cutpoints`), gdy reguły nie da się dopasować na VAL, albo gdy jawna opcja (`--method`,
+`--temperature`, `--main-rule`, `--rule`, `--backend-rule`) jest sprzeczna z plikiem wag w formacie
+backendu lub z inną opcją (reguła główna musi być wśród ocenianych reguł).
 
 **Czas** (1 rdzeń CPU): bootstrap 1000 losowań × 56 tys. wierszy × wszystkie metryki, obie reguły
 to ~7 s na model i populację. Raport z 6 modelami i `--bootstrap 2000` trwa kilka minut.
@@ -569,3 +599,78 @@ to ~7 s na model i populację. Raport z 6 modelami i `--bootstrap 2000` trwa kil
 Funkcje są też dostępne bezpośrednio: `src.evaluation.statistics` (`bootstrap_ci`,
 `paired_bootstrap_diff`, `ece_top_label`, `ece_classwise`, `reliability_table`,
 `calibration_summary`, `ece_consistency`, `calibrate_on_val`, `crossfit_temperature`).
+
+## 15. Po treningu: analizy do pracy
+
+Kolejność po nocnym przebiegu (wszystko wznawialne; test oceniasz dopiero w kroku 3):
+
+```powershell
+python scripts/run_all.py --stage analyses                       # 1. analizy na gotowych runach (refity, bez tuningu)
+python scripts/07_compare_runs.py --tag standard --bootstrap 1000 # 2. wybór modeli / wag na VAL (opcjonalnie)
+python scripts/08_final_report.py --feature-set triage --tag standard   # 3. RAZ: raport końcowy na TEST
+python scripts/05_explain.py --model-name ebm --global             # 4. wyjaśnienia globalne do rozdziału
+```
+
+**1. Analizy** (`--stage analyses`; `--stage all` = trening, a potem analizy). Uruchamia po kolei
+trzy skrypty z tymi samymi zabezpieczeniami co trening (osobne procesy, logi, blokada uśpienia,
+wznawianie):
+
+| skrypt | co liczy (ULEPSZENIA.md) | wynik |
+|---|---|---|
+| `09_seed_refits.py` | każdy model z najlepszymi parametrami jeszcze 3 razy z innym seedem (C1) — ile wynik zależy od losowości treningu | `runs/analyses/seeds__<zestaw>__<tag>/results.json` (średnia ± SD) |
+| `10_leave_site_out.py` | trening bez oddziału A (potem B), ocena na jego wierszach TRAIN + VAL; korekta rozkładu klas: znana i EM (C3) | `runs/analyses/site_out__…/results.json` |
+| `11_learning_curve.py` | lightgbm i xgboost na 5–100% danych dopasowania, dopasowanie potęgowe (C9) | `runs/analyses/learning_curve__…/results.json` + wykres |
+
+Każdy skrypt pomija gotowe jednostki, więc po przerwaniu uruchom to samo polecenie. Wyniki
+(`results.json`, `summary.md`, `--status`) są kumulatywne: wywołanie tylko dla części modeli lub
+oddziałów (np. `10_leave_site_out.py --sites C --models logreg`) dopisuje je do policzonych wcześniej;
+model liczony ponownie zastępuje swoje stare wyniki, a wyniki z nieaktualnego runa źródłowego
+odpadają. Raport (krok 3) pomija analizy z innych danych albo innych runów niż jego własne (z notą
+„nieaktualne”). Czas to
+mniej więcej 3× (seedy) + 2× (oddziały) + 1,9× (krzywa) czasu treningu finalnego modeli
+(`run_all.py --stage analyses --dry-run` pokazuje ETA). Postęp: `run_all.py --status`.
+Linux: `make analyses`.
+
+**2–3. Raport końcowy z domyślnymi ustawieniami** (`make final-report`): wagi `optimize` (minimum
+log loss na VAL), temperatura na VAL, reguła główna `target` (progi oczekiwanego poziomu ESI
+z celem niedotriażowania 15% w podgrupie vc + siatka bezpieczeństwa), oceniane też argmax,
+koszt i Bayes T. Raport sam wczytuje wyniki analiz z kroku 1 (sekcja 13 i kolumna „wyższość
+(C1)” w sekcji 3). Bez nich pisze, jak je uruchomić.
+
+**Jak czytać** (pełny opis sekcji: punkt 14):
+
+- **Metryka główna to QWK przy zadanym niedotriażowaniu.** Najpierw spójrz na „Punkt pracy” na
+  VAL: na krzywej niedotriażowanie – QWK progi T powinny leżeć wyraźnie nad regułą kosztową. Potem
+  sekcja 1 na TEST: czy niedotriażowanie w podgrupie vc jest blisko T (±1–2 pp)?
+- **Porównania modeli:** wyższość ogłaszaj tylko z „TAK — <zwycięzca>” w kolumnie C1 (sekcja 3);
+  zwycięzcą może być pojedynczy model, nie połączenie (kierunek: wyższe QWK / AUC, niższe
+  niedotriażowanie / log loss). Różnica istotna statystycznie, ale mniejsza niż szum seedów, to nie
+  jest wynik.
+- **Równość (sekcja 8):** różnice między podgrupami czytaj razem z kolumną przyjęć. Duża Δ
+  niedotriażowania przy podobnym odsetku przyjętych w ESI 3–5 to raczej inny profil pacjentów
+  niż gorszy model.
+- **Model a pielęgniarka (sekcje 7, 10.2):** jedyna miara niezależna od etykiety ESI. Przewaga
+  ciągłego −E[ESI] w AUC przyjęcia nie oznacza przewagi twardej decyzji 5-poziomowej.
+- **Leave-site-out (sekcja 13.2):** jeśli AUC przyjęcia się utrzymuje, a niedotriażowanie surowego
+  modelu rośnie, to problemem jest rozkład klas. Wtedy w Polsce trzeba na nowo dobrać progi
+  i rozkład.
+- Wiersze z ⚠ (EM niestabilne) i ekstrapolacje krzywej uczenia oznaczone jako niewiarygodne
+  pomijaj w pracy (powód jest w nawiasie: np. krzywa gorsza od ostatniego punktu albo cel ponad
+  10× dalej niż największa próbka).
+- **O/E** (sekcje 11 i 13.2) = obserwowane / oczekiwane: > 1 oznacza, że model zaniża częstość
+  poziomu ESI.
+
+**4. Wyjaśnienia globalne** (C11): `05_explain.py --run <run> --global` zapisuje do
+`runs/<run>/figures/global/`:
+
+- SHAP summary dla wszystkich poziomów;
+- beeswarm ESI 1 i ESI 2;
+- wykresy zależności SHAP dla top-k cech (`--top-k 6`) i parametrów życiowych;
+- `shap_mean_abs.csv`;
+- dla EBM — krzywe kształtu termów parametrów życiowych z pasmem ±1 SD między workami i linią
+  wygładzoną. Surowe krzywe EBM są postrzępione, a liczba zmian kierunku jest w
+  `global_summary.json`; w pracy opisuj linię wygładzoną.
+
+Do pracy dołącz też `docs/TRIPOD_AI.md` (lista kontrolna: pozycja → status → miejsce w repo lub
+raporcie) i `docs/LITERATURA.md` (porównanie z literaturą; liczby oznaczone „do weryfikacji”
+sprawdź w oryginałach).

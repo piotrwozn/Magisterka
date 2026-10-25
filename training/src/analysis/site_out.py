@@ -16,8 +16,9 @@ Dla każdego wyłączonego oddziału S (domyślnie A i B; C ma tylko ~20 wizyt E
       (`in_distribution`) i model przeniesiony na tych samych wierszach (`transported_same_rows`).
 
 Metryki: QWK, niedotriażowanie, krytyczne pominięcia, czułość ESI 1 (reguły argmax, koszt,
-target_transfer), log loss, makro-AUC, AUC przyjęcia (−E[ESI]), O/E ESI 1 i ESI 1–2 — pełny zbiór
-i podgrupa `vc_`.
+target_transfer), log loss, makro-AUC, AUC przyjęcia (−E[ESI]), O/E ESI 1 i ESI 1–2 (obserwowane /
+oczekiwane; > 1 = model zaniża) — pełny zbiór i podgrupa `vc_`. Rozkład treningowy do korekty =
+liczności TRAIN × wagi klas modelu (`effective_train_prior`; bez wag = rozkład etykiet).
 
 Wynik: runs/analyses/site_out__<cechy>__<tag>/results.json
     {"sites": {S: {model: {"raw": {...}, "prior_known": {...}, "prior_em": {...}, "n", "n_esi1", …}}}}
@@ -37,9 +38,11 @@ import numpy as np
 
 from src.analysis.common import (
     METRICS_VERSION,
+    AnalysisArgumentError,
     UnitStore,
     admitted_for,
     analysis_dir,
+    current_source_names,
     decision_module,
     default_tag,
     evaluate,
@@ -47,6 +50,7 @@ from src.analysis.common import (
     find_refit_run,
     fit_population_mask,
     load_predictions,
+    merge_units,
     now_iso,
     read_json,
     require_source_runs,
@@ -78,6 +82,25 @@ def parse_sites(spec: str | Sequence[str]) -> list[str]:
     if not values:
         raise ValueError("Podaj co najmniej jeden oddział (np. A,B)")
     return list(dict.fromkeys(values))
+
+
+def available_sites() -> set[str]:
+    """Oddziały w TRAIN i VAL (czyta tylko kolumnę site — szybka kontrola argumentów)."""
+    from src.data.dataset import load_split
+
+    found: set[str] = set()
+    for split in ("train", "val"):
+        found |= set(load_split(split, columns=["site"])["site"].astype(str))
+    return found
+
+
+def check_sites(sites: Sequence[str]) -> None:
+    """AnalysisArgumentError, gdy któregoś oddziału nie ma w danych (przed zapisem planu i treningiem)."""
+    known = available_sites()
+    unknown = [s for s in sites if s not in known]
+    if unknown:
+        raise AnalysisArgumentError(f"Oddziałów {', '.join(unknown)} nie ma w danych "
+                                    f"(dostępne: {', '.join(sorted(known))})")
 
 
 # ─────────────────────────────────────────
@@ -124,9 +147,39 @@ class _Frames:
 # Metryki jednostki
 # ─────────────────────────────────────────
 def _oe(y: np.ndarray, proba: np.ndarray, classes: Sequence[int]) -> float:
-    """Oczekiwane / obserwowane: Σ P(klasy) / liczba wizyt tych klas (O/E < 1 = model zaniża)."""
+    """
+    O/E = obserwowane / oczekiwane: liczba wizyt tych klas / Σ P(klasy) — ta sama definicja co
+    w sekcji 11 raportu (report_sections.calibration_groups): > 1 = model ZANIŻA częstość, < 1 = zawyża.
+    """
     observed = int(np.isin(y, classes).sum())
-    return float(proba[:, list(classes)].sum() / observed) if observed else float("nan")
+    expected = float(proba[:, list(classes)].sum())
+    return observed / expected if expected > 0 else float("nan")
+
+
+def effective_train_prior(counts: Sequence[float], info: Mapping[str, Any]) -> tuple[np.ndarray, str | None]:
+    """
+    Rozkład klas, który „widział” model: liczności TRAIN × wagi klas użyte w treningu, znormalizowane.
+    Bez wag (weights_strategy 'none') = rozkład etykiet. Wagi Optuny (`optuna_qwk`) — z run_info
+    `class_weights`; strategie 'balanced' / 'sqrt_balanced' / 'custom' — przeliczone z liczności
+    (refit liczy je na własnych etykietach). Bez tego korekta Saerensa P·π_nowe/π_trening dzieli przez
+    zły rozkład i nie koryguje modelu ważonego. Zwraca (rozkład, opis wag | None).
+    """
+    from src.models.base import compute_class_weights_dict
+
+    counts_arr = np.asarray(counts, dtype=np.float64)
+    strategy = info.get("weights_strategy") or "none"
+    if strategy == "none":
+        return normalize_prior(counts_arr), None
+    k = len(counts_arr)
+    if strategy == "optuna_qwk":
+        cw = info.get("class_weights") or {}
+        weights = np.array([float(cw.get(str(c), cw.get(c, 1.0))) for c in range(k)])
+    else:
+        sample_strategy = info.get("sample_weight_strategy") or strategy
+        y = np.repeat(np.arange(k), np.maximum(counts_arr, 0).astype(np.int64))
+        cw = compute_class_weights_dict(y, strategy=sample_strategy)
+        weights = np.array([float(cw.get(c, 1.0)) for c in range(k)])
+    return normalize_prior(counts_arr * weights), str(strategy)
 
 
 def _halves(y: np.ndarray, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -151,7 +204,11 @@ def unit_metrics(run_dir: Path | str, source_dir: Path | str, site: str) -> dict
     counts = info.get("class_counts_train")
     if not counts:
         raise ValueError(f"{run_dir.name}: brak class_counts_train w run_info.json (refit sprzed analiz?)")
-    train_prior = normalize_prior(counts)
+    label_prior = normalize_prior(counts)
+    train_prior, weighted = effective_train_prior(counts, info)
+    if weighted:
+        log.info(f"{run_dir.name}: model z wagami klas ({weighted}) — korekta rozkładu względem ważonego "
+                 f"rozkładu treningowego")
 
     y, proba, frame = load_predictions(run_dir, HELDOUT)
     vc = vc_mask(frame)
@@ -240,8 +297,8 @@ def unit_metrics(run_dir: Path | str, source_dir: Path | str, site: str) -> dict
         "n_dev_val": int(info.get(f"n_{DEV_VAL}") or 0),
         "n_fit": info.get("n_fit"),
         "nurse_admission_auc": nurse_auc,
-        "priors": {"train": train_prior.tolist(), "site": site_prior.tolist(), "em": prior_em.tolist(),
-                   "em_info": em_info},
+        "priors": {"train": train_prior.tolist(), "train_labels": label_prior.tolist(), "train_weights": weighted,
+                   "site": site_prior.tolist(), "em": prior_em.tolist(), "em_info": em_info},
         "target_rule_dev": None if rule_dev is None else rule_dev.to_dict(),
     }
 
@@ -267,7 +324,8 @@ def summary_lines(results: Mapping[str, Any]) -> list[str]:
                 m = entry.get(variant)
                 if not m:
                     continue
-                cells = ["—" if m.get(k) is None else f"{m[k]:.4f}" for k in SUMMARY_METRICS]
+                cells = ["—" if m.get(k) is None else (f"{m[k]:.4f}" if abs(m[k]) < 1e4 else f"{m[k]:.3g}")
+                         for k in SUMMARY_METRICS]
                 label = variant + (" ⚠ EM niestabilne" if m.get("em_suspect") else "")
                 lines.append(f"| {model} | {label} | {m.get('n', entry.get('n'))} | " + " | ".join(cells) + " |")
         lines.append("")
@@ -286,14 +344,22 @@ def run_leave_site_out(
     from src.models.train import REFIT_VERSION, refit_from_run
 
     tag = tag or default_tag()
-    sites = parse_sites(sites)
+    try:
+        sites = parse_sites(sites)
+    except ValueError as exc:
+        raise AnalysisArgumentError(str(exc)) from exc
     runs = require_source_runs(feature_set, tag, models)
+    check_sites(sites)
     store = UnitStore(analysis_dir("site_out", feature_set, tag))
     fingerprint = data_fingerprint()
     units = [{"unit": f"{site}/{model}", "site": site, "model": model, "source_run": run.name,
               "seed": source_seed(run.info)} for site in sites for model, run in runs.items()]
+    # Wyniki kumulatywne: pary (oddział, model) policzone wcześniej z tym samym runem źródłowym zostają
+    all_units = merge_units(store.planned_units(), units, lambda u: u["unit"],
+                            current_source_names(feature_set, tag))
+    all_units.sort(key=lambda u: str(u["site"]))                 # stabilnie: w oddziale kolejność modeli
     store.write_plan({"analysis": "site_out", "feature_set": feature_set, "tag": tag, "sites": sites,
-                      "units": [{"unit": u["unit"], "source_run": u["source_run"]} for u in units]})
+                      "units": all_units})
     frames = _Frames(feature_set)
     frame_cache: dict[tuple[str, Any], dict[str, Any]] = {}
 
@@ -331,7 +397,7 @@ def run_leave_site_out(
 
     sites_out: dict[str, dict[str, Any]] = {}
     n_done = 0
-    for u in units:
+    for u in all_units:
         payload = store.valid(str(u["unit"]), expect(u))
         if payload is None:
             continue
@@ -344,22 +410,24 @@ def run_leave_site_out(
         "tag": tag,
         "created": now_iso(),
         "data_fingerprint": fingerprint,
-        "sites_requested": sites,
-        "source_runs": {m: r.name for m, r in runs.items()},
+        "metrics_version": METRICS_VERSION,
+        "sites_requested": sorted({str(u["site"]) for u in all_units}),
+        "source_runs": {u["model"]: u["source_run"] for u in all_units},
         "variants": list(VARIANTS),
         "target_rule_note": (f"B1 + B2 (T = {config.DECISION_TARGET_UNDERTRIAGE}, populacja "
                              f"'{config.DECISION_FIT_POPULATION}')" if decision_module() is not None
                              else "niedostępna (brak src.evaluation.decision)"),
-        "n_units": len(units),
+        "n_units": len(all_units),
         "n_done": n_done,
-        "complete": not failures and n_done == len(units),
+        "complete": not failures and n_done == len(all_units),
         "failures": failures,
         "sites": sites_out,
     }
     path = store.write_results(results)
     store.write_summary(summary_lines(results))
-    log.info(f"Leave-site-out: {n_done}/{len(units)} jednostek → {path}")
+    log.info(f"Leave-site-out: {n_done}/{len(all_units)} jednostek (kumulatywnie) → {path}")
     return results
 
 
-__all__ = ["DEFAULT_MODELS", "DEFAULT_SITES", "VARIANTS", "parse_sites", "run_leave_site_out", "unit_metrics"]
+__all__ = ["DEFAULT_MODELS", "DEFAULT_SITES", "VARIANTS", "available_sites", "check_sites", "effective_train_prior",
+           "parse_sites", "run_leave_site_out", "unit_metrics"]

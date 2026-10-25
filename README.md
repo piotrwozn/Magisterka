@@ -60,6 +60,7 @@ pip install -r requirements-lock.txt     # Python 3.12/3.13 x64; sterownik NVIDI
 python scripts/00_check_env.py           # kontrola środowiska
 python scripts/run_all.py --profile smoke   # 5–10 min: test całego pipeline'u
 python scripts/run_all.py                # tuning + trening 6 modeli, ewaluacja, porównanie (noc, wznawialne)
+python scripts/run_all.py --stage analyses  # potem: analizy do pracy, na końcu scripts/08_final_report.py (training/README.md §15)
 ```
 
 Na noc pod Windows: tryb zasilania „Najlepsza wydajność” i otwarte (niezminimalizowane) okno konsoli.

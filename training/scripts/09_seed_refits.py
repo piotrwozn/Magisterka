@@ -12,6 +12,8 @@ Użycie (z katalogu training/):
 próbki danych). Refity: runs/<czas>_<model>_<cechy>_<tag>-seed<k>/ (DONE.json `custom: true`,
 `refit_of`; bez pliku modelu, chyba że --save-models). Wynik: runs/analyses/seeds__<cechy>__<tag>/
 results.json + summary.md. Wznawialne: gotowe jednostki (model × seed) są pomijane (--force: od nowa).
+Wyniki są kumulatywne: wywołanie dla innych modeli dopisuje je do policzonych wcześniej (model liczony
+ponownie zastępuje swoje stare wyniki).
 Czas: ≈ (liczba seedów) × czas treningu finalnego każdego modelu (GBM minuty, EBM ~1 h na pełnych danych).
 
 Kody wyjścia: 0 = OK, 1 = któraś jednostka nieudana, 2 = brak runów źródłowych, 130 = Ctrl+C.

@@ -35,6 +35,7 @@ from src.analysis.common import (
     UnitStore,
     admitted_for,
     analysis_dir,
+    current_source_names,
     decision_module,
     default_tag,
     evaluate,
@@ -43,6 +44,7 @@ from src.analysis.common import (
     fit_population_mask,
     load_predictions,
     mean_sd,
+    merge_units,
     now_iso,
     require_source_runs,
     source_seed,
@@ -208,9 +210,11 @@ def run_seed_refits(
     seeds = list(range(1, int(n_seeds) + 1))
     units = plan_units(runs, seeds, include_source, vary_es_split)
     fingerprint = data_fingerprint()
+    # Wyniki kumulatywne: modele policzone wcześniej (ten sam run źródłowy) zostają w results.json
+    all_units = merge_units(store.planned_units(), units, lambda u: u["model"],
+                            current_source_names(feature_set, tag))
     store.write_plan({"analysis": "seeds", "feature_set": feature_set, "tag": tag, "seeds": seeds,
-                      "include_source": include_source, "vary_es_split": vary_es_split,
-                      "units": [{"unit": u["unit"], "source_run": u["source_run"]} for u in units]})
+                      "include_source": include_source, "vary_es_split": vary_es_split, "units": all_units})
 
     def expect(u: Mapping[str, Any]) -> dict[str, Any]:
         return {"source_run": u["source_run"], "data_fingerprint": fingerprint, "metrics_version": METRICS_VERSION,
@@ -237,7 +241,7 @@ def run_seed_refits(
         return 2.0 if u["source"] else float(runs[u["model"]].info.get("training_duration_s") or 0.0) * 1.2 + 5.0
 
     failures = execute_units(store, units, expect, compute, "seeds", force=force, estimate_s=estimate)
-    models_out = summarize(store, units, expect)
+    models_out = summarize(store, all_units, expect)
     n_done = sum(len(m["runs"]) for m in models_out.values())
     results = {
         "analysis": "seeds",
@@ -245,25 +249,27 @@ def run_seed_refits(
         "tag": tag,
         "created": now_iso(),
         "data_fingerprint": fingerprint,
-        "seeds": seeds,
-        "includes_source": include_source,
+        "metrics_version": METRICS_VERSION,
+        "seeds": sorted({int(u["seed"]) for u in all_units if not u.get("source")}),
+        "includes_source": any(u.get("source") for u in all_units),
         "vary_es_split": vary_es_split,
-        "source_runs": {m: r.name for m, r in runs.items()},
+        "source_runs": {u["model"]: u["source_run"] for u in all_units},
         "metrics": METRICS,
         "rules": list(RULES),
         "target_rule_note": (f"B1 + B2 (T = {config.DECISION_TARGET_UNDERTRIAGE}, populacja dopasowania "
                              f"'{config.DECISION_FIT_POPULATION}'): val — cross-fitting 2 foldy, test — reguła "
                              f"dopasowana na całym val tego seeda"
                              if decision_module() is not None else "niedostępna (brak src.evaluation.decision)"),
-        "n_units": len(units),
+        "n_units": len(all_units),
         "n_done": n_done,
-        "complete": not failures and n_done == len(units),
+        "complete": not failures and n_done == len(all_units),
         "failures": failures,
         "models": models_out,
     }
     path = store.write_results(results)
     store.write_summary(summary_lines(results))
-    log.info(f"Seedy: {n_done}/{len(units)} jednostek → {path}")
+    log.info(f"Seedy: {n_done}/{len(all_units)} jednostek (kumulatywnie, modele: "
+             f"{', '.join(models_out) or '—'}) → {path}")
     return results
 
 

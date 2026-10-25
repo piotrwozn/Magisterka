@@ -346,8 +346,38 @@ class SHAPTriageExplainer:
                 base = np.asarray(explanation.base_values, dtype=float).reshape(n, -1)[0]
                 self.expected_value = base
 
-        values = _to_sample_class_feature(raw_values, n, len(self.class_names), n_out)
+        if self.method == "linear":
+            # Wejścia klasyfikatora = cechy + `missingindicator_<cecha>` (SimpleImputer(add_indicator=True)):
+            # wkład wskaźnika braku dopisujemy do jego cechy, żeby wyjaśnienie dotyczyło cech modelu
+            n_in = np.asarray(data).shape[1]
+            values = _to_sample_class_feature(raw_values, n, len(self.class_names), n_in)
+            values = self._fold_indicator_values(values)
+        else:
+            values = _to_sample_class_feature(raw_values, n, len(self.class_names), n_out)
         return values, np.asarray(base, dtype=float).reshape(-1)
+
+    def _fold_indicator_values(self, values: np.ndarray) -> np.ndarray:
+        """(n, C, wejścia klasyfikatora) → (n, C, cechy): wskaźniki braków sumowane z cechą bazową."""
+        names = self.output_feature_names
+        if values.shape[2] == len(names):
+            return values
+        try:
+            inputs = [str(c) for c in self._preprocess.get_feature_names_out(names)]
+        except (AttributeError, ValueError) as e:
+            raise ExplainerUnavailable(f"SHAP (linear): nie da się odczytać nazw wejść klasyfikatora: {e}") from e
+        if len(inputs) != values.shape[2]:
+            raise ExplainerUnavailable(
+                f"SHAP (linear): {values.shape[2]} wejść klasyfikatora, a {len(inputs)} nazw z preprocessingu"
+            )
+        index = {name: i for i, name in enumerate(names)}
+        prefix = "missingindicator_"
+        folded = np.zeros(values.shape[:2] + (len(names),), dtype=float)
+        for j, name in enumerate(inputs):
+            base = name[len(prefix):] if name.startswith(prefix) else name
+            if base not in index:
+                raise ExplainerUnavailable(f"SHAP (linear): nieznane wejście klasyfikatora '{name}'")
+            folded[:, :, index[base]] += values[:, :, j]
+        return folded
 
     # ──────── Globalne wyjaśnienia ────────
     def explain_dataset(self, X: pd.DataFrame) -> list[np.ndarray]:

@@ -152,6 +152,19 @@ class TestCommon:
         assert 0 < out["log_loss"] < 3 and 0.5 <= out["admission_auc"] <= 1
         assert "vc_qwk_argmax" in out and "vc_log_loss" in out
 
+    def test_merge_units_cumulative(self):
+        prev = [{"unit": "logreg/seed1", "model": "logreg", "source_run": "r_lr"},
+                {"unit": "lightgbm/seed1", "model": "lightgbm", "source_run": "r_lgbm"},
+                {"unit": "lightgbm/seed2", "model": "lightgbm", "source_run": "r_lgbm"},
+                {"unit": "xgboost/seed1", "model": "xgboost", "source_run": "r_xgb_old"}]
+        cur = [{"unit": "lightgbm/seed1", "model": "lightgbm", "source_run": "r_lgbm"}]
+        merged = common.merge_units(prev, cur, lambda u: u["model"],
+                                    {"logreg": "r_lr", "lightgbm": "r_lgbm", "xgboost": "r_xgb_new"})
+        # lightgbm liczony teraz (1 seed) zastępuje swoje 2 stare; xgboost ze starego runa odpada
+        assert [u["unit"] for u in merged] == ["logreg/seed1", "lightgbm/seed1"]
+        store = UnitStore(Path("/nonexistent"))
+        assert store.planned_units() == []
+
     def test_mean_sd_and_clean_json(self):
         s = common.mean_sd([0.5, 0.7, None, float("nan")])
         assert s["mean"] == pytest.approx(0.6) and s["n"] == 2 and s["values"] == [0.5, 0.7, None, None]
@@ -308,10 +321,17 @@ class TestAnalyses:
         (out / "units" / "lightgbm__seed1.json").unlink()
         assert seeds.run_seed_refits(tag=TAG, models=["logreg", "lightgbm"], n_seeds=2)["n_done"] == 6
         assert refit_dirs(prepared_paths.RUNS_DIR) == refits
-        # Nowy run źródłowy (nowszy) → jednostki tego modelu liczone od nowa
+        # Nowy run źródłowy (nowszy) → jednostki tego modelu liczone od nowa; wyniki kumulatywne:
+        # lightgbm (niewywołany teraz, ten sam run źródłowy) zostaje w results.json i w postępie
         newer = make_source("logreg")
         res = seeds.run_seed_refits(tag=TAG, models=["logreg"], n_seeds=1)
-        assert res["source_runs"] == {"logreg": newer.name} and len(refit_dirs(prepared_paths.RUNS_DIR)) == 5
+        assert res["source_runs"] == {"logreg": newer.name, "lightgbm": sources["lightgbm"].name}
+        assert len(refit_dirs(prepared_paths.RUNS_DIR)) == 5
+        assert res["models"]["logreg"]["n_runs"] == 2 and res["models"]["lightgbm"]["n_runs"] == 3
+        assert res["complete"] and res["n_done"] == res["n_units"] == 5
+        assert list(res["models"]) == ["logreg", "lightgbm"]                       # kolejność rejestru
+        progress = analyses_status("triage", TAG)["seeds"]
+        assert progress["done"] == progress["total"] == 5
 
     def test_site_out(self, prepared_paths):
         from src.data.dataset import load_split
@@ -340,11 +360,39 @@ class TestAnalyses:
         dev = pd.read_parquet(run_dir / "predictions_dev_val.parquet")
         assert "A" not in set(dev["site"].astype(str)) and set(dev["row_id"]) <= set(val_df["row_id"])
         assert _read(run_dir / "DONE.json")["refit_of"] == source.name
-        # Wznowienie bez nowych refitów; nieznany oddział → błąd jednostki, nie całej analizy
+        # Wznowienie bez nowych refitów; nieznany oddział → błąd argumentów PRZED planem i treningiem
         assert site_out.run_leave_site_out(tag=TAG, models=["logreg"], sites=["A"])["n_done"] == 1
-        res = site_out.run_leave_site_out(tag=TAG, models=["logreg"], sites=["A", "Z"])
-        assert [f["unit"] for f in res["failures"]] == ["Z/logreg"] and not res["complete"]
+        plan_before = (prepared_paths.RUNS_DIR / "analyses" / "site_out__triage__smoke" / "plan.json").read_text(
+            encoding="utf-8")
+        with pytest.raises(common.AnalysisArgumentError, match="Z"):
+            site_out.run_leave_site_out(tag=TAG, models=["logreg"], sites=["A", "Z"])
+        assert (prepared_paths.RUNS_DIR / "analyses" / "site_out__triage__smoke" / "plan.json").read_text(
+            encoding="utf-8") == plan_before
         assert len(refit_dirs(prepared_paths.RUNS_DIR)) == 1
+        # Wyniki kumulatywne: wywołanie dla B dopisuje oddział, A zostaje
+        res = site_out.run_leave_site_out(tag=TAG, models=["logreg"], sites=["B"])
+        assert set(res["sites"]) == {"A", "B"} and res["sites_requested"] == ["A", "B"] and res["complete"]
+        assert analyses_status("triage", TAG)["site_out"]["total"] == 2
+
+    def test_oe_is_observed_over_expected(self):
+        y = np.array([0, 0, 0, 0, 1, 2, 2, 2, 3, 4])
+        p = np.full((10, 5), 0.2)                       # Σ P(ESI 1) = 2, obserwowane 4
+        assert site_out._oe(y, p, [0]) == pytest.approx(2.0)          # > 1 = model zaniża ESI 1
+        assert site_out._oe(y, p, [0, 1]) == pytest.approx(5 / 4)
+        assert np.isnan(site_out._oe(y, np.zeros((10, 5)), [0]))
+
+    def test_effective_train_prior_uses_class_weights(self):
+        counts = [10, 90, 400, 400, 100]
+        plain, note = site_out.effective_train_prior(counts, {"weights_strategy": "none"})
+        np.testing.assert_allclose(plain, np.array(counts) / 1000) and note is None
+        optuna, note = site_out.effective_train_prior(
+            counts, {"weights_strategy": "optuna_qwk", "class_weights": {"0": 30.0, "1": 2.0}})
+        expected = np.array([300.0, 180, 400, 400, 100])
+        np.testing.assert_allclose(optuna, expected / expected.sum())
+        assert note == "optuna_qwk" and optuna[0] > 20 * plain[0]
+        balanced, _ = site_out.effective_train_prior(
+            counts, {"weights_strategy": "balanced", "sample_weight_strategy": "balanced"})
+        np.testing.assert_allclose(balanced, np.full(5, 0.2))
 
     def test_learning_curve(self, lgbm_source, prepared_paths):
         res = learning_curve.run_learning_curve(tag=TAG, models=["lightgbm"], fractions=[0.25, 0.5, 1.0])
@@ -363,6 +411,21 @@ class TestAnalyses:
                                    atol=1e-6)
         assert not (full / "predictions_test.parquet").exists()
 
+    def test_power_law_reliability_checks(self):
+        """Ekstrapolacja gorsza od ostatniego punktu, zły kierunek, daleki cel → niewiarygodna z powodem."""
+        n = [270, 540, 1350, 2700, 5400]
+        smoke = learning_curve.fit_power_law(n, [0.150, 0.281, 0.309, 0.311, 0.374], [401_779], True)
+        assert not smoke["reliable"] and smoke["predicted"]["401779"] < 0.374
+        assert any("gorsza od ostatniego punktu" in r for r in smoke["reasons"])
+        assert any("ekstrapolacja > 10" in r for r in smoke["reasons"])
+        x = np.array([20_000, 40_000, 100_000, 200_000, 400_000], dtype=float)
+        qwk = 0.70 - 3 * x ** -0.5 + np.array([0.001, -0.001, 0.0005, 0.0, 0.0008])
+        good = learning_curve.fit_power_law(x, qwk, [400_000, 800_000], True)
+        assert good["reliable"] and good["reasons"] == []
+        wrong_way = learning_curve.fit_power_law(x, qwk, [800_000], False)        # QWK jako „mniej = lepiej”
+        assert not wrong_way["reliable"] and "krzywa pogarsza się z liczbą danych" in wrong_way["reasons"]
+        assert learning_curve.HIGHER_IS_BETTER["log_loss"] is False
+
     def test_power_law_fit(self):
         n = np.array([1_000, 2_000, 5_000, 10_000, 50_000], dtype=float)
         y = 0.75 + 2.0 * n ** -0.4
@@ -373,7 +436,8 @@ class TestAnalyses:
         three = learning_curve.fit_power_law(n[:3], y[:3], extrapolate_to=[100_000])
         assert three["c_fixed"] and three["c"] == learning_curve.C_FIXED and not three["reliable"]
         linear = learning_curve.fit_power_law(n, 1.0 - 0.01 * np.log(n))          # bez asymptoty → c na granicy
-        assert linear["at_bound"] and not linear["reliable"]
+        assert linear["at_bound"] and not linear["reliable"] and "c na granicy przedziału" in linear["reasons"]
+        assert fit["reasons"] == []
         assert learning_curve.fit_power_law(n[:2], y[:2]) is None
         assert learning_curve.parse_fractions("1,0.1,0.1") == [0.1, 1.0]
         with pytest.raises(ValueError):
@@ -398,6 +462,10 @@ def test_scripts_exit_2_without_source_runs(prepared_paths, script):
 def test_scripts_bad_arguments(prepared_paths):
     assert _load_script("11_learning_curve.py").run(["--tag", TAG, "--fractions", "0,2"]) == 2
     assert _load_script("10_leave_site_out.py").run(["--tag", TAG, "--sites", " , "]) == 2
+    make_source("logreg")
+    assert _load_script("10_leave_site_out.py").run(["--tag", TAG, "--sites", "Z", "--models", "lr"]) == 2
+    assert not (prepared_paths.RUNS_DIR / "analyses" / "site_out__triage__smoke" / "plan.json").exists()
+    assert refit_dirs(prepared_paths.RUNS_DIR) == []
     with pytest.raises(SystemExit):
         _load_script("09_seed_refits.py").run(["--seeds", "0"])
 

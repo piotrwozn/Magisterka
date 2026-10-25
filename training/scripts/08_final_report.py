@@ -2,7 +2,7 @@
 Krok 8: RAPORT KOŃCOWY do pracy — jedna ocena na TEST dla receptury wybranej wcześniej na VAL.
 
 Nic nie jest trenowane: wszystko liczone z zapisanych predykcji runów
-(runs/<run>/predictions_{val,test}.parquet).
+(runs/<run>/predictions_{val,test}.parquet). Obliczenia nowych sekcji: src/evaluation/report_sections.py.
 
 Receptura (wybrana na VAL, np. po `07_compare_runs.py`):
     runy         --runs RUN …  albo  --feature-set triage --tag standard (najnowszy ukończony run
@@ -12,25 +12,34 @@ Receptura (wybrana na VAL, np. po `07_compare_runs.py`):
                  jego "method", "rule" i "temperature" są przejmowane; sprzeczna opcja = odmowa)
     łączenie     --method mean | geometric (domyślnie mean)
     temperatura  --temperature fit (dopasowana na VAL, domyślnie) | none
-    reguła       --rule argmax | cost | both (domyślnie both)
+    reguła       --main-rule target | bayes_target | cost | argmax (domyślnie target) — reguła
+                 w pliku dla backendu; --target-undertriage T (domyślnie z config), --guarantee
+                 (B6), --safety-net / --no-safety-net (B2, domyślnie włączona), --fit-population
+                 vc | all (wiersze VAL do dopasowania progów, domyślnie vc); --rule all (domyślnie:
+                 wszystkie reguły w tabelach) | both (argmax + koszt) | jedna reguła
 
 Kroki:
     1. Kontrola runów: ten sam zestaw cech, ta sama wersja i to samo przygotowanie danych, jeden
        run na model, te same wiersze i etykiety w val i test — inaczej ODMOWA (kod wyjścia 2).
-    2. VAL: połączenie (wagi, metoda) i temperatura T dopasowana na VAL; każdy pojedynczy model
-       przechodzi tę samą obróbkę (własna T), żeby porównanie było uczciwe.
+    2. VAL: połączenie (wagi, metoda) i temperatura T dopasowana na VAL; reguły decyzyjne
+       (progi z celem T + siatka bezpieczeństwa, decyzja Bayesa z λ) dopasowane na VAL po
+       temperaturze. Każdy pojedynczy model przechodzi tę samą obróbkę (własna T, własne reguły).
     3. TEST — raz:
        (a) połączenie i każdy model z 95% przedziałami ufności (bootstrap percentylowy,
            stratyfikowany po ESI; odsetki pacjentów — dokładny przedział Clopper–Pearsona z k/n)
-           — cała populacja, podgrupa vc (komplet HR/SBP/RR), oddziały;
+           dla WSZYSTKICH reguł — cała populacja, podgrupa vc (komplet HR/SBP/RR), oddziały;
        (b) sparowane Δ: połączenie − najlepszy pojedynczy model (najniższy log loss na VAL)
-           dla QWK, niedotriażowania i log loss;
-       (c) kalibracja przed i po temperaturze (ECE, wykresy niezawodności);
-       (d) macierze pomyłek (liczby i % wiersza) dla każdej reguły;
-       (e) trafność względem przyjęcia do szpitala (AUC), gdy dostępna jest kolumna `admitted`.
+           dla QWK, niedotriażowania i log loss, z regułą wyższości C1 (CI bez 0, |Δ| > MID,
+           |Δ| > 2 × SD seedów z runs/analyses);
+       (c) kalibracja przed i po temperaturze (ECE, wykresy niezawodności) i per poziom / oddział (C8);
+       (d) macierze pomyłek; (e) przyjęcia do szpitala: AUC, podgrupy, niezgodność model–pielęgniarka (C4);
+       (f) punkt pracy na VAL (C6), podgrupy i równość (C2), analiza błędów (C10), krzywe
+           decyzyjne (C7), odsyłanie niepewnych i zbiory conformal (C13), podsumowanie analiz
+           runs/analyses/ (C1 seedy, C3 leave-site-out, C9 krzywa uczenia).
+       Sekcja bez danych (brak `admitted`, atrybutów pacjentów, wyników analiz) jest pomijana z notą.
     4. Zapis: runs/final_report__<zestaw>__<czas>/ (albo --out): report.md (po polsku, tabele do
        pracy), metrics.json, recipe.json, tables/*.csv, figures/*.png oraz
-       backend_ensemble_weights.json (format backend/app/models/ensemble.py).
+       backend_ensemble_weights.json (format backend/app/models/ensemble.py, z parametrami reguły).
 
 UWAGA: zbiór TESTOWY oceniasz RAZ, dla ostatecznej receptury. Kolejne uruchomienia z innymi
 recepturami i wybór „najlepszej” na teście zawyżają wyniki (test przestaje być niezależny).
@@ -38,8 +47,7 @@ Każde uruchomienie jest dopisywane do rejestru runs/final_reports.jsonl (niezal
 kolejny raport dla tych samych runów wypisuje wcześniejsze (z informacją, czy receptura była ta sama).
 
 Użycie:
-    python scripts/08_final_report.py --feature-set triage --tag standard \\
-        --weights '{"xgboost": 0.4, "catboost": 0.3, "ebm": 0.3}' --temperature fit
+    python scripts/08_final_report.py --feature-set triage --tag standard      # domyślnie: optimize, target T=15%
     python scripts/08_final_report.py --runs RUN_A RUN_B RUN_C --weights optimize --method geometric
     python scripts/08_final_report.py --feature-set triage --tag smoke --include-samples --bootstrap 300
 """
@@ -50,9 +58,11 @@ import argparse
 import hashlib
 import json
 import math
+import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -76,17 +86,29 @@ from src.ensemble import (  # noqa: E402
     optimize_weights,
     resolve_feature_set,
 )
-from src.evaluation.metrics import decide  # noqa: E402
+from src.evaluation import report_sections as rs  # noqa: E402
+from src.evaluation.decision import expected_level, normalize_spec  # noqa: E402
+from src.evaluation.report_sections import (  # noqa: E402
+    COUNT_METRICS,  # noqa: F401 — eksport dla zgodności (formatowanie w report_sections)
+    NURSE,
+    PERCENT_METRICS,  # noqa: F401
+    RULE_LABELS,
+    RULE_ORDER,
+    DecisionOptions,
+    FittedRules,
+    Fmt,
+    md_table,
+)
+from src.evaluation.report_sections import fnum as _f  # noqa: E402
+from src.evaluation.report_sections import int_text as _int  # noqa: E402
+from src.evaluation.report_sections import jsonable as _jsonable  # noqa: E402
 from src.evaluation.statistics import (  # noqa: E402
     DEFAULT_CI_METRICS,
     DEFAULT_N_BINS,
     BootstrapSamples,
-    bootstrap_auc,
-    bootstrap_samples,
     calibration_summary,
     ci_to_dict,
     crossfit_temperature,
-    format_ci,
     point_metrics,
 )
 from src.utils import config  # noqa: E402
@@ -101,26 +123,19 @@ log = get_logger(__name__)
 # ─────────────────────────────────────────
 BLEND = "połączenie"
 BLEND_RAW = "połączenie (bez T)"
-NURSE = "ESI z triażu (pielęgniarka)"
-RULES = ("argmax", "cost")
-RULE_LABELS = {"argmax": "argmax", "cost": "koszt"}
+RULES = RULE_ORDER                                   # argmax, cost, target, bayes_target
+RULE_SETS: dict[str, list[str]] = {"all": list(RULE_ORDER), "both": ["argmax", "cost"]}
 EXIT_REFUSED = 2
 ECE_NULL_SIMS = 200          # losowania idealnie skalibrowanego modelu (wartość odniesienia ECE)
 DEFAULT_METHOD = "mean"
 DEFAULT_TEMPERATURE = "fit"
-DEFAULT_RULE = "both"
-BACKEND_KEYS = frozenset({"weights", "method", "temperature", "rule"})   # backend/app/models/ensemble.py
+DEFAULT_RULE = "all"
+DEFAULT_MAIN_RULE = "target"
+RULE_PARAM_KEYS = frozenset({"cutpoints", "safety_q", "lam"})
+BACKEND_KEYS = frozenset({"weights", "method", "temperature", "rule"}) | RULE_PARAM_KEYS   # backend ensemble.py
 TEMPERATURE_RTOL = 1e-3      # T dopasowana ponownie vs T z pliku wag: większa różnica = ostrzeżenie
 REGISTRY_FILE = "final_reports.jsonl"   # rejestr wszystkich raportów końcowych (w RUNS_DIR)
 
-# Metryki raportowane procentowo (odsetki pacjentów)
-PERCENT_METRICS = frozenset({
-    "accuracy", "within_one_accuracy", "undertriage_rate", "critical_miss_rate", "overtriage_rate",
-    "mistriage_under", "mistriage_over", "recall_esi1", "recall_esi12",
-})
-# Odsetki z małym mianownikiem (klasy ESI) — w tabelach także liczebność k/n
-COUNT_METRICS = frozenset({"undertriage_rate", "critical_miss_rate", "overtriage_rate", "recall_esi1",
-                           "recall_esi12"})
 METRIC_LABELS: dict[str, str] = {
     "quadratic_weighted_kappa": "QWK ↑",
     "accuracy": "trafność (accuracy) ↑",
@@ -135,7 +150,7 @@ METRIC_LABELS: dict[str, str] = {
     "auc_macro": "AUC makro (jeden-przeciw-reszcie) ↑",
     "log_loss": "log loss ↓",
     "brier": "Brier ↓",
-    "expected_cost": "oczekiwany koszt decyzji ↓",
+    "expected_cost": "oczekiwany koszt decyzji (macierz k = 3) ↓",
     "ece": "ECE top-label ↓",
 }
 SHORT_LABELS: dict[str, str] = {
@@ -189,11 +204,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--temperature", choices=["fit", "none"], default=None,
                         help=f"Temperatura połączonych prawdopodobieństw dopasowana na VAL albo bez "
                              f"(domyślnie z pliku wag, inaczej {DEFAULT_TEMPERATURE})")
-    parser.add_argument("--rule", choices=["argmax", "cost", "both"], default=None,
-                        help=f"Reguły decyzyjne w raporcie (domyślnie {DEFAULT_RULE})")
-    parser.add_argument("--backend-rule", choices=["argmax", "cost"], default=None,
-                        help="Reguła w backend_ensemble_weights.json (domyślnie: reguła z pliku wag, potem "
-                             "--rule, a przy 'both' — cost); musi być jedną z ocenianych reguł")
+    rules = parser.add_argument_group("reguły decyzyjne (dopasowanie na VAL, ocena na TEST)")
+    rules.add_argument("--main-rule", choices=list(RULES), default=None,
+                       help=f"Reguła główna: tabele szczegółowe, podgrupy, analiza błędów i plik dla backendu "
+                            f"(domyślnie z pliku wag, inaczej {DEFAULT_MAIN_RULE})")
+    rules.add_argument("--backend-rule", choices=list(RULES), default=None,
+                       help="Dawna nazwa --main-rule (zgodność wstecz)")
+    rules.add_argument("--rule", choices=["all", "both", *RULES], default=None,
+                       help=f"Reguły oceniane w raporcie: all = argmax, koszt, progi T, Bayes T (domyślnie "
+                            f"{DEFAULT_RULE}); both = argmax + koszt; jedna nazwa = tylko ta reguła "
+                            f"(i ona trafia do backendu)")
+    rules.add_argument("--target-undertriage", type=float, default=config.DECISION_TARGET_UNDERTRIAGE,
+                       metavar="T", help="Cel niedotriażowania ESI 1–2 → 3–5 reguł progi T / Bayes T (na VAL)")
+    rules.add_argument("--guarantee", action="store_true",
+                       help="B6: próg tak, by górna granica Clopper–Pearsona niedotriażowania na VAL ≤ T")
+    rules.add_argument("--safety-net", action=argparse.BooleanOptionalAction, default=True,
+                       help="B2: P(ESI 1)+P(ESI 2) ≥ q → najwyżej ESI 3 (q dopasowane na VAL)")
+    rules.add_argument("--fit-population", choices=["vc", "all"], default=config.DECISION_FIT_POPULATION,
+                       help="Wiersze VAL do dopasowania progów: vc (komplet HR/SBP/RR, jak TOPSOR) albo all")
     parser.add_argument("--bootstrap", type=int, default=2000, metavar="N", help="Liczba losowań bootstrap")
     parser.add_argument("--alpha", type=float, default=0.05, help="1 − poziom ufności przedziałów")
     parser.add_argument("--seed", type=int, default=42, help="Ziarno losowań bootstrap")
@@ -206,6 +234,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--bootstrap musi być ≥ 1 (raport końcowy zawsze podaje przedziały ufności)")
     if not 0 < args.alpha < 1:
         parser.error("--alpha musi być w (0, 1)")
+    if not 0 < args.target_undertriage < 1:
+        parser.error("--target-undertriage musi być w (0, 1)")
     return args
 
 
@@ -223,6 +253,17 @@ def resolve_runs(args: argparse.Namespace) -> list[Run]:
     models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else None
     runs = latest_runs(feature_set, models=models, include_samples=args.include_samples, tag=args.tag,
                        include_weighted=args.include_weighted, require_tuned=not args.include_untuned)
+    # Refit analizy z modelem (09_seed_refits.py --save-models) bywa „najnowszym” runem — raport
+    # dotyczy runu głównego, z którego refit powstał (refit jawnie: --runs)
+    for i, run in enumerate(runs):
+        source = run.info.get("refit_of")
+        if source:
+            try:
+                runs[i] = load_run(source)
+            except FileNotFoundError as exc:
+                raise RecipeError(f"{run.name} to refit analizy, a jego run główny {source} nie istnieje — "
+                                  f"podaj runy jawnie (--runs)") from exc
+            log.warning(f"{run.name} to refit analizy — w raporcie biorę jego run główny {source}")
     if not runs:
         raise RecipeError(
             f"Brak ukończonych runów dla zestawu '{feature_set}'"
@@ -267,12 +308,14 @@ def check_runs(runs: list[Run], feature_set_arg: str | None) -> dict[str, Any]:
     if unfinished:
         log.warning("Runy bez DONE.json (nieukończone): " + ", ".join(unfinished))
     strategies = {r.info.get("split_strategy") for r in runs if r.info.get("split_strategy")}
+    tags = {r.info.get("tag") for r in runs}
     return {
         "feature_set": feature_set,
         "data_version": version,
         "data_fingerprint": fingerprints.pop() if fingerprints else None,
         "split_strategy": strategies.pop() if len(strategies) == 1 else None,
         "samples": samples,
+        "tag": tags.pop() if len(tags) == 1 else None,
     }
 
 
@@ -312,14 +355,14 @@ def _read_weights_spec(spec: str) -> tuple[Any, str]:
 
 
 def _is_backend_config(payload: Any) -> bool:
-    """Format backend_ensemble_weights.json: {"weights": {...}, "method", "temperature", "rule"}."""
+    """Format backend_ensemble_weights.json: {"weights": {...}, "method", "temperature", "rule", parametry reguły}."""
     return isinstance(payload, dict) and bool(set(payload) & BACKEND_KEYS)
 
 
 def weights_file_recipe(spec: str) -> dict[str, Any] | None:
     """
     Ustawienia receptury zapisane w pliku wag w formacie backendu (tylko klucze obecne w pliku:
-    method, rule, temperature). Zwykłe {model: waga}, 'equal', 'optimize' → None.
+    method, rule (+ jej parametry), temperature). Zwykłe {model: waga}, 'equal', 'optimize' → None.
     """
     spec = spec.strip()
     if spec in ("equal", "optimize"):
@@ -334,8 +377,14 @@ def weights_file_recipe(spec: str) -> dict[str, Any] | None:
     recipe = {k: payload[k] for k in ("method", "rule", "temperature") if k in payload}
     if "method" in recipe and recipe["method"] not in ("mean", "geometric"):
         raise RecipeError(f"--weights: \"method\" w pliku musi być mean | geometric (jest {recipe['method']!r})")
-    if "rule" in recipe and recipe["rule"] not in RULES:
-        raise RecipeError(f"--weights: \"rule\" w pliku musi być argmax | cost (jest {recipe['rule']!r})")
+    if "rule" in recipe or set(payload) & RULE_PARAM_KEYS:
+        if recipe.get("rule") not in RULES:
+            raise RecipeError(f"--weights: \"rule\" w pliku musi być jedną z {list(RULES)} "
+                              f"(jest {recipe.get('rule')!r})")
+        try:
+            recipe["rule_spec"] = normalize_spec({k: payload[k] for k in ("rule", *RULE_PARAM_KEYS) if k in payload})
+        except ValueError as exc:
+            raise RecipeError(f"--weights: reguła w pliku jest niepoprawna ({exc})") from exc
     t = recipe.get("temperature")
     if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) or t <= 0):
         raise RecipeError(f"--weights: \"temperature\" w pliku musi być liczbą > 0 albo null (jest {t!r})")
@@ -349,9 +398,15 @@ class RecipeOptions:
     method: str
     temperature_mode: str
     rules: list[str]
-    backend_rule: str
+    main_rule: str
     file_temperature: float | None = None
+    file_rule_spec: dict[str, Any] | None = None
     adopted: tuple[str, ...] = ()
+
+    @property
+    def backend_rule(self) -> str:
+        """Dawna nazwa reguły głównej (reguła zapisywana w pliku dla backendu)."""
+        return self.main_rule
 
 
 def resolve_options(args: argparse.Namespace, file_recipe: dict[str, Any] | None) -> RecipeOptions:
@@ -377,20 +432,30 @@ def resolve_options(args: argparse.Namespace, file_recipe: dict[str, Any] | None
     file_mode = None if "temperature" not in fr else ("none" if fr["temperature"] is None else "fit")
     temperature_mode = pick("temperature", args.temperature, file_mode, DEFAULT_TEMPERATURE)
     rule_arg = args.rule or DEFAULT_RULE
-    rules = list(RULES) if rule_arg == "both" else [rule_arg]
-    cli_backend = args.backend_rule or (args.rule if args.rule in RULES else None)
-    if fr.get("rule") is not None and cli_backend is not None and cli_backend != fr["rule"]:
-        raise RecipeError(f"Reguła {cli_backend} (z --rule / --backend-rule) jest sprzeczna z plikiem wag "
-                          f"(rule = {fr['rule']}); usuń opcję albo podaj wagi bez pliku backendu")
-    if cli_backend is None and fr.get("rule") is not None:
+    rules = list(RULE_SETS.get(rule_arg, [rule_arg]))
+    if args.main_rule and args.backend_rule and args.main_rule != args.backend_rule:
+        raise RecipeError(f"--main-rule {args.main_rule} i --backend-rule {args.backend_rule} są sprzeczne "
+                          f"(to ta sama opcja — podaj jedną)")
+    cli_main = args.main_rule or args.backend_rule or (rule_arg if rule_arg in RULES else None)
+    file_rule = fr.get("rule")
+    if file_rule is not None and cli_main is not None and cli_main != file_rule:
+        raise RecipeError(f"Reguła {cli_main} (z --main-rule / --backend-rule / --rule) jest sprzeczna z plikiem "
+                          f"wag (rule = {file_rule}); usuń opcję albo podaj wagi bez pliku backendu")
+    if cli_main is None and file_rule is not None:
         adopted.append("rule")
-    backend_rule = cli_backend or fr.get("rule") or "cost"
-    if backend_rule not in rules:
-        raise RecipeError(f"Reguła dla backendu '{backend_rule}' nie jest oceniana w raporcie (--rule {rule_arg}) "
-                          f"— dodaj ją (--rule {backend_rule} albo both)")
+    if cli_main or file_rule:
+        main_rule = cli_main or file_rule
+    elif DEFAULT_MAIN_RULE in rules:
+        main_rule = DEFAULT_MAIN_RULE
+    else:
+        main_rule = "cost" if "cost" in rules else rules[0]
+    if main_rule not in rules:
+        raise RecipeError(f"Reguła główna '{main_rule}' nie jest oceniana w raporcie (--rule {rule_arg}) "
+                          f"— dodaj ją (--rule {main_rule} albo all)")
     t = fr.get("temperature")
-    return RecipeOptions(method=method, temperature_mode=temperature_mode, rules=rules, backend_rule=backend_rule,
-                         file_temperature=float(t) if t is not None else None, adopted=tuple(adopted))
+    return RecipeOptions(method=method, temperature_mode=temperature_mode, rules=rules, main_rule=main_rule,
+                         file_temperature=float(t) if t is not None else None,
+                         file_rule_spec=fr.get("rule_spec"), adopted=tuple(adopted))
 
 
 def resolve_weights(
@@ -437,11 +502,15 @@ def resolve_weights(
     return {n: w / total for n, w in weights.items()}, mode
 
 
-def recipe_hash(run_names: list[str], weights: dict[str, float], opts: RecipeOptions) -> str:
-    """Krótki skrót receptury (runy, wagi, metoda, temperatura, reguły) — do rozpoznania powtórek."""
+def recipe_hash(run_names: list[str], weights: dict[str, float], opts: RecipeOptions,
+                dopts: DecisionOptions | None = None) -> str:
+    """Krótki skrót receptury (runy, wagi, metoda, temperatura, reguły, cel T…) — do rozpoznania powtórek."""
     payload = {"runs": sorted(run_names), "weights": {k: round(v, 6) for k, v in sorted(weights.items())},
                "method": opts.method, "temperature": opts.temperature_mode, "rules": sorted(opts.rules),
-               "backend_rule": opts.backend_rule}
+               "backend_rule": opts.main_rule}
+    if dopts is not None:
+        payload["decision"] = {"target": round(dopts.target, 6), "guarantee": dopts.guarantee,
+                               "safety_net": dopts.safety_net, "population": dopts.population}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
@@ -532,163 +601,30 @@ def warn_test_once(prior: list[dict[str, Any]]) -> None:
     log.warning(bar)
 
 
-# ─────────────────────────────────────────
-# Formatowanie (report.md)
-# ─────────────────────────────────────────
-@dataclass
-class Fmt:
-    decimal_comma: bool = False
-
-    def _dc(self, text: str) -> str:
-        return text.replace(".", ",") if self.decimal_comma else text
-
-    def ci(self, metric: str, row: dict[str, Any] | pd.Series | None) -> str:
-        """'12.3% [11.0; 13.6]'; odsetki z małym mianownikiem dodatkowo z liczebnością: '0.0% [0.0; 9.3] (0/38)'."""
-        if row is None:
-            return "—"
-        text = format_ci(_f(row["value"]), _f(row["ci_low"]), _f(row["ci_high"]), digits=3,
-                         percent=metric in PERCENT_METRICS, decimal_comma=self.decimal_comma)
-        k, n = _f(row.get("k")), _f(row.get("n"))
-        if metric in COUNT_METRICS and k is not None and n is not None:
-            text += f" ({_int(k)}/{_int(n)})"
-        return text
-
-    def num(self, value: Any, digits: int = 3) -> str:
-        v = _f(value)
-        return "—" if v is None else self._dc(f"{v:.{digits}f}")
-
-    def pct(self, value: Any, digits: int = 1) -> str:
-        v = _f(value)
-        return "—" if v is None else self._dc(f"{100 * v:.{digits}f}%")
-
-    def delta(self, metric: str, d: Any, low: Any, high: Any) -> str:
-        d, low, high = _f(d), _f(low), _f(high)
-        if d is None:
-            return "—"
-        if metric in PERCENT_METRICS:
-            text = f"{100 * d:+.1f} pp"
-            if low is not None and high is not None:
-                text += f" [{100 * low:+.1f}; {100 * high:+.1f}]"
-        else:
-            text = f"{d:+.4f}"
-            if low is not None and high is not None:
-                text += f" [{low:+.4f}; {high:+.4f}]"
-        return self._dc(text)
-
-    def p(self, value: Any) -> str:
-        v = _f(value)
-        if v is None:
-            return "—"
-        return self._dc("< 0.001" if v < 0.001 else f"{v:.3f}")
-
-
-def _f(value: Any) -> float | None:
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    return v if math.isfinite(v) else None
-
-
-def _int(value: float) -> str:
-    """Liczba całkowita z odstępem tysięcy: 12 345."""
-    return f"{int(round(value)):,}".replace(",", " ")
-
-
-def md_table(header: list[str], rows: list[list[str]]) -> str:
-    lines = ["| " + " | ".join(header) + " |", "|" + "|".join("---" for _ in header) + "|"]
-    lines += ["| " + " | ".join(str(c) for c in row) + " |" for row in rows]
-    return "\n".join(lines)
-
-
-def _jsonable(obj: Any) -> Any:
-    """Rekurencyjnie: numpy → Python, NaN/inf → None, DataFrame → lista rekordów."""
-    if isinstance(obj, dict):
-        return {str(k): _jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_jsonable(v) for v in obj]
-    if isinstance(obj, pd.DataFrame):
-        return _jsonable(obj.to_dict(orient="records"))
-    if isinstance(obj, np.ndarray):
-        return _jsonable(obj.tolist())
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (float, np.floating)):
-        return float(obj) if math.isfinite(float(obj)) else None
-    if isinstance(obj, (np.bool_,)):
-        return bool(obj)
-    if isinstance(obj, Path):
-        return str(obj)
-    return obj
-
-
 def _ci_lookup(res: BootstrapSamples | None, name: str, rule: str) -> dict[str, dict[str, Any]]:
-    if res is None or name not in res.names:
+    if res is None or name not in res.names or rule not in res.rules:
         return {}
     return ci_to_dict(res.ci(name, rule))
 
 
-# ─────────────────────────────────────────
-# Trafność względem przyjęcia do szpitala
-# ─────────────────────────────────────────
-def admission_labels(meta: pd.DataFrame, split: str, fingerprint: str | None) -> tuple[np.ndarray | None, str]:
+def shown_rules(rules: list[str], main_rule: str) -> list[str]:
+    """Reguły w tabelach szczegółowych: główna + argmax (punkt odniesienia bez warstwy decyzyjnej)."""
+    return [main_rule] + (["argmax"] if "argmax" in rules and main_rule != "argmax" else [])
+
+
+def run_section(name: str, timings: dict[str, float], fn: Callable[[], Any]) -> Any:
     """
-    Kolumna `admitted` w kolejności wierszy predykcji: z predykcji, a gdy jej tam nie ma —
-    z przygotowanego splitu (tylko przy zgodnym odcisku danych). Zwraca (wartości | None, źródło/powód).
+    Sekcja dodatkowa: błąd nie przerywa raportu — sekcja dostaje {"skipped": opis błędu}
+    (ostrzeżenie w logu), a pozostałe liczby i plik dla backendu powstają normalnie.
     """
-    if "admitted" in meta.columns:
-        values = pd.to_numeric(meta["admitted"], errors="coerce").to_numpy(dtype=float)
-        return values, "predykcje runów"
+    t = time.perf_counter()
     try:
-        from src.data import dataset
-
-        current = dataset.data_fingerprint()
-        if current == dataset.NO_DATA_FINGERPRINT:
-            return None, "brak kolumny `admitted` w predykcjach i brak przygotowanych splitów (data/processed)"
-        if fingerprint and current != fingerprint:
-            return None, (f"przygotowane splity mają inny odcisk danych ({current}) niż runy ({fingerprint}) "
-                          f"— pomijam")
-        frame = dataset.load_split(split, columns=["row_id", "admitted"]).set_index("row_id")
-    except Exception as exc:  # noqa: BLE001 — brak splitu / kolumny = pomijamy sekcję
-        return None, f"brak kolumny `admitted` w predykcjach i splicie ({type(exc).__name__}: {exc})"
-    missing = meta.index.difference(frame.index)
-    if len(missing):
-        return None, f"{len(missing):,} wierszy predykcji nie ma w splicie '{split}' — pomijam"
-    values = pd.to_numeric(frame.loc[meta.index, "admitted"], errors="coerce").to_numpy(dtype=float)
-    return values, f"split '{split}' (data/processed)"
-
-
-def admission_section(
-    admitted: np.ndarray, meta: pd.DataFrame, p_blend: np.ndarray, rules: list[str],
-    n_boot: int, alpha: float, seed: int,
-) -> dict[str, Any]:
-    """AUC wyników pilności względem przyjęcia (z CI i Δ względem ESI z triażu) + odsetek przyjęć wg poziomu."""
-    ok = np.isfinite(admitted)
-    adm = admitted[ok].astype(int)
-    p = p_blend[ok]
-    esi = meta["esi"].to_numpy()[ok] if "esi" in meta.columns else meta["target"].to_numpy()[ok] + 1
-    levels = np.arange(1, N_CLASSES + 1)
-    scores: dict[str, np.ndarray] = {
-        NURSE: -esi.astype(float),
-        f"{BLEND}: P(ESI 1–2)": p[:, 0] + p[:, 1],
-        f"{BLEND}: oczekiwany poziom (−E[ESI])": -(p @ levels),
-    }
-    for rule in rules:
-        scores[f"{BLEND}: przewidziany ESI ({RULE_LABELS[rule]})"] = -(decide(p, rule) + 1).astype(float)
-    table = bootstrap_auc(adm, scores, reference=NURSE, n_boot=n_boot, alpha=alpha, seed=seed)
-    by_level = []
-    for level in levels:
-        row: dict[str, Any] = {"poziom": f"ESI {level}"}
-        mask = esi == level
-        row["n (ESI z triażu)"] = int(mask.sum())
-        row["przyjęci (ESI z triażu)"] = float(adm[mask].mean()) if mask.any() else None
-        for rule in rules:
-            pred = decide(p, rule) + 1
-            m = pred == level
-            row[f"n ({RULE_LABELS[rule]})"] = int(m.sum())
-            row[f"przyjęci ({RULE_LABELS[rule]})"] = float(adm[m].mean()) if m.any() else None
-        by_level.append(row)
-    return {"n": int(ok.sum()), "admission_rate": float(adm.mean()), "auc": table, "by_level": by_level}
+        out = fn()
+    except Exception as exc:  # noqa: BLE001 — raport końcowy ma powstać mimo błędu jednej sekcji
+        log.warning(f"Sekcja '{name}' pominięta z powodu błędu: {type(exc).__name__}: {exc}")
+        out = {"skipped": f"błąd obliczeń ({type(exc).__name__}: {exc})"}
+    timings[f"{name}_s"] = round(time.perf_counter() - t, 2)
+    return out
 
 
 # ─────────────────────────────────────────
@@ -696,8 +632,8 @@ def admission_section(
 # ─────────────────────────────────────────
 def make_figures(
     fig_dir: Path, y: np.ndarray, vc: np.ndarray | None, p_raw: np.ndarray, p_final: np.ndarray,
-    temperature: float | None, rules: list[str], res_all: BootstrapSamples, res_vc: BootstrapSamples | None,
-    order: list[str], n_bins: int,
+    temperature: float | None, rules: list[str], decisions: dict[str, np.ndarray], res_all: BootstrapSamples,
+    res_vc: BootstrapSamples | None, order: list[str], n_bins: int,
 ) -> list[str]:
     from src.evaluation.visualizations import (
         plot_confusion_matrix,
@@ -715,7 +651,7 @@ def make_figures(
         paths.append(plot_reliability(y[vc], sets_vc, path=fig_dir / "reliability_test_blend_vc.png",
                                       n_bins=n_bins, title="Kalibracja połączenia na TEST — podgrupa vc"))
     for rule in rules:
-        pred = decide(p_final, rule)
+        pred = decisions[rule]
         label = RULE_LABELS[rule]
         paths.append(plot_confusion_matrix(y, pred, normalize=None,
                                            save_path=fig_dir / f"confusion_test_{rule}_counts.png",
@@ -724,7 +660,7 @@ def make_figures(
                                            save_path=fig_dir / f"confusion_test_{rule}_rowpct.png",
                                            title=f"Macierz pomyłek — {BLEND}, TEST, reguła {label}"))
         if vc is not None and vc.any():
-            paths.append(plot_confusion_matrix(y[vc], decide(p_final[vc], rule), normalize="true",
+            paths.append(plot_confusion_matrix(y[vc], pred[vc], normalize="true",
                                                save_path=fig_dir / f"confusion_test_vc_{rule}_rowpct.png",
                                                title=f"Macierz pomyłek — {BLEND}, TEST vc, reguła {label}"))
         rows = []
@@ -761,9 +697,75 @@ def make_figures(
 # ─────────────────────────────────────────
 # Raport
 # ─────────────────────────────────────────
+def _rule_params_text(spec: dict[str, Any], fmt: Fmt) -> str:
+    rule = spec.get("rule")
+    if rule == "target":
+        cuts = ", ".join(fmt.num(c, 3) for c in spec["cutpoints"])
+        q = spec.get("safety_q")
+        return f"progi EL = [{cuts}]" + (f", siatka q = {fmt.num(q, 3)}" if q is not None else ", bez siatki")
+    if rule == "bayes_target":
+        return f"λ = {fmt.num(spec['lam'], 3)}"
+    if rule == "cost":
+        return "macierz kosztów repo (niedotriażowanie 3×, kwadrat odległości)"
+    return "bez parametrów"
+
+
+def render_recipe_decision(ctx: dict[str, Any], fmt: Fmt) -> list[str]:
+    """Reguły decyzyjne w recepturze: ustawienia, parametry dopasowane na VAL i wynik na VAL."""
+    dec = ctx["decision"]
+    dopts: DecisionOptions = ctx["dopts"]
+    fitted: FittedRules = ctx["fitted_blend"]
+    pop = {"vc": "podgrupa vc VAL (komplet HR/SBP/RR, jak TOPSOR)", "all": "cały VAL"}[fitted.population]
+    lines = [
+        "### Reguły decyzyjne (dopasowane na VAL, na prawdopodobieństwach po łączeniu i temperaturze)",
+        "",
+        f"- reguła główna (backend, tabele szczegółowe): **{RULE_LABELS[dopts.main_rule]}** "
+        f"(`{dopts.main_rule}`); cel: {dopts.describe()}; dopasowanie: {pop}"
+        + (f" — {fitted.note}" if fitted.note else ""),
+    ]
+    for rule in dopts.rules:
+        lines.append(f"- {RULE_LABELS[rule]} (`{rule}`): {_rule_params_text(fitted.specs[rule], fmt)}")
+    lines.append("")
+    rows = []
+    for rule in dopts.rules:
+        v = dec["val"][rule]
+        a = v["all"]
+        row = [RULE_LABELS[rule], v["kind"], fmt.num(a["qwk"]), fmt.rate(a["k_under"], a["n_high"]),
+               fmt.rate(a["k_crit"], a["n_esi1"]), fmt.pct(a["overtriage"])]
+        f = v.get("fit_population")
+        if f is not None:
+            row += [fmt.num(f["qwk"]), fmt.rate(f["k_under"], f["n_high"])]
+        rows.append(row)
+    header = ["reguła", "ocena na VAL", "QWK", "niedotriażowanie", "kryt. pominięcie", "przetriażowanie"]
+    if fitted.mask is not None:
+        header += ["QWK (vc)", "niedotriażowanie (vc)"]
+    hits = []
+    for rule in dopts.rules:
+        v = dec["val"][rule]
+        if rule not in rs.FITTED_RULES or not v["kind"].startswith("cross-fit"):
+            continue
+        u = (v.get("fit_population") or v["all"]).get("undertriage")
+        if u is not None:
+            hits.append(f"{RULE_LABELS[rule]} {fmt.pct(u)} ({fmt.pp(u - dopts.target)} względem T)")
+    where = "w populacji dopasowania" if fitted.mask is not None else "na całym VAL"
+    hit_text = ""
+    if hits:
+        hit_text = f"Niedotriażowanie z cross-fittingu {where}: " + "; ".join(hits) + ". "
+    elif any(r in rs.FITTED_RULES for r in dopts.rules):
+        hit_text = "Cross-fitting niemożliwy — trafienia w cel T na VAL nie oceniono. "
+    lines += [md_table(header, rows), "",
+              "Reguły dopasowywane (progi T, Bayes T) oceniono na VAL cross-fittingiem: parametry z jednej połowy "
+              "VAL, wynik na drugiej — to przybliża wynik na nowych danych. Na TEST trafiają parametry dopasowane "
+              f"na CAŁYM VAL. {hit_text}`--guarantee` przesuwa próg tak, by górna granica Clopper–Pearsona na "
+              "VAL była ≤ T.", ""]
+    return lines
+
+
 def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
     """report.md: tabele gotowe do wklejenia do pracy (po polsku)."""
     rules: list[str] = ctx["rules"]
+    shown: list[str] = ctx["shown_rules"]
+    main_rule: str = ctx["main_rule"]
     order: list[str] = ctx["order"]
     res_all: BootstrapSamples = ctx["res_all"]
     res_vc: BootstrapSamples | None = ctx["res_vc"]
@@ -774,9 +776,9 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
     lines: list[str] = [
         f"# Raport końcowy — zestaw `{recipe['feature_set']}` (TEST)",
         "",
-        "> **Zbiór TESTOWY — ocena jednorazowa.** Recepturę (modele, wagi, łączenie, temperaturę, regułę) "
-        "wybrano wcześniej na VAL. Raport generuje się raz, dla ostatecznej receptury; kolejne uruchomienia "
-        "z innymi recepturami i wybór najlepszej na teście zawyżają wyniki.",
+        "> **Zbiór TESTOWY — ocena jednorazowa.** Recepturę (modele, wagi, łączenie, temperaturę, regułę "
+        "decyzyjną i jej parametry) wybrano wcześniej na VAL. Raport generuje się raz, dla ostatecznej receptury; "
+        "kolejne uruchomienia z innymi recepturami i wybór najlepszej na teście zawyżają wyniki.",
         "",
     ]
     if recipe.get("samples"):
@@ -798,28 +800,25 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
         f"- wagi: {recipe['weights_mode']}; łączenie: `{recipe['method']}`"
         f" ({'średnia arytmetyczna' if recipe['method'] == 'mean' else 'średnia geometryczna'} prawdopodobieństw)",
         f"- temperatura połączenia (dopasowana na VAL): {t_text}",
-        f"- reguły decyzyjne: {', '.join(RULE_LABELS[r] for r in rules)}; reguła w pliku dla backendu: "
-        f"`{recipe['backend_rule']}`",
+        f"- reguły w raporcie: {', '.join(RULE_LABELS[r] for r in rules)}; reguła w pliku dla backendu: "
+        f"`{main_rule}`",
         f"- najlepszy pojedynczy model (najniższy log loss na VAL): **{recipe['best_single_model']}**",
         f"- dane: wersja `{recipe['data_version']}`, odcisk `{recipe['data_fingerprint']}`, "
         f"podział `{recipe.get('split_strategy') or '?'}`",
         "",
-        "Wynik połączenia na VAL (punkt odniesienia — na tych danych dobrano recepturę):",
+        "Jakość prawdopodobieństw połączenia na VAL (punkt odniesienia — na tych danych dobrano recepturę): "
+        f"log loss {fmt.num(ctx['val_summary']['log_loss'])}, ECE {fmt.num(ctx['val_summary']['ece'])}.",
         "",
     ]
     val = ctx["val_summary"]
-    val_rows = []
-    for rule in rules:
-        m = val["metrics"][rule]
-        val_rows.append([RULE_LABELS[rule], fmt.num(m["quadratic_weighted_kappa"]), fmt.pct(m["undertriage_rate"]),
-                         fmt.num(m["log_loss"]), fmt.num(m["ece"])])
-    lines += [md_table(["reguła", "QWK", "niedotriażowanie", "log loss", "ECE"], val_rows), ""]
     if val.get("crossfit") is not None:
         cf = val["crossfit"]
         lines += [f"Temperatura oceniona uczciwie na VAL (2 foldy: T dopasowana na jednym, oceniana na drugim; "
                   f"T foldów {', '.join(fmt.num(t, 3) for t in cf['temperatures'])}): log loss "
                   f"{fmt.num(cf['raw']['log_loss'])} → {fmt.num(cf['calibrated']['log_loss'])}, ECE "
                   f"{fmt.num(cf['raw']['ece_top_label'])} → {fmt.num(cf['calibrated']['ece_top_label'])}.", ""]
+    lines += render_recipe_decision(ctx, fmt)
+    lines += rs.render_tradeoff(ctx["tradeoff"], fmt, ctx["dopts"])
 
     # --- Dane ---
     counts = data["esi_counts"]
@@ -827,10 +826,9 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
         "## Zbiór testowy",
         "",
         md_table(["", "n", *[f"ESI {k}" for k in range(1, N_CLASSES + 1)]],
-                 [["cała populacja", f"{data['n']:,}".replace(",", " "),
-                   *[f"{c:,}".replace(",", " ") for c in counts["all"]]]]
-                 + ([["podgrupa vc", f"{data['n_vc']:,}".replace(",", " "),
-                      *[f"{c:,}".replace(",", " ") for c in counts["vc"]]]] if counts.get("vc") else [])),
+                 [["cała populacja", _int(data["n"]), *[_int(c) for c in counts["all"]]]]
+                 + ([["podgrupa vc", _int(data["n_vc"]), *[_int(c) for c in counts["vc"]]]]
+                    if counts.get("vc") else [])),
         "",
         "*vc* = pacjenci z kompletem tętna, ciśnienia skurczowego i częstości oddechów przy triażu "
         "(`vitals_complete == 1`) — populacja jak w TOPSOR, gdzie pomiar jest obowiązkowy.",
@@ -840,7 +838,8 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
         f"- **`0.712 [0.701; 0.723]`** — wartość na całym zbiorze testowym i {conf}% przedział ufności "
         f"(bootstrap percentylowy: {n_boot} losowań pacjentów ze zwracaniem, osobno w każdej klasie ESI, "
         f"więc rzadkie ESI 1 jest w każdym losowaniu). Przedział pokazuje, o ile wynik mógłby się różnić na "
-        f"innej próbce pacjentów z tej samej populacji; nie obejmuje zmienności samego treningu.",
+        f"innej próbce pacjentów z tej samej populacji; nie obejmuje zmienności samego treningu (tę mierzy "
+        f"analiza seedów, sekcja 13).",
         "- Odsetki pacjentów (trafność, niedotriażowanie, czułość…) w procentach, z **dokładnym przedziałem "
         "Clopper–Pearsona** z liczebności, a nie z bootstrapu. Przy rzadkich zdarzeniach bootstrap daje "
         "przedział za wąski (0 zdarzeń → [0; 0]); Clopper–Pearson przy 0/38 daje [0; 9,3%]. Przy metrykach "
@@ -848,73 +847,88 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
         "QWK, AUC, log loss, Brier, ECE i koszt jako liczby (bootstrap). ↑ — im więcej, tym lepiej; "
         "↓ — im mniej, tym lepiej.",
         "- **Porównanie modeli**: nakładające się przedziały w tabeli 2 NIE oznaczają braku różnicy. "
-        "O różnicy rozstrzyga tabela 3 (sparowany bootstrap: oba modele na tych samych losowaniach).",
+        "O różnicy rozstrzyga tabela 3 (sparowany bootstrap: oba modele na tych samych losowaniach), "
+        "a o „wyższości” — reguła C1 (przedział bez zera, |Δ| większa od minimalnej istotnej różnicy "
+        "i od 2 × SD seedów).",
         "- **ECE** (expected calibration error) — średnia różnica między deklarowaną pewnością modelu "
         "a jego faktyczną trafnością (0 = idealnie; 0,05 = model myli się średnio o 5 punktów procentowych "
         "w ocenie własnej pewności). **T** (temperatura) — jeden parametr dopasowany na VAL: T > 1 "
         "„uspokaja” zbyt pewny model, T < 1 go wyostrza; nie zmienia najbardziej prawdopodobnego poziomu, "
-        "zmienia decyzje reguły kosztowej. ECE z binów jest zawyżone przez szum: nawet idealnie skalibrowany "
+        "zmienia decyzje pozostałych reguł. ECE z binów jest zawyżone przez szum: nawet idealnie skalibrowany "
         "model ma ECE > 0 (tym większe, im mniejsza grupa), więc jego przedział nie zawiera 0. Punktem "
         "odniesienia jest wiersz „ECE idealnie skalibrowanego modelu” w sekcji 4; ECE modeli porównuj "
         "parami na tych samych pacjentach.",
-        "- **Reguły**: *argmax* — najbardziej prawdopodobny poziom; *koszt* — poziom o najmniejszym "
-        "oczekiwanym koszcie (niedotriażowanie 3× droższe, koszt rośnie z kwadratem odległości).",
+        "- **Reguły decyzyjne** (te same prawdopodobieństwa, różne decyzje): *argmax* — najbardziej "
+        "prawdopodobny poziom; *koszt* — najmniejszy oczekiwany koszt (niedotriażowanie 3× droższe, koszt "
+        "rośnie z kwadratem odległości); *progi T* — oczekiwany poziom E[ESI] dzielony 4 progami: próg "
+        "ESI 2/3 ustawiony tak, by niedotriażowanie na VAL wynosiło T, pozostałe maksymalizują QWK, "
+        "opcjonalnie z siatką bezpieczeństwa (P(ESI 1)+P(ESI 2) ≥ q → najwyżej ESI 3); *Bayes T* — decyzja "
+        "minimalizująca stratę (p − t)² + λ·[ESI 1–2 → ESI 3–5], λ dobrane do celu T. Metrykę główną "
+        "czytaj jako **QWK przy zadanym niedotriażowaniu**; oczekiwany koszt liczony macierzą k = 3 faworyzuje "
+        "regułę kosztową z definicji.",
         "- ESI 1 jest rzadkie — przedziały czułości ESI 1 i krytycznych pominięć są szerokie (nawet przy "
         "0 zdarzeń górna granica jest > 0); „—” oznacza metrykę nieokreśloną (np. brak ESI 1 w podgrupie).",
         "",
     ]
 
     # --- 1. Tabela główna ---
-    header = ["metryka"]
-    cols: list[tuple[BootstrapSamples, str]] = []
-    for res, prefix in ((res_all, "cała populacja"), (res_vc, "vc")):
-        if res is None:
-            continue
-        for rule in rules:
-            header.append(f"{prefix}, {RULE_LABELS[rule]}")
-            cols.append((res, rule))
-    rows = []
-    for metric in DEFAULT_CI_METRICS:
-        cells = []
-        for res, rule in cols:
-            cells.append(fmt.ci(metric, _ci_lookup(res, BLEND, rule).get(metric)))
-        rows.append([METRIC_LABELS.get(metric, metric), *cells])
-    lines += [f"## 1. Wynik końcowy: {BLEND} na TEST ({conf}% CI)", "", md_table(header, rows), "",
-              "Metryki prawdopodobieństw (AUC, log loss, Brier, ECE) nie zależą od reguły decyzyjnej.", ""]
-
-    # --- 2. Połączenie vs modele ---
-    lines += [f"## 2. Połączenie i pojedyncze modele na TEST ({conf}% CI)", "",
-              "Każdy pojedynczy model z własną temperaturą dopasowaną na VAL (ta sama obróbka co połączenie)."
-              if recipe["temperature"] is not None else "Prawdopodobieństwa bez temperatury.", ""]
+    lines += [f"## 1. Wynik końcowy: {BLEND} na TEST ({conf}% CI)", ""]
     for res, title in ((res_all, "cała populacja"), (res_vc, "podgrupa vc")):
         if res is None:
             continue
-        for rule in rules:
+        header = ["metryka", *[RULE_LABELS[r] + (" (główna)" if r == main_rule else "") for r in rules]]
+        rows = []
+        for metric in DEFAULT_CI_METRICS:
+            if metric in rs.PROBA_METRICS and len(rules) > 1:
+                continue
+            rows.append([METRIC_LABELS.get(metric, metric),
+                         *[fmt.ci(metric, _ci_lookup(res, BLEND, rule).get(metric)) for rule in rules]])
+        lines += [f"### 1.{1 if res is res_all else 2}. {title.capitalize()}", "", md_table(header, rows), ""]
+        if len(rules) > 1:
+            ci = _ci_lookup(res, BLEND, rules[0])
+            proba_text = "; ".join(f"{SHORT_LABELS.get(m, m)} {fmt.ci(m, ci.get(m))}" for m in COMPARE_PROBA_METRICS)
+            lines += [f"Metryki prawdopodobieństw (nie zależą od reguły): {proba_text}.", ""]
+
+    # --- 2. Połączenie vs modele ---
+    lines += [f"## 2. Połączenie i pojedyncze modele na TEST ({conf}% CI)", "",
+              "Każdy pojedynczy model z własną temperaturą i własnymi regułami dopasowanymi na VAL (ta sama "
+              "obróbka co połączenie)." if recipe["temperature"] is not None else
+              "Prawdopodobieństwa bez temperatury; reguły każdego modelu dopasowane na jego VAL.",
+              "Tabele dla reguły głównej i argmax; pozostałe reguły: `tables/ci_all_models.csv`.", ""]
+    sub = 0
+    for res, title in ((res_all, "cała populacja"), (res_vc, "podgrupa vc")):
+        if res is None:
+            continue
+        for rule in shown:
             rows = []
             for name in order:
                 ci = _ci_lookup(res, name, rule)
                 label = f"**{name}**" if name == BLEND else name
                 rows.append([label, *[fmt.ci(m, ci.get(m)) for m in COMPARE_DECISION_METRICS]])
-            lines += [f"### 2.{len([1 for line in lines if line.startswith('### 2.')]) + 1}. {title}, reguła "
-                      f"{RULE_LABELS[rule]}", "",
+            sub += 1
+            lines += [f"### 2.{sub}. {title}, reguła {RULE_LABELS[rule]}", "",
                       md_table(["model", *[SHORT_LABELS[m] for m in COMPARE_DECISION_METRICS]], rows), ""]
         rows = []
         for name in order:
             ci = _ci_lookup(res, name, rules[0])
             label = f"**{name}**" if name == BLEND else name
             rows.append([label, *[fmt.ci(m, ci.get(m)) for m in COMPARE_PROBA_METRICS]])
-        lines += [f"### 2.{len([1 for line in lines if line.startswith('### 2.')]) + 1}. {title}, jakość "
-                  f"prawdopodobieństw", "",
+        sub += 1
+        lines += [f"### 2.{sub}. {title}, jakość prawdopodobieństw", "",
                   md_table(["model", *[SHORT_LABELS[m] for m in COMPARE_PROBA_METRICS]], rows), ""]
 
     # --- 3. Sparowane różnice ---
     best = recipe["best_single_model"]
+    sup = ctx["superiority"]
     lines += [
         f"## 3. Czy połączenie jest lepsze od najlepszego pojedynczego modelu ({best})?",
         "",
         f"Sparowany bootstrap ({n_boot} losowań; w każdym oba modele na tych samych pacjentach). "
         f"Δ = {BLEND} − {best}. Dla QWK dodatnia Δ = połączenie lepsze; dla niedotriażowania i log loss "
-        f"UJEMNA Δ = połączenie lepsze. Przedział bez zera = różnica istotna (p < {res_all.alpha:g}).",
+        f"UJEMNA Δ = połączenie lepsze. Przedział bez zera = różnica istotna (p < {res_all.alpha:g}). "
+        f"Kolumna **wyższość (C1)**: „TAK — <zwycięzca>” tylko, gdy przedział wyklucza 0, |Δ| > minimalna "
+        f"istotna różnica (QWK 0,01; niedotriażowanie 1 pp; log loss 0,005) i |Δ| > 2 × SD seedów "
+        f"(SD: {sup['source']}); zwycięzca wynika z kierunku metryki (może nim być {best}, nie połączenie).",
         "",
     ]
     rows = []
@@ -924,12 +938,14 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
         for rec in table.to_dict(orient="records"):
             rule = "—" if rec["rule"] == "*" else RULE_LABELS[rec["rule"]]
             verdict = {"A": f"lepsze: {BLEND}", "B": f"lepszy: {best}"}.get(rec["better"], rec["better"])
+            key = f"{group}|{rec['rule']}|{rec['metric']}"
             rows.append([group, SHORT_LABELS.get(rec["metric"], rec["metric"]), rule,
                          fmt.ci(rec["metric"], {"value": rec["value_a"], "ci_low": None, "ci_high": None}),
                          fmt.ci(rec["metric"], {"value": rec["value_b"], "ci_low": None, "ci_high": None}),
                          fmt.delta(rec["metric"], rec["delta"], rec["ci_low"], rec["ci_high"]),
-                         fmt.p(rec["p_two_sided"]), verdict])
-    lines += [md_table(["populacja", "metryka", "reguła", BLEND, best, f"Δ [{conf}% CI]", "p", "wniosek"], rows),
+                         fmt.p(rec["p_two_sided"]), verdict, fmt._dc(sup["verdicts"].get(key, "—"))])
+    lines += [md_table(["populacja", "metryka", "reguła", BLEND, best, f"Δ [{conf}% CI]", "p", "wniosek",
+                        "wyższość (C1)"], rows),
               "", "pp = punkty procentowe. Pełne porównania z każdym modelem: `metrics.json` → "
               "`test.paired_all`.", ""]
 
@@ -970,17 +986,17 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
             for name, v in cal["per_model"].items()]
     lines += ["Modele (TEST): temperatura z VAL i ECE top-label przed / po:", "",
               md_table(["model", "T", "ECE przed", "ECE po"], rows), "",
-              "Wykres: `figures/reliability_test_blend.png` (punkty poniżej przekątnej = model zbyt pewny siebie).",
-              ""]
+              "Wykres: `figures/reliability_test_blend.png` (punkty poniżej przekątnej = model zbyt pewny siebie). "
+              "Kalibracja per poziom ESI i oddział: sekcja 11.", ""]
 
     # --- 5. Macierze pomyłek ---
     lines += ["## 5. Macierze pomyłek połączenia (TEST, cała populacja)", "",
-              "Wiersze — prawdziwy poziom (ESI z triażu), kolumny — decyzja modelu.", ""]
-    for rule in rules:
+              "Wiersze — prawdziwy poziom (ESI z triażu), kolumny — decyzja modelu. Pozostałe reguły: "
+              "`metrics.json` → `test.confusion`.", ""]
+    for rule in shown:
         cm = np.asarray(ctx["confusion"]["all"][rule])
         names = [f"ESI {k}" for k in range(1, N_CLASSES + 1)]
-        rows = [[names[i], *[f"{int(v):,}".replace(",", " ") for v in cm[i]],
-                 f"{int(cm[i].sum()):,}".replace(",", " ")] for i in range(len(cm))]
+        rows = [[names[i], *[_int(v) for v in cm[i]], _int(cm[i].sum())] for i in range(len(cm))]
         lines += [f"Reguła {RULE_LABELS[rule]} — liczby:", "",
                   md_table(["prawda \\ decyzja", *names, "razem"], rows), ""]
         row_pct = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
@@ -992,23 +1008,25 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
     sites = ctx["sites"]
     if sites:
         lines += ["## 6. Połączenie na oddziałach (TEST)", ""]
-        for rule in rules:
+        for rule in shown:
             rows = []
             for site, info in sites.items():
                 ci = info["ci"][rule]
-                rows.append([site, f"{info['n']:,}".replace(",", " "), str(info["n_esi1"]),
+                rows.append([site, _int(info["n"]), str(info["n_esi1"]),
                              *[fmt.ci(m, ci.get(m)) for m in SITE_METRICS]])
             lines += [f"Reguła {RULE_LABELS[rule]}:", "",
                       md_table(["oddział", "n", "ESI 1", *[SHORT_LABELS[m] for m in SITE_METRICS]], rows), ""]
-        lines += ["Oddział z kilkoma wizytami ESI 1 ma bardzo szerokie przedziały metryk ESI 1.", ""]
+        lines += ["Oddział z kilkoma wizytami ESI 1 ma bardzo szerokie przedziały metryk ESI 1. Reguła dopasowana "
+                  "na VAL wszystkich oddziałów — różnice między oddziałami to w dużej mierze inny rozkład ESI "
+                  "(sekcje 11 i 13.2).", ""]
 
     # --- 7. Przyjęcia ---
     adm = ctx["admission"]
-    lines += ["## 7. Trafność względem przyjęcia do szpitala (TEST)", ""]
+    lines += ["## 7. Trafność względem przyjęcia do szpitala: model a pielęgniarka (TEST)", ""]
     if adm.get("auc") is None:
         lines += [f"Pominięte: {adm.get('reason', 'brak danych o przyjęciach')}.", ""]
     else:
-        lines += [f"Źródło: {adm['source']}; n = {adm['n']:,}".replace(",", " ")
+        lines += [f"Źródło: {adm['source']}; n = {_int(adm['n'])}"
                   + f", przyjętych {fmt.pct(adm['admission_rate'])}. Przyjęcie to niezależny od etykiety "
                   f"wskaźnik ciężkości stanu: dobry poziom pilności powinien je przewidywać. AUC: "
                   f"wyższy wynik pilności = większe prawdopodobieństwo przyjęcia.", ""]
@@ -1023,26 +1041,63 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
                   "Odsetek przyjętych według poziomu (ESI z triażu vs decyzja połączenia):", ""]
         by_level = adm["by_level"]
         header = list(by_level[0])
-        rows = [[(fmt.pct(v) if k.startswith("przyjęci") else (f"{v:,}".replace(",", " ") if isinstance(v, int)
-                                                               else str(v))) for k, v in r.items()]
-                for r in by_level]
+        rows = [[(fmt.pct(v) if k.startswith("przyjęci") else (_int(v) if isinstance(v, int) else str(v)))
+                 for k, v in r.items()] for r in by_level]
         lines += [md_table(header, rows), ""]
+        lines += rs.render_admission_extra(ctx.get("admission_subgroups"), ctx.get("discordance"), fmt,
+                                           main_rule, conf)
+
+    # --- 8–13. Sekcje dodatkowe ---
+    lines += rs.render_subgroups(ctx["subgroups"], fmt, main_rule, conf, ctx.get("attributes_source"),
+                                 population=ctx["fitted_blend"].population)
+    errors = ctx["errors"]
+    if errors.get("skipped"):
+        lines += ["## 9. Analiza błędów", "", f"Pominięte: {errors['skipped']}.", ""]
+    else:
+        lines += rs.render_errors(errors, fmt, main_rule)
+    dca_label, dca_adm = ctx["dca_label"], ctx["dca_admission"]
+    if dca_label.get("skipped"):
+        lines += ["## 10. Krzywe decyzyjne", "", f"Pominięte: {dca_label['skipped']}.", ""]
+    else:
+        lines += rs.render_dca(dca_label, dca_adm, fmt, main_rule, conf)
+    cal_groups = ctx["calibration_groups"]
+    if cal_groups.get("skipped"):
+        lines += ["## 11. Kalibracja według poziomu ESI i oddziału", "", f"Pominięte: {cal_groups['skipped']}.", ""]
+    else:
+        lines += rs.render_calibration_groups(cal_groups, fmt)
+    deferral, conformal = ctx["deferral"], ctx["conformal"]
+    if deferral.get("skipped") or conformal.get("skipped"):
+        reason = deferral.get("skipped") or conformal.get("skipped")
+        lines += ["## 12. Odsyłanie niepewnych przypadków i zbiory conformal", "", f"Pominięte: {reason}.", ""]
+    else:
+        lines += rs.render_deferral(deferral, conformal, fmt, main_rule)
+    lines += rs.render_analyses(ctx["analyses"], fmt, ctx["dopts"], ctx.get("analysis_figures"))
 
     # --- Pliki ---
     lines += [
         "## Pliki",
         "",
-        "- `metrics.json` — wszystkie liczby (także przedziały dla każdego modelu i podgrupy, porównania "
-        "parami z każdym modelem, kalibracja na VAL i TEST, metryki per oddział),",
-        "- `recipe.json` — receptura i runy (do odtworzenia),",
-        "- `backend_ensemble_weights.json` — wagi, metoda, temperatura i reguła w formacie backendu "
-        "(skopiuj jako `backend/models/ensemble_weights.json`),",
-        "- `tables/*.csv` — tabele 1–3 i 6–7 do arkusza / LaTeX-a,",
+        "- `metrics.json` — wszystkie liczby (także przedziały dla każdego modelu, reguły i podgrupy, porównania "
+        "parami z każdym modelem, kalibracja na VAL i TEST, metryki per oddział, sekcje 8–13),",
+        "- `recipe.json` — receptura i runy (do odtworzenia), w tym dopasowane reguły decyzyjne (`decision`),",
+        "- `backend_ensemble_weights.json` — wagi, metoda, temperatura i reguła główna z parametrami w formacie "
+        "backendu (skopiuj jako `backend/models/ensemble_weights.json`),",
+        "- `tables/*.csv` — tabele do arkusza / LaTeX-a (m.in. `ci_all_models.csv`, `subgroups.csv`, "
+        "`tradeoff_val.csv`, `dca_*.csv`, `calibration_*.csv`, `deferral.csv`, `conformal.csv`),",
     ]
     if ctx["figures"]:
         lines += ["- `figures/`: " + ", ".join(f"`{f}`" for f in ctx["figures"]) + "."]
-    lines += ["", f"Wygenerowano {recipe['created_at']} (bootstrap {n_boot}×, ziarno {res_all.seed}).", ""]
+    lines += ["", "Lista kontrolna TRIPOD+AI i porównanie z literaturą: `docs/TRIPOD_AI.md`, `docs/LITERATURA.md`.",
+              "", f"Wygenerowano {recipe['created_at']} (bootstrap {n_boot}×, ziarno {res_all.seed}).", ""]
     return "\n".join(lines)
+
+
+def _frame(records: Any) -> pd.DataFrame | None:
+    if isinstance(records, pd.DataFrame):
+        return records
+    if isinstance(records, list) and records:
+        return pd.DataFrame([{k: v for k, v in r.items() if not isinstance(v, np.ndarray)} for r in records])
+    return None
 
 
 def write_tables(table_dir: Path, ctx: dict[str, Any]) -> list[str]:
@@ -1061,7 +1116,7 @@ def write_tables(table_dir: Path, ctx: dict[str, Any]) -> list[str]:
                 df.insert(0, "population", group)
                 df.insert(0, "model", name)
                 frames.append(df)
-    tables = {"ci_all_models.csv": pd.concat(frames, ignore_index=True)}
+    tables: dict[str, pd.DataFrame | None] = {"ci_all_models.csv": pd.concat(frames, ignore_index=True)}
     paired = [t.assign(population=g) for g, t in ctx["paired"].items() if t is not None]
     if paired:
         tables["paired_blend_vs_best.csv"] = pd.concat(paired, ignore_index=True)
@@ -1075,7 +1130,39 @@ def write_tables(table_dir: Path, ctx: dict[str, Any]) -> list[str]:
         tables["sites_blend.csv"] = pd.DataFrame(rows)
     if ctx["admission"].get("auc") is not None:
         tables["admission_auc.csv"] = ctx["admission"]["auc"]
+    tables["tradeoff_val.csv"] = ctx["tradeoff"].get("table")
+    tables["subgroups.csv"] = _frame(ctx["subgroups"].get("rows"))
+    tables["admission_subgroups.csv"] = _frame((ctx.get("admission_subgroups") or {}).get("rows"))
+    tables["admission_discordance.csv"] = _frame(ctx.get("discordance"))
+    errors = ctx["errors"]
+    tables["errors_pairs.csv"] = _frame(errors.get("pairs"))
+    tables["errors_complaints.csv"] = _frame(errors.get("complaints"))
+    dca = ctx["dca_label"]
+    if "all" in dca:
+        frame = pd.DataFrame({"pt": dca["thresholds"]})
+        for pop in ("all", "vc"):
+            if pop in dca:
+                frame[f"model_{pop}"] = dca[pop]["model"]
+                frame[f"treat_all_{pop}"] = dca[pop]["treat_all"]
+                for rule, v in dca[pop]["rules"].items():
+                    frame[f"rule_{rule}_{pop}"] = v
+        tables["dca_label.csv"] = frame
+    adm = ctx["dca_admission"]
+    if "model" in adm:
+        frame = pd.DataFrame({"pt": adm["thresholds"], "model": adm["model"], "nurse_risk": adm["nurse_risk"],
+                              "nurse_rule_esi12": adm["nurse_rule"], "treat_all": adm["treat_all"]})
+        for rule, v in adm["rules"].items():
+            frame[f"rule_{rule}"] = v
+        tables["dca_admission.csv"] = frame
+        tables["dca_admission_delta.csv"] = _frame(adm.get("delta_vs_nurse_rule"))
+    cal = ctx["calibration_groups"]
+    tables["calibration_classes.csv"] = _frame(cal.get("classes"))
+    tables["calibration_esi12.csv"] = _frame(cal.get("esi12"))
+    tables["deferral.csv"] = _frame(ctx["deferral"].get("rows"))
+    tables["conformal.csv"] = _frame(ctx["conformal"].get("rows"))
     for name, df in tables.items():
+        if df is None or df.empty:
+            continue
         write_text_atomic(table_dir / name, df.to_csv(index=False))
         written.append(name)
     return written
@@ -1104,10 +1191,14 @@ def main(argv: list[str] | None = None) -> int:
         log.error("ODMOWA: różne zestawy modeli w val i test")
         return EXIT_REFUSED
     log.info("Runy: " + ", ".join(r.name for r in runs))
-    rules, backend_rule, method = opts.rules, opts.backend_rule, opts.method
+    rules, main_rule, method = opts.rules, opts.main_rule, opts.method
+    shown = shown_rules(rules, main_rule)
+    dopts = DecisionOptions(main_rule=main_rule, rules=rules, target=float(args.target_undertriage),
+                            guarantee=bool(args.guarantee), safety_net=bool(args.safety_net),
+                            population=args.fit_population)
     if opts.adopted:
         log.info(f"Z pliku wag ({args.weights}) przejęto: " + ", ".join(opts.adopted)
-                 + f" → metoda {method}, temperatura {opts.temperature_mode}, reguła backendu {backend_rule}")
+                 + f" → metoda {method}, temperatura {opts.temperature_mode}, reguła główna {main_rule}")
 
     out_dir = Path(args.out or (Path(config.RUNS_DIR) / f"final_report__{info['feature_set']}__"
                                                         f"{datetime.now():%Y%m%d_%H%M%S}"))
@@ -1118,7 +1209,7 @@ def main(argv: list[str] | None = None) -> int:
     except RecipeError as exc:
         log.error(f"ODMOWA: {exc}")
         return EXIT_REFUSED
-    digest = recipe_hash([r.name for r in runs], weights, opts)
+    digest = recipe_hash([r.name for r in runs], weights, opts, dopts)
     prior = previous_reports([r.name for r in runs], digest, out_dir, [Path(config.RUNS_DIR), out_dir.parent])
     warn_test_once(prior)
     p_val_raw = blend(val.probas, weights, method)
@@ -1146,16 +1237,38 @@ def main(argv: list[str] | None = None) -> int:
         p = split.probas[name]
         return apply_temperature(p, per_model_t[name]) if name in per_model_t else p
 
+    # Reguły decyzyjne: dopasowanie na VAL (połączenie i — ta sama obróbka — każdy model)
+    t_rules = time.perf_counter()
+    val_sets: dict[str, np.ndarray] = {BLEND: p_val}
+    if temperature is not None:
+        val_sets[BLEND_RAW] = p_val_raw
+    for n in names:
+        val_sets[n] = final(val, n)
+    try:
+        fitted: dict[str, FittedRules] = {k: rs.fit_rules(val.y, p, val.vc, dopts) for k, p in val_sets.items()}
+    except ValueError as exc:
+        log.error(f"ODMOWA: nie da się dopasować reguł decyzyjnych na VAL ({exc})")
+        return EXIT_REFUSED
+    fitted_blend = fitted[BLEND]
+    main_spec = fitted_blend.specs[main_rule]
+    if opts.file_rule_spec is not None and opts.file_rule_spec.get("rule") == main_rule and main_rule in rs.FITTED_RULES:
+        log.info(f"Parametry reguły dopasowane ponownie na VAL: {main_spec} (w pliku wag: {opts.file_rule_spec})")
+        if opts.file_rule_spec != main_spec:
+            log.warning("Parametry reguły z pliku wag różnią się od dopasowanych na VAL — plik pochodzi z innych "
+                        "runów / wag / celu T? Do backendu trafią parametry dopasowane teraz.")
     val_ll = {n: point_metrics(val.y, val.probas[n], ["log_loss"])["log_loss"] for n in names}
     best = min(val_ll, key=val_ll.get)
+    val_proba = point_metrics(val.y, p_val, ["log_loss", "ece"], n_bins=args.n_bins)
     val_summary = {
-        "metrics": {rule: point_metrics(val.y, p_val, rule=rule, n_bins=args.n_bins) for rule in rules},
+        "log_loss": val_proba["log_loss"], "ece": val_proba["ece"],
+        "rules": rs.val_rule_summary(val.y, p_val, fitted_blend, dopts, seed=args.seed),
         "single_log_loss": val_ll,
         "crossfit": crossfit,
     }
     log.info(f"Wagi ({weights_mode}): " + ", ".join(f"{n}={w:.3f}" for n, w in weights.items())
              + f"; metoda {method}; T = {temperature if temperature is None else round(temperature, 4)}; "
-               f"najlepszy pojedynczy (log loss VAL): {best}")
+               f"najlepszy pojedynczy (log loss VAL): {best}; reguła główna {main_rule}: {main_spec}")
+    timings["reguly_val_s"] = round(time.perf_counter() - t_rules, 2)
     timings["receptura_val_s"] = round(time.perf_counter() - t0, 2)
 
     # 3. TEST — raz
@@ -1167,25 +1280,55 @@ def main(argv: list[str] | None = None) -> int:
     for n in singles:
         candidates[n] = final(test, n)
     order = [BLEND, *singles]
-    log.info(f"TEST: bootstrap {args.bootstrap}× dla {len(candidates)} wariantów (cała populacja)…")
-    res_all = bootstrap_samples(test.y, candidates, rules, DEFAULT_CI_METRICS, n_boot=args.bootstrap,
-                                alpha=args.alpha, seed=args.seed, n_bins=args.n_bins)
+    decisions = {name: rs.predict_rules(p, fitted[name]) for name, p in candidates.items()}
+    decisions = {name: {r: d[r] for r in rules} for name, d in decisions.items()}
+    blend_dec = decisions[BLEND]
+    pred_main = blend_dec[main_rule]
+    log.info(f"TEST: bootstrap {args.bootstrap}× dla {len(candidates)} wariantów × {len(rules)} reguł "
+             f"(cała populacja)…")
+    res_all = rs.bootstrap_decisions(test.y, candidates, decisions, DEFAULT_CI_METRICS, n_boot=args.bootstrap,
+                                     alpha=args.alpha, seed=args.seed, n_bins=args.n_bins)
     res_vc = None
     if test.vc is not None and test.vc.any():
         log.info(f"TEST: bootstrap {args.bootstrap}× — podgrupa vc ({int(test.vc.sum()):,} wierszy)…")
-        res_vc = bootstrap_samples(test.y[test.vc], {k: v[test.vc] for k, v in candidates.items()}, rules,
-                                   DEFAULT_CI_METRICS, n_boot=args.bootstrap, alpha=args.alpha, seed=args.seed,
-                                   n_bins=args.n_bins)
+        res_vc = rs.bootstrap_decisions(
+            test.y[test.vc], {k: v[test.vc] for k, v in candidates.items()},
+            {k: {r: p[test.vc] for r, p in d.items()} for k, d in decisions.items()},
+            DEFAULT_CI_METRICS, n_boot=args.bootstrap, alpha=args.alpha, seed=args.seed, n_bins=args.n_bins)
     timings["bootstrap_test_s"] = round(time.perf_counter() - t1, 2)
 
-    paired = {"cała populacja": res_all.paired(BLEND, best, PAIRED_METRICS, rules),
-              "vc": res_vc.paired(BLEND, best, PAIRED_METRICS, rules) if res_vc is not None else None}
+    paired = {"cała populacja": res_all.paired(BLEND, best, PAIRED_METRICS, shown),
+              "vc": res_vc.paired(BLEND, best, PAIRED_METRICS, shown) if res_vc is not None else None}
     paired_all = {
         group: {n: res.paired(BLEND, n, None, rules) for n in singles}
         for group, res in (("all", res_all), ("vc", res_vc)) if res is not None
     }
     calibration_paired = (res_all.paired(BLEND, BLEND_RAW, CALIBRATION_PAIRED_METRICS, rules[:1])
                           if temperature is not None else None)
+
+    # Analizy runs/analyses (C1, C3, C9) i reguła wyższości C1 dla sekcji 3
+    # tylko analizy z tych samych danych i tych samych runów co raport (inne → pominięte z notą)
+    analyses = rs.load_analyses(info["feature_set"], args.tag or info.get("tag"),
+                                fingerprint=info["data_fingerprint"], run_names={r.model: r.name for r in runs})
+    seeds = analyses.get("seeds") if not (analyses.get("seeds") or {}).get("skipped") else None
+    members = [best]                       # SD seedów porównywanego modelu (połączenie nie ma refitów)
+    verdicts: dict[str, str] = {}
+    sds: dict[str, float | None] = {}
+    for group, table in paired.items():
+        if table is None:
+            continue
+        population = "vc" if group == "vc" else "all"
+        for rec in table.to_dict(orient="records"):
+            rule = main_rule if rec["rule"] == "*" else rec["rule"]
+            sd = rs.seed_sd(seeds, members, rec["metric"], rule, population=population)
+            key = f"{group}|{rec['rule']}|{rec['metric']}"
+            sds[key] = sd
+            verdicts[key] = rs.superiority(rec["metric"], rec["delta"], rec["ci_low"], rec["ci_high"], sd,
+                                           name_a=BLEND, name_b=best)
+    superiority = {"verdicts": verdicts, "seed_sd": sds, "mid": rs.MINIMAL_IMPORTANT_DIFFERENCE,
+                   "sd_factor": rs.SEED_SD_FACTOR, "models": members,
+                   "source": (f"refity modelu {best} z innymi seedami, TEST" if seeds is not None
+                              else "brak wyników seedów — `run_all.py --stage analyses`")}
 
     # Oddziały (połączenie)
     t2 = time.perf_counter()
@@ -1195,12 +1338,13 @@ def main(argv: list[str] | None = None) -> int:
         for site in sorted(pd.unique(site_values[~pd.isna(site_values)])):
             mask = site_values == site
             y_s = test.y[mask]
-            res_s = bootstrap_samples(y_s, {BLEND: p_test[mask]}, rules, SITE_METRICS, n_boot=args.bootstrap,
-                                      alpha=args.alpha, seed=args.seed)
+            res_s = rs.bootstrap_decisions(y_s, {BLEND: p_test[mask]}, {BLEND: {r: blend_dec[r][mask] for r in rules}},
+                                           SITE_METRICS, n_boot=args.bootstrap, alpha=args.alpha, seed=args.seed)
             sites[str(site)] = {
                 "n": int(mask.sum()), "n_esi1": int((y_s == 0).sum()),
                 "ci": {rule: ci_to_dict(res_s.ci(BLEND, rule)) for rule in rules},
-                "single_models": {n: {rule: point_metrics(y_s, candidates[n][mask], SITE_METRICS, rule)
+                "single_models": {n: {rule: rs.decision_point_metrics(y_s, candidates[n][mask],
+                                                                      decisions[n][rule][mask], SITE_METRICS)
                                       for rule in rules} for n in singles},
             }
     timings["oddzialy_s"] = round(time.perf_counter() - t2, 2)
@@ -1227,35 +1371,103 @@ def main(argv: list[str] | None = None) -> int:
     from sklearn.metrics import confusion_matrix
 
     labels = list(range(N_CLASSES))
-    confusion = {"all": {rule: confusion_matrix(test.y, decide(p_test, rule), labels=labels).tolist()
-                         for rule in rules}}
+    confusion = {"all": {rule: confusion_matrix(test.y, blend_dec[rule], labels=labels).tolist() for rule in rules}}
     if res_vc is not None:
-        confusion["vc"] = {rule: confusion_matrix(test.y[test.vc], decide(p_test[test.vc], rule),
-                                                  labels=labels).tolist() for rule in rules}
+        confusion["vc"] = {rule: confusion_matrix(test.y[test.vc], blend_dec[rule][test.vc], labels=labels).tolist()
+                           for rule in rules}
 
-    # Przyjęcia
+    # Przyjęcia (C4)
     t3 = time.perf_counter()
-    admitted, source = admission_labels(test.meta, "test", info["data_fingerprint"])
+    esi_test = rs.nurse_esi(test.meta)
+    admitted, source = rs.admission_labels(test.meta, "test", info["data_fingerprint"])
     admission: dict[str, Any] = {"auc": None, "source": source}
-    if admitted is None or np.isfinite(admitted).sum() == 0 or len(np.unique(admitted[np.isfinite(admitted)])) < 2:
+    has_admissions = rs.usable_admissions(admitted)
+    if not has_admissions:
         admission["reason"] = source if admitted is None else "kolumna `admitted` bez obu wartości"
         log.info(f"Trafność względem przyjęć pominięta: {admission['reason']}")
     else:
-        admission.update(admission_section(admitted, test.meta, p_test, rules, args.bootstrap, args.alpha,
-                                           args.seed))
+        admission.update(rs.admission_section(admitted, esi_test, p_test, {r: blend_dec[r] for r in shown},
+                                              args.bootstrap, args.alpha, args.seed, blend_label=BLEND))
     timings["przyjecia_s"] = round(time.perf_counter() - t3, 2)
 
-    # 4. Zapis
+    # Sekcje dodatkowe (każda pomijana z notą, gdy brak danych)
     out_dir = Path(out_dir)
     fig_dir = out_dir / "figures"
     out_dir.mkdir(parents=True, exist_ok=True)
+    plots = not args.no_plots
+
+    def fig(name: str) -> Path | None:
+        return fig_dir / name if plots else None
+
+    tradeoff = run_section("kompromis_val", timings, lambda: rs.tradeoff_section(
+        val.y, p_val, fitted_blend.mask, fitted_blend.population, dopts, fig("tradeoff_val.png"), args.seed))
+    try:
+        pred_frame = runs[0].predictions("test").set_index("row_id")
+    except (OSError, KeyError, ValueError):
+        pred_frame = None
+    attrs, attrs_source = rs.load_attributes(test.meta, "test", info["data_fingerprint"], pred_frame)
+    if attrs is None:
+        log.info(f"Atrybuty pacjentów (płeć, wiek, przybycie, dolegliwości): {attrs_source}")
+    groups = rs.subgroup_masks(test.meta, attrs)
+    adm_or_none = admitted if has_admissions else None
+    subgroups = run_section("podgrupy", timings, lambda: rs.subgroup_section(
+        test.y, p_test, pred_main, groups, esi=esi_test, admitted=adm_or_none,
+        pred_argmax=blend_dec.get("argmax"), n_boot=args.bootstrap, alpha=args.alpha, seed=args.seed))
+    admission_subgroups = discordance = None
+    if has_admissions:
+        admission_subgroups = run_section("przyjecia_podgrupy", timings, lambda: rs.admission_subgroups(
+            admitted, esi_test, p_test, groups, args.bootstrap, args.alpha, args.seed))
+        discordance = rs.discordance_table(admitted, esi_test, pred_main)
+    errors = run_section("bledy", timings, lambda: rs.error_analysis(test.y, pred_main, attrs, adm_or_none))
+    dca_label = run_section("dca_etykieta", timings, lambda: rs.dca_label_section(
+        test.y, p_test, test.vc, {r: blend_dec[r] for r in shown}, fig("dca_esi12_test.png")))
+    if has_admissions:
+        adm_val, _ = rs.admission_labels(val.meta, "val", info["data_fingerprint"])
+        dca_admission = run_section("dca_przyjecia", timings, lambda: rs.dca_admission_section(
+            adm_val, expected_level(p_val), rs.nurse_esi(val.meta), admitted, expected_level(p_test), esi_test,
+            {r: blend_dec[r] for r in shown}, args.bootstrap, args.alpha, args.seed, fig("dca_admission_test.png")))
+    else:
+        dca_admission = {"skipped": admission.get("reason", "brak danych o przyjęciach")}
+    cal_sets = [("cała populacja", np.ones(len(test.y), dtype=bool))]
+    if test.vc is not None and test.vc.any():
+        cal_sets.append(("podgrupa vc", test.vc))
+    if "site" in test.meta.columns:
+        site_values = test.meta["site"].astype("string").to_numpy()
+        cal_sets += [(f"oddział {s}", site_values == s) for s in sorted(sites)]
+    calibration_groups = run_section("kalibracja_grupy", timings,
+                                     lambda: rs.calibration_groups(test.y, p_test, cal_sets, args.alpha))
+    deferral = run_section("odsylanie", timings, lambda: rs.deferral_section(
+        p_val, fitted_blend.mask, test.y, p_test, test.vc, pred_main, main_spec))
+    conformal = run_section("conformal", timings, lambda: rs.conformal_section(
+        val.y, p_val, test.y, p_test, test.vc))
+    analysis_figures: dict[str, str] = {}
+    lc = analyses.get("learning_curve") or {}
+    lc_plot = (lc.get("results") or {}).get("plot")
+    if plots and lc_plot and Path(lc_plot).exists():
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(lc_plot, fig_dir / "learning_curve.png")
+        analysis_figures["learning_curve"] = "learning_curve.png"
+
+    # 4. Zapis
     figures: list[str] = []
-    if not args.no_plots:
+    if plots:
         t4 = time.perf_counter()
-        figures = make_figures(fig_dir, test.y, test.vc, p_test_raw, p_test, temperature, rules, res_all, res_vc,
-                               order, args.n_bins)
+        figures = make_figures(fig_dir, test.y, test.vc, p_test_raw, p_test, temperature, shown, blend_dec, res_all,
+                               res_vc, order, args.n_bins)
+        for sec in (tradeoff, dca_label, dca_admission):
+            if isinstance(sec, dict) and sec.get("figure"):
+                figures.append(sec["figure"])
+        figures += list(analysis_figures.values())
         timings["wykresy_s"] = round(time.perf_counter() - t4, 2)
 
+    decision_record = {
+        "main_rule": main_rule, "rules": rules, "target_undertriage": dopts.target, "guarantee": dopts.guarantee,
+        "guarantee_alpha": config.DECISION_GUARANTEE_ALPHA, "safety_net": dopts.safety_net,
+        "fit_population_requested": dopts.population, "fit_population": fitted_blend.population,
+        "fit_population_note": fitted_blend.note, "main_spec": main_spec,
+        "blend": fitted_blend.to_dict(), "per_model": {k: v.specs for k, v in fitted.items() if k != BLEND},
+        "val": val_summary["rules"],
+    }
     recipe = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "feature_set": info["feature_set"],
@@ -1273,10 +1485,13 @@ def main(argv: list[str] | None = None) -> int:
         "temperature_mode": opts.temperature_mode,
         "options_from_weights_file": list(opts.adopted),
         "weights_file_temperature": opts.file_temperature,
+        "weights_file_rule": opts.file_rule_spec,
         "temperature": temperature,
         "per_model_temperature": per_model_t,
         "rules": rules,
-        "backend_rule": backend_rule,
+        "main_rule": main_rule,
+        "backend_rule": main_rule,
+        "decision": decision_record,
         "best_single_model": best,
         "best_single_by": "najniższy log loss na VAL",
         "bootstrap": {"n_boot": args.bootstrap, "alpha": args.alpha, "seed": args.seed, "stratified": True,
@@ -1295,21 +1510,28 @@ def main(argv: list[str] | None = None) -> int:
     data = {"n": int(len(test.y)), "n_vc": int(test.vc.sum()) if test.vc is not None else None,
             "esi_counts": counts}
 
-    ctx = {"rules": rules, "order": order, "res_all": res_all, "res_vc": res_vc, "recipe": recipe, "data": data,
-           "val_summary": val_summary, "paired": paired, "calibration": calibration,
-           "calibration_paired": calibration_paired, "confusion": confusion, "sites": sites,
-           "admission": admission, "figures": figures}
+    ctx = {"rules": rules, "shown_rules": shown, "main_rule": main_rule, "order": order, "res_all": res_all,
+           "res_vc": res_vc, "recipe": recipe, "data": data, "val_summary": val_summary, "paired": paired,
+           "calibration": calibration, "calibration_paired": calibration_paired, "confusion": confusion,
+           "sites": sites, "admission": admission, "figures": figures, "dopts": dopts, "fitted_blend": fitted_blend,
+           "decision": {"val": val_summary["rules"]}, "superiority": superiority, "tradeoff": tradeoff,
+           "subgroups": subgroups, "attributes_source": attrs_source, "admission_subgroups": admission_subgroups,
+           "discordance": discordance, "errors": errors, "dca_label": dca_label, "dca_admission": dca_admission,
+           "calibration_groups": calibration_groups, "deferral": deferral, "conformal": conformal,
+           "analyses": analyses, "analysis_figures": analysis_figures}
     tables = write_tables(out_dir / "tables", ctx)
-    write_text_atomic(out_dir / "report.md", build_report(ctx, Fmt(args.decimal_comma)))
+    write_text_atomic(out_dir / "report.md", build_report(ctx, Fmt(args.decimal_comma, args.alpha)))
     write_json_atomic(out_dir / "recipe.json", _jsonable(recipe))
     backend = {
         "weights": {n: round(w, 6) for n, w in weights.items() if w > 0},
         "method": method,
         "temperature": None if temperature is None else round(temperature, 6),
-        "rule": backend_rule,
+        **main_spec,
     }
-    write_json_atomic(out_dir / "backend_ensemble_weights.json", backend)
+    write_json_atomic(out_dir / "backend_ensemble_weights.json", _jsonable(backend))
     timings["razem_s"] = round(time.perf_counter() - t0, 2)
+    analyses_summary = {k: ({"skipped": v["skipped"]} if v.get("skipped") else {"path": v.get("path")})
+                        for k, v in analyses.items()}
     metrics = {
         "recipe": recipe,
         "data": data,
@@ -1319,12 +1541,25 @@ def main(argv: list[str] | None = None) -> int:
                    for group, res in (("all", res_all), ("vc", res_vc)) if res is not None},
             "paired_blend_vs_best": {g: t for g, t in paired.items() if t is not None},
             "paired_all": paired_all,
+            "superiority": superiority,
             "calibration_paired": calibration_paired,
             "calibration": calibration,
+            "calibration_groups": calibration_groups,
             "confusion": confusion,
             "sites": sites,
             "admission": admission,
+            "admission_subgroups": admission_subgroups,
+            "admission_discordance": discordance,
+            "subgroups": {k: v for k, v in subgroups.items() if k != "rows"} | {
+                "rows": [{k: v for k, v in r.items() if k != "mask"} for r in subgroups.get("rows", [])]},
+            "errors": errors,
+            "dca_label": dca_label,
+            "dca_admission": dca_admission,
+            "deferral": deferral,
+            "conformal": conformal,
         },
+        "val_tradeoff": tradeoff,
+        "analyses": analyses_summary,
         "files": {"figures": figures, "tables": tables},
         "timings": timings,
     }
@@ -1332,14 +1567,16 @@ def main(argv: list[str] | None = None) -> int:
     register_report({"created_at": recipe["created_at"], "out_dir": str(out_dir.absolute()),
                      "runs": sorted(r.name for r in runs), "feature_set": info["feature_set"],
                      "recipe_hash": digest, "weights": weights, "method": method,
-                     "temperature": temperature, "rules": rules, "backend_rule": backend_rule})
+                     "temperature": temperature, "rules": rules, "backend_rule": main_rule,
+                     "main_rule": main_rule, "main_spec": main_spec})
 
     # Podsumowanie na konsoli
     fmt = Fmt()
     print(f"\n=== Raport końcowy (TEST, n={len(test.y):,}) → {out_dir} ===")
     for rule in rules:
         ci = _ci_lookup(res_all, BLEND, rule)
-        print(f"{BLEND} [{RULE_LABELS[rule]}]: QWK {fmt.ci('quadratic_weighted_kappa', ci['quadratic_weighted_kappa'])}"
+        star = " *" if rule == main_rule else ""
+        print(f"{BLEND} [{RULE_LABELS[rule]}{star}]: QWK {fmt.ci('quadratic_weighted_kappa', ci['quadratic_weighted_kappa'])}"
               f" | niedotriażowanie {fmt.ci('undertriage_rate', ci['undertriage_rate'])}"
               f" | log loss {fmt.ci('log_loss', ci['log_loss'])}")
     table = paired["cała populacja"]
@@ -1347,10 +1584,18 @@ def main(argv: list[str] | None = None) -> int:
         rule = "" if rec["rule"] == "*" else f" [{RULE_LABELS[rec['rule']]}]"
         print(f"Δ {SHORT_LABELS[rec['metric']]}{rule} ({BLEND} − {best}): "
               f"{fmt.delta(rec['metric'], rec['delta'], rec['ci_low'], rec['ci_high'])}, p {fmt.p(rec['p_two_sided'])}")
+    skipped = [name for name, sec in (("kompromis", tradeoff), ("podgrupy", subgroups), ("błędy", errors),
+                                      ("DCA etykieta", dca_label), ("DCA przyjęcia", dca_admission),
+                                      ("kalibracja grup", calibration_groups), ("odsyłanie", deferral),
+                                      ("conformal", conformal))
+               if isinstance(sec, dict) and sec.get("skipped")]
+    skipped += [f"analiza {k}" for k, v in analyses.items() if v.get("skipped")]
+    if skipped:
+        print("Sekcje pominięte (powód w report.md): " + ", ".join(skipped))
     print("Czasy [s]: " + ", ".join(f"{k} {v}" for k, v in timings.items()))
     warn_test_once(prior)
     log.info(f"Raport: {out_dir / 'report.md'} (zapisany w rejestrze {_registry_path()})")
-    log.info(f"Wagi dla backendu: {out_dir / 'backend_ensemble_weights.json'} "
+    log.info(f"Wagi i reguła dla backendu: {out_dir / 'backend_ensemble_weights.json'} "
              f"(skopiuj jako backend/models/ensemble_weights.json)")
     return 0
 

@@ -32,11 +32,13 @@ from src.analysis.common import (
     UnitStore,
     admitted_for,
     analysis_dir,
+    current_source_names,
     default_tag,
     evaluate,
     execute_units,
     find_refit_run,
     load_predictions,
+    merge_units,
     now_iso,
     read_json,
     require_source_runs,
@@ -59,6 +61,12 @@ FIT_METRICS: tuple[str, ...] = ("log_loss", "qwk_argmax", "qwk_cost", "auc_macro
 # Wykładnik c: typowe krzywe uczenia mają c ≈ 0,1–1; c na granicy przedziału = dopasowanie niewiarygodne
 C_BOUNDS: tuple[float, float] = (0.05, 2.0)
 C_FIXED: float = 0.5           # przy 3 punktach (3 parametry = brak stopni swobody) c ustalone
+# Kierunek metryk dopasowania: True = im więcej, tym lepiej (QWK, AUC); False = im mniej (log loss, undertriage)
+HIGHER_IS_BETTER: dict[str, bool] = {"log_loss": False, "qwk_argmax": True, "qwk_cost": True, "auc_macro": True,
+                                     "undertriage_cost": False}
+# Kontrola wiarygodności ekstrapolacji (poza c ustalonym / na granicy):
+MAX_EXTRAPOLATION_FACTOR: float = 10.0   # cel > 10 × największe n z krzywej → za daleko poza danymi
+MAX_RMSE_FRACTION: float = 0.25          # RMSE > 25% zakresu obserwowanych wartości → złe dopasowanie
 
 
 def fraction_label(fraction: float) -> str:
@@ -83,12 +91,16 @@ def _power(n: np.ndarray, a: float, b: float, c: float) -> np.ndarray:
 
 
 def fit_power_law(n: Sequence[float], values: Sequence[float | None],
-                  extrapolate_to: Sequence[float] = ()) -> dict[str, Any] | None:
+                  extrapolate_to: Sequence[float] = (), higher_is_better: bool | None = None) -> dict[str, Any] | None:
     """
     metryka(n) = a + b·n^(−c). ≥ 4 punkty: a, b, c dopasowane (c ∈ C_BOUNDS); 3 punkty: c = C_FIXED,
     dopasowane tylko a, b. None, gdy < 3 skończonych punktów albo dopasowanie się nie zbiega.
-    `a` = asymptota (nieskończenie wiele danych); `predicted` — wartości w `extrapolate_to`;
-    `reliable` = False przy ustalonym c albo c na granicy przedziału (ekstrapolacji nie raportuj).
+    `a` = asymptota (nieskończenie wiele danych); `predicted` — wartości w `extrapolate_to`.
+    `reliable` = False (ekstrapolacji nie raportuj), a `reasons` mówi dlaczego, gdy:
+        c ustalone (3 punkty) albo na granicy przedziału; krzywa idzie w złą stronę (wg
+        `higher_is_better`: b < 0 dla QWK/AUC, b > 0 dla log loss); asymptota albo ekstrapolacja
+        gorsza od OSTATNIEGO obserwowanego punktu o więcej niż RMSE; RMSE > MAX_RMSE_FRACTION zakresu
+        obserwacji; cel ekstrapolacji > MAX_EXTRAPOLATION_FACTOR × największe n z krzywej.
     """
     from scipy.optimize import curve_fit
 
@@ -114,15 +126,39 @@ def fit_power_law(n: Sequence[float], values: Sequence[float | None],
             return None
     at_bound = free_c and (c <= C_BOUNDS[0] * 1.01 or c >= C_BOUNDS[1] * 0.99)
     fitted = _power(x, a, b, c)
+    rmse = float(np.sqrt(np.mean((fitted - y) ** 2)))
+    predicted = {str(int(t)): float(_power(np.array([t], dtype=float), a, b, c)[0]) for t in extrapolate_to}
+    reasons: list[str] = []
+    if not free_c:
+        reasons.append("3 punkty, c ustalone")
+    if at_bound:
+        reasons.append("c na granicy przedziału")
+    if higher_is_better is not None:
+        if (b >= 0) if higher_is_better else (b <= 0):
+            reasons.append("krzywa pogarsza się z liczbą danych")
+        last, tol = float(y[-1]), max(rmse, 1e-12)
+
+        def worse(v: float) -> bool:
+            return v < last - tol if higher_is_better else v > last + tol
+
+        beyond = [v for t, v in zip(extrapolate_to, predicted.values(), strict=True) if float(t) >= x.max()]
+        if worse(float(a)) or any(worse(v) for v in beyond):
+            reasons.append("asymptota / ekstrapolacja gorsza od ostatniego punktu")
+    spread = float(y.max() - y.min())
+    if spread > 0 and rmse > MAX_RMSE_FRACTION * spread:
+        reasons.append(f"RMSE > {MAX_RMSE_FRACTION:.0%} zakresu punktów")
+    if extrapolate_to and max(float(t) for t in extrapolate_to) > MAX_EXTRAPOLATION_FACTOR * float(x.max()):
+        reasons.append(f"ekstrapolacja > {MAX_EXTRAPOLATION_FACTOR:g}× największego n krzywej")
     return {
         "a": float(a), "b": float(b), "c": float(c),
         "c_fixed": not free_c,
         "at_bound": bool(at_bound),
-        "reliable": bool(free_c and not at_bound),
-        "rmse": float(np.sqrt(np.mean((fitted - y) ** 2))),
+        "reliable": not reasons,
+        "reasons": reasons,
+        "rmse": rmse,
         "n_points": len(pts),
         "n_range": [float(x.min()), float(x.max())],
-        "predicted": {str(int(t)): float(_power(np.array([t], dtype=float), a, b, c)[0]) for t in extrapolate_to},
+        "predicted": predicted,
     }
 
 
@@ -212,7 +248,7 @@ def summary_lines(results: Mapping[str, Any]) -> list[str]:
             if fit:
                 pred = ", ".join(f"n={int(k):,}: {val:.4f}" for k, val in fit["predicted"].items())
                 note = "" if fit.get("reliable") else (
-                    " — **niewiarygodne** (" + ("3 punkty, c ustalone" if fit.get("c_fixed") else "c na granicy")
+                    " — **niewiarygodne** (" + "; ".join(fit.get("reasons") or ["c ustalone albo na granicy"])
                     + "; nie raportuj ekstrapolacji)")
                 lines.append(f"\n- {metric}: a + b·n^(−c), a = {fit['a']:.4f}, c = {fit['c']:.3f} "
                              f"(RMSE {fit['rmse']:.4f}); ekstrapolacja: {pred}{note}")
@@ -241,9 +277,11 @@ def run_learning_curve(
     units = [{"unit": f"{model}/f{fraction_label(fr)}", "model": model, "fraction": fr, "source_run": run.name,
               "seed": int(seed) if seed is not None else source_seed(run.info)}
              for model, run in runs.items() for fr in fractions]
+    # Wyniki kumulatywne: modele policzone wcześniej (ten sam run źródłowy) zostają w results.json
+    all_units = merge_units(store.planned_units(), units, lambda u: u["model"],
+                            current_source_names(feature_set, tag))
     store.write_plan({"analysis": "learning_curve", "feature_set": feature_set, "tag": tag,
-                      "fractions": fractions, "units": [{"unit": u["unit"], "source_run": u["source_run"]}
-                                                        for u in units]})
+                      "fractions": fractions, "units": all_units})
 
     def expect(u: Mapping[str, Any]) -> dict[str, Any]:
         return {"source_run": u["source_run"], "data_fingerprint": fingerprint, "metrics_version": METRICS_VERSION,
@@ -270,9 +308,10 @@ def run_learning_curve(
 
     models_out: dict[str, Any] = {}
     n_done = 0
-    for model, run in runs.items():
+    for model in dict.fromkeys(str(u["model"]) for u in all_units):
+        model_units = [u for u in all_units if u["model"] == model]
         points = []
-        for u in (u for u in units if u["model"] == model):
+        for u in model_units:
             payload = store.valid(str(u["unit"]), expect(u))
             if payload is None:
                 continue
@@ -285,24 +324,28 @@ def run_learning_curve(
         n_full = full_fit_rows(uses_es)
         targets = [t for t in (n_full, 2 * n_full if n_full else None) if t]
         power = {metric: fit_power_law([p["n_fit"] for p in points], [(p["val"] or {}).get(metric) for p in points],
-                                       targets) for metric in FIT_METRICS}
-        models_out[model] = {"source_run": run.name, "points": points, "n_fit_full_train": n_full,
-                             "power_law": power}
+                                       targets, HIGHER_IS_BETTER.get(metric)) for metric in FIT_METRICS}
+        models_out[model] = {"source_run": model_units[0]["source_run"], "points": points,
+                             "n_fit_full_train": n_full, "power_law": power}
     results = {
         "analysis": "learning_curve",
         "feature_set": feature_set,
         "tag": tag,
         "created": now_iso(),
         "data_fingerprint": fingerprint,
-        "fractions": fractions,
+        "metrics_version": METRICS_VERSION,
+        "source_runs": {u["model"]: u["source_run"] for u in all_units},
+        "fractions": sorted({float(u["fraction"]) for u in all_units}),
         "metrics": METRICS,
         "fit_metrics": list(FIT_METRICS),
         "power_law_formula": ("metric(n) = a + b * n^(-c); n = wiersze X_fit; predicted: n X_fit całego TRAIN i 2×; "
                               f"c w {list(C_BOUNDS)} (≥ 4 punkty), c = {C_FIXED} przy 3 punktach; "
-                              "reliable = c dopasowane i nie na granicy"),
-        "n_units": len(units),
+                              "reliable = brak powodów w `reasons` (c ustalone / na granicy, zły kierunek, "
+                              "ekstrapolacja gorsza od ostatniego punktu, duże RMSE, cel > "
+                              f"{MAX_EXTRAPOLATION_FACTOR:g}× n krzywej)"),
+        "n_units": len(all_units),
         "n_done": n_done,
-        "complete": not failures and n_done == len(units),
+        "complete": not failures and n_done == len(all_units),
         "failures": failures,
         "models": models_out,
     }
@@ -314,8 +357,9 @@ def run_learning_curve(
         results["plot"] = None
     path = store.write_results(results)
     store.write_summary(summary_lines(results))
-    log.info(f"Krzywa uczenia: {n_done}/{len(units)} jednostek → {path}")
+    log.info(f"Krzywa uczenia: {n_done}/{len(all_units)} jednostek (kumulatywnie) → {path}")
     return results
 
 
-__all__ = ["DEFAULT_FRACTIONS", "DEFAULT_MODELS", "fit_power_law", "parse_fractions", "run_learning_curve"]
+__all__ = ["DEFAULT_FRACTIONS", "DEFAULT_MODELS", "HIGHER_IS_BETTER", "fit_power_law", "parse_fractions",
+           "run_learning_curve"]
