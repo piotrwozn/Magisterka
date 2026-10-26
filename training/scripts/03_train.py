@@ -2,7 +2,9 @@
 Krok 3: trening modeli ESI (CLI z `src.models.train.main`).
 
 Użycie:
-    python scripts/03_train.py --model all                          # 6 modeli, zestaw 'triage'
+    python scripts/03_train.py --model all                          # 6 modeli KLASYCZNYCH, zestaw 'triage'
+    python scripts/03_train.py --model tfm --tune --profile smoke   # TabPFN-3.5 + TabICLv2 (modele fundamentalne)
+    python scripts/03_train.py --model tabpfn --tune                # jeden TFM, profil 'standard' (GPU)
     python scripts/03_train.py --model xgboost
     python scripts/03_train.py --model lightgbm,catboost --feature-set full
     python scripts/03_train.py --model all --tune                   # Optuna, profil 'standard' (noc)
@@ -15,6 +17,11 @@ próbkę do tuningu, foldy, limit czasu i próbki danych; jawne --n-trials / --t
 --cv-folds / --tune-timeout / --sample / --eval-sample mają pierwszeństwo.
 Tuning jest wznawialny: po awarii lub Ctrl+C uruchom to samo polecenie — Optuna dokończy
 brakujące próby i brakujący czas.
+
+`--model all` oznacza 6 modeli klasycznych (logreg, lightgbm, xgboost, catboost, random_forest, ebm);
+modele fundamentalne TFM (tabpfn, tabicl; grupa `tfm`, aliasy pfn / icl) tylko na jawne żądanie.
+Dla TFM `--tune` = wybór konfiguracji na holdoucie z TRAIN (src/models/tfm_tuning.py; też wznawialny),
+wymagane: torch z CUDA + `pip install -r requirements-tfm.txt` + `python scripts/13_tfm_setup.py` (wagi).
 
 `--n-jobs N` ustawia SOR_AI_N_JOBS (i domyślnie OMP_NUM_THREADS) PRZED importem pakietu `src`
 (config ustala liczbę wątków przy imporcie). Na Windows proces na starcie wyłącza dławienie

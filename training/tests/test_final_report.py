@@ -584,3 +584,93 @@ class TestFinalReportRefusals:
 
     def test_no_runs(self, isolated_paths):
         self._expect_refusal(["--feature-set", "triage"], isolated_paths.RUNS_DIR / "x")
+
+
+# ─────────────────────────────────────────
+# Receptura z modelem fundamentalnym (TFM): --include-pretrained i backend_ensemble_weights_no_tfm.json
+# ─────────────────────────────────────────
+TFM_RUN = "20260102_000300_tabpfn_triage_standard"
+NO_TFM_FILE = "backend_ensemble_weights_no_tfm.json"
+
+
+@pytest.fixture
+def tfm_report_runs(report_runs):
+    """report_runs + run TabPFN (run_info `pretrained: true`) z tym samym tagiem i wierszami."""
+    y = _true_labels()
+    run_dir = write_run(report_runs, TFM_RUN, "tabpfn", {s: _make_proba(y, 2.8, 40 + j)
+                                                         for j, s in enumerate(["val", "test"])}, y)
+    _rewrite_predictions(run_dir, site=np.where(np.arange(N_ROWS) % 2 == 0, "A", "B"))
+    info = json.loads((run_dir / "run_info.json").read_text(encoding="utf-8"))
+    info["pretrained"] = True
+    (run_dir / "run_info.json").write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+    return report_runs
+
+
+class TestNoTfmVariant:
+    def _run(self, argv: list[str], out: Path) -> int:
+        return _load_script().main([*argv, "--bootstrap", "40", "--no-plots", "--out", str(out)])
+
+    def test_tag_selection_skips_tfm_without_flag(self, tfm_report_runs):
+        out = tfm_report_runs / "r_plain"
+        assert self._run(["--feature-set", "triage", "--tag", "standard"], out) == 0
+        recipe = json.loads((out / "recipe.json").read_text(encoding="utf-8"))
+        assert "tabpfn" not in {r["model"] for r in recipe["runs"]}
+        assert "no_tfm" not in recipe                                   # klasyczna receptura bez zmian
+        assert not (out / NO_TFM_FILE).exists()
+        assert NO_TFM_FILE not in (out / "report.md").read_text(encoding="utf-8")
+
+    def test_include_pretrained_writes_no_tfm_variant(self, tfm_report_runs):
+        out = tfm_report_runs / "r_tfm"
+        assert self._run(["--feature-set", "triage", "--tag", "standard", "--include-pretrained"], out) == 0
+        recipe = json.loads((out / "recipe.json").read_text(encoding="utf-8"))
+        assert "tabpfn" in {r["model"] for r in recipe["runs"]}
+        backend = json.loads((out / "backend_ensemble_weights.json").read_text(encoding="utf-8"))
+        no_tfm = json.loads((out / NO_TFM_FILE).read_text(encoding="utf-8"))
+        assert "tabpfn" in backend["weights"] and "tabpfn" not in no_tfm["weights"]
+        assert set(no_tfm["weights"]) <= {"lightgbm", "xgboost", "ebm"}
+        assert no_tfm["rule"] == backend["rule"] == "target" and len(no_tfm["cutpoints"]) == 4
+        assert no_tfm["method"] == backend["method"] and no_tfm["temperature"] > 0
+        assert recipe["no_tfm"]["dropped"] == ["tabpfn"]
+        assert recipe["no_tfm"]["weights_mode"].startswith("optimize")
+        report = (out / "report.md").read_text(encoding="utf-8")
+        assert NO_TFM_FILE in report and "Receptura zawiera model fundamentalny (tabpfn)" in report
+        # Plik bez TFM = receptura dopasowana na VAL bez TFM (ta sama obróbka co 08: wagi → T → reguła)
+        from src.ensemble import fit_temperature, optimize_weights
+        from src.evaluation import report_sections as rs
+
+        runs = [load_run(tfm_report_runs / name) for name in RUNS]
+        y_val, p_val, vc = aligned_probas(runs, "val", return_vc=True)
+        weights = optimize_weights(p_val, y_val)
+        p = blend(p_val, weights)
+        t = fit_temperature(p, y_val)
+        spec = rs.fit_rules(y_val, apply_temperature(p, t), vc, rs.DecisionOptions(rules=["target"])).specs["target"]
+        assert no_tfm["temperature"] == pytest.approx(round(t, 6))
+        assert no_tfm["cutpoints"] == pytest.approx(spec["cutpoints"])
+        # Format zgodny z backendem (także TFM w głównym pliku — znany model, nie odrzucany)
+        cfg = _backend_loader()(out / NO_TFM_FILE)
+        assert set(cfg.weights) == set(no_tfm["weights"])
+        assert "tabpfn" in _backend_loader()(out / "backend_ensemble_weights.json").weights
+
+    def test_explicit_weights_dropped_and_renormalised(self, tfm_report_runs):
+        out = tfm_report_runs / "r_explicit"
+        weights = {"lightgbm": 0.3, "xgboost": 0.1, "tabpfn": 0.6}
+        assert self._run(["--runs", RUNS_LIST[0], RUNS_LIST[1], TFM_RUN, "--weights", json.dumps(weights),
+                          "--temperature", "none", "--main-rule", "cost", "--rule", "both"], out) == 0
+        no_tfm = json.loads((out / NO_TFM_FILE).read_text(encoding="utf-8"))
+        assert no_tfm["weights"] == {"lightgbm": pytest.approx(0.75), "xgboost": pytest.approx(0.25)}
+        assert no_tfm["temperature"] is None and no_tfm["rule"] == "cost"
+
+    def test_tfm_with_zero_weight_writes_no_variant(self, tfm_report_runs):
+        out = tfm_report_runs / "r_zero"
+        assert self._run(["--runs", RUNS_LIST[0], TFM_RUN, "--weights", json.dumps({"lightgbm": 1, "tabpfn": 0})],
+                         out) == 0
+        assert not (out / NO_TFM_FILE).exists()
+
+    def test_only_tfm_members_noted(self, tfm_report_runs):
+        out = tfm_report_runs / "r_only"
+        assert self._run(["--runs", TFM_RUN], out) == 0
+        assert not (out / NO_TFM_FILE).exists()
+        assert "wyłącznie z modeli fundamentalnych" in (out / "report.md").read_text(encoding="utf-8")
+
+
+RUNS_LIST = list(RUNS)

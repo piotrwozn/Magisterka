@@ -6,9 +6,17 @@ Orkiestrator nocnego przebiegu — jedno polecenie, wznawialne, Windows / Linux 
     python scripts/run_all.py --status                # stan z plików-znaczników, nic nie uruchamia
     python scripts/run_all.py --stage analyses        # po treningu: analizy do pracy (seedy, oddziały, krzywa)
     python scripts/run_all.py --stage all             # trening, potem analizy
+    python scripts/run_all.py --models tfm            # modele fundamentalne TabPFN-3.5 + TabICLv2 (GPU)
 
 Etapy (`--stage`): train (domyślnie, kroki 1–5), analyses (krok 6, po sprawdzeniu, że główne runy
 z tuningiem istnieją), all (train, potem analyses).
+
+Modele (`--models`): `all` = 6 modeli KLASYCZNYCH (logreg, lightgbm, xgboost, catboost, random_forest, ebm);
+modele fundamentalne TFM (tabpfn, tabicl; grupa `tfm`, aliasy pfn / icl) tylko na jawne żądanie, np.
+`--models tfm` albo `--models all,tfm`. TFM: "tuning" = wybór konfiguracji na holdoucie z TRAIN, urządzenie
+z próby torch w preflight (00_check_env.py --models … --profile …); bez CUDA preflight odmawia, chyba że
+profil smoke (kontekst ≤ TFM_CPU_MAX_CONTEXT, tor CPU); błąd GPU TFM NIE jest powtarzany na CPU (wskazówki:
+scripts/13_tfm_setup.py, mniejszy kontekst); ETA = limit wyboru konfiguracji + `final_budget_s` profilu.
 
 Kroki (każdy w OSOBNYM procesie — awaria natywna/CUDA/OOM zabija jeden krok, nie całą noc):
     1. preflight  — scripts/00_check_env.py (próba GPU, RAM, dysk, wersje) → preflight.json,
@@ -29,12 +37,16 @@ Kroki (każdy w OSOBNYM procesie — awaria natywna/CUDA/OOM zabija jeden krok, 
        wątki): scripts/09_seed_refits.py → 10_leave_site_out.py → 11_learning_curve.py --tag P
        --models <modele z gotowym runem ∩ domyślne modele analizy>; każdy skrypt jest wznawialny
        (gotowe jednostki pomija), wyniki w runs/analyses/<analiza>__<fs>__<tag>/results.json.
+       Seedy: domyślnie 6 modeli klasycznych (refity TFM tylko, gdy TFM są w --models). Potem kroki TFM —
+       tylko gdy są ich warunki (inaczej „pomijam — <powód>” w planie i w --status):
+       14_small_data_curve.py (eksperyment A: biblioteki torch + tabpfn/tabicl zainstalowane),
+       15_tfm_blend.py (eksperyment B: gotowy run lightgbm i co najmniej jeden run TFM z tym tagiem).
 
 Tory (`--lanes auto`): 2, gdy co najmniej jeden model idzie na GPU (urządzenie 'gpu' z próby GPU
 w preflight), ≥ 16 rdzeni fizycznych i ≥ 30 GB RAM (komputer z 32 GB raportuje ~31,8 GB) —
-tor GPU (tylko modele na GPU: xgboost → catboost, SOR_AI_N_JOBS=6) i tor CPU (pozostałe modele,
-także xgboost/catboost na CPU; pozostałe rdzenie fizyczne). Budżety wątków się nie nakładają
-(nadsubskrypcja OpenMP = ~70× wolniej).
+tor GPU (tylko modele na GPU: xgboost → catboost → tabpfn → tabicl, SOR_AI_N_JOBS=6) i tor CPU
+(pozostałe modele, także modele GPU na CPU; pozostałe rdzenie fizyczne). Budżety wątków się nie
+nakładają (nadsubskrypcja OpenMP = ~70× wolniej); modele w torze GPU nigdy nie dzielą karty naraz.
 
 Procesy kroków: wyjście czyta osobny wątek, a tor czeka na zakończenie procesu — twarda awaria
 kroku nie blokuje toru, nawet gdy proces-wnuk (loky/joblib) trzyma otwarty potok. POSIX: każdy
@@ -47,7 +59,8 @@ terminate/kill; drugie Ctrl+C = natychmiast), podsumowanie i polecenie wznowieni
 z `--force` i tylko niedokończonymi modelami, osobno dla zestawów cech, a potem zwykłe polecenie
 — brakujące ewaluacje i porównanie wszystkich modeli). xgboost/catboost z błędem GPU w logu są
 powtarzane raz na CPU (SOR_AI_DEVICE_<MODEL>=cpu) — z budżetem wątków toru CPU, gdy ten tor już
-skończył.
+skończył. Modele TFM nigdy (duży kontekst na CPU = wiele godzin) — zamiast powtórki wskazówka
+(wagi, CUDA, brak pamięci GPU).
 
 Windows: na czas przebiegu wyłączone dławienie energii procesu (EcoQoS) i tryb QuickEdit konsoli
 (kliknięcie w okno zatrzymywałoby wypisywanie, a przez potoki — trening).
@@ -84,13 +97,19 @@ log = get_logger(__name__)
 PROJECT_ROOT: Path = config.PROJECT_ROOT
 SCRIPTS_DIR: Path = PROJECT_ROOT / "scripts"
 
-# Kolejność = src.models.MODEL_REGISTRY (bez importu modeli w procesie orkiestratora)
-MODEL_ORDER: tuple[str, ...] = ("logreg", "lightgbm", "xgboost", "catboost", "random_forest", "ebm")
+# Kolejność = src.models.MODEL_REGISTRY (bez importu modeli w procesie orkiestratora): 6 modeli
+# klasycznych, potem modele fundamentalne TFM (zawsze na końcu)
+CLASSICAL_MODELS: tuple[str, ...] = tuple(config.CLASSICAL_MODELS)
+TFM_MODELS: tuple[str, ...] = tuple(config.TFM_MODELS)
+MODEL_ORDER: tuple[str, ...] = CLASSICAL_MODELS + TFM_MODELS
 MODEL_ALIASES: dict[str, str] = {"lr": "logreg", "lgbm": "lightgbm", "xgb": "xgboost", "cb": "catboost",
-                                 "rf": "random_forest"}
+                                 "rf": "random_forest", "pfn": "tabpfn", "icl": "tabicl"}
+# Grupy w `--models`: 'all' = 6 modeli klasycznych (TFM tylko jawnie), 'tfm' = TabPFN + TabICL
+MODEL_GROUPS: dict[str, tuple[str, ...]] = {"all": CLASSICAL_MODELS, "tfm": TFM_MODELS}
 FEATURE_SETS: tuple[str, ...] = ("triage", "full")
 FEATURE_SET_ALIASES: dict[str, str] = {"triage_only": "triage", "top": "triage"}
-GPU_MODELS: tuple[str, ...] = ("xgboost", "catboost")
+# Modele z obsługą GPU; kolejność = kolejność w torze GPU (TFM po xgboost/catboost — karta dla jednego naraz)
+GPU_MODELS: tuple[str, ...] = ("xgboost", "catboost", "tabpfn", "tabicl")
 SPLITS: tuple[str, ...] = ("random", "site")
 
 GPU_LANE_THREADS: int = 6             # wątki CPU toru GPU (przygotowanie danych, ES, predykcja)
@@ -108,7 +127,9 @@ BOOT_TIME_TOLERANCE_S: float = 120.0  # --status: inny czas startu systemu = by�
 CREATE_TIME_FROM_BOOT: bool = sys.platform.startswith("linux")
 LOG_TAIL_LINES: int = 40
 
-# Zapas na trening finalny + ewaluację ponad limit czasu tuningu (pełne dane; szacunek ±50%)
+# Zapas na trening finalny + ewaluację ponad limit czasu tuningu (pełne dane; szacunek ±50%).
+# TFM (tabpfn, tabicl): zapas = `final_budget_s` profilu (config.TUNING_PROFILES — budżet finalnej predykcji
+# VAL + TEST, czytany przy wywołaniu: `fit_allowance_s`), także na profilach z próbką danych.
 FINAL_FIT_ALLOWANCE_S: dict[str, int] = {
     "logreg": 180, "lightgbm": 300, "xgboost": 300, "catboost": 600, "random_forest": 900, "ebm": 2700,
 }
@@ -124,15 +145,26 @@ _IGNORED = re.compile(r"\bignored\b", re.IGNORECASE)
 STAGES: tuple[str, ...] = ("train", "analyses", "all")
 # Analizy (kolejność kroków): nazwa → (skrypt, domyślne modele; None = wszystkie z gotowym runem).
 # Domyślne modele = DEFAULT_MODELS w src/analysis/{site_out,learning_curve}.py (bez importu tutaj).
+# Seedy: modele z gotowym runem spośród --models — domyślnie ('all') 6 klasycznych; refity seedów TFM
+# tylko na jawne żądanie (--models tfm / all,tfm). Kroki TFM (TFM_ANALYSES) mają własne warunki
+# (`tfm_analysis_models`): small_data — biblioteki TFM zainstalowane; tfm_blend — run lightgbm + ≥ 1 run TFM.
 ANALYSIS_STEPS: dict[str, tuple[str, tuple[str, ...] | None]] = {
     "seeds": ("09_seed_refits.py", None),
     "site_out": ("10_leave_site_out.py", ("lightgbm", "xgboost", "catboost", "logreg")),
     "learning_curve": ("11_learning_curve.py", ("lightgbm", "xgboost")),
+    "small_data": ("14_small_data_curve.py", ("lightgbm", "tabpfn", "tabicl")),
+    "tfm_blend": ("15_tfm_blend.py", ("lightgbm", "tabpfn", "tabicl")),
 }
+TFM_ANALYSES: tuple[str, ...] = ("small_data", "tfm_blend")
 # Szacunek czasu analizy = mnożnik × czas treningu finalnego runów (seedy 3×, oddziały A+B ≈ 2×,
 # krzywa uczenia: suma ułamków 0,05+0,1+0,25+0,5+1 ≈ 1,9×) + stały narzut na model
 ANALYSIS_ETA_FACTOR: dict[str, float] = {"seeds": 3.0, "site_out": 2.0, "learning_curve": 1.9}
 ANALYSIS_OVERHEAD_S: float = 30.0
+# Kroki TFM: łączenie na VAL (z zapisanych predykcji, bez GPU) — stały szacunek; krzywa małych danych —
+# z benchmarku scripts/13_tfm_setup.py (runs/analyses/tfm_setup/benchmark.json), bez niego brak szacunku
+ANALYSIS_FIXED_ETA_S: dict[str, float] = {"tfm_blend": 15 * 60.0}
+TFM_SETUP_SUBDIR: str = "tfm_setup"
+TFM_BENCHMARK_JSON: str = "benchmark.json"
 
 # Stany zadania modelu
 PENDING, RUNNING, DONE, SKIPPED = "pending", "running", "done", "skipped"
@@ -152,7 +184,7 @@ INTERRUPT_CODES: tuple[int, ...] = (130, -2, 0xC000013A)   # 130 = 03_train.py p
 class Options:
     profile: str = config.DEFAULT_TUNING_PROFILE
     feature_sets: list[str] = field(default_factory=lambda: ["triage"])
-    models: list[str] = field(default_factory=lambda: list(MODEL_ORDER))
+    models: list[str] = field(default_factory=lambda: list(CLASSICAL_MODELS))    # 'all' = 6 klasycznych
     split: str = "random"
     tune: bool = True
     lanes: str = "auto"
@@ -204,10 +236,10 @@ class ModelTask:
 
 @dataclass
 class AnalysisTask:
-    """Krok analizy (09 / 10 / 11) dla zestawu cech — skrypt sam pomija gotowe jednostki."""
+    """Krok analizy (09 / 10 / 11 / 14 / 15) dla zestawu cech — skrypt sam pomija gotowe jednostki."""
 
     fs: str
-    name: str                  # seeds | site_out | learning_curve
+    name: str                  # seeds | site_out | learning_curve | small_data | tfm_blend
     models: list[str]
     status: str = PENDING
     rc: int | None = None
@@ -228,17 +260,24 @@ class AnalysisTask:
 # Funkcje czyste (testowane osobno)
 # ─────────────────────────────────────────
 def parse_models(spec: str) -> list[str]:
-    """'all' albo lista po przecinku (aliasy: lr, lgbm, xgb, cb, rf) → modele w kolejności MODEL_ORDER."""
+    """
+    'all' (= 6 modeli KLASYCZNYCH), 'tfm' (= tabpfn, tabicl) albo lista po przecinku (nazwy, aliasy lr, lgbm,
+    xgb, cb, rf, pfn, icl i grupy, np. 'all,tfm') → modele w kolejności MODEL_ORDER (TFM na końcu).
+    """
     if spec.strip().lower() in ("", "all"):
-        return list(MODEL_ORDER)
+        return list(CLASSICAL_MODELS)
     chosen: set[str] = set()
     for raw in spec.split(","):
         name = raw.strip().lower()
         if not name:
             continue
+        if name in MODEL_GROUPS:
+            chosen.update(MODEL_GROUPS[name])
+            continue
         name = MODEL_ALIASES.get(name, name)
         if name not in MODEL_ORDER:
-            raise ValueError(f"Nieznany model '{raw.strip()}'. Dostępne: {', '.join(MODEL_ORDER)}")
+            raise ValueError(f"Nieznany model '{raw.strip()}'. Dostępne: {', '.join(MODEL_ORDER)}; grupy: "
+                             f"all (6 modeli klasycznych), tfm ({', '.join(TFM_MODELS)})")
         chosen.add(name)
     return [m for m in MODEL_ORDER if m in chosen]
 
@@ -287,10 +326,20 @@ def read_json(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def is_gpu_device(device: Any) -> bool:
-    """'gpu' (catboost) albo 'cuda' / 'cuda:0' (xgboost) = trening na karcie."""
+def normalize_device(device: Any) -> str | None:
+    """
+    Urządzenie z DONE.json w jednej postaci: 'cuda' / 'cuda:0' (xgboost, modele TFM) i 'gpu' (catboost)
+    → 'gpu'; 'cpu' → 'cpu'; brak → None (inne wartości: małe litery bez zmian).
+    """
     text = str(device or "").strip().lower()
-    return text == "gpu" or text.startswith("cuda")
+    if not text or text == "none":
+        return None
+    return "gpu" if text == "gpu" or text.startswith("cuda") else text
+
+
+def is_gpu_device(device: Any) -> bool:
+    """'gpu' (catboost) albo 'cuda' / 'cuda:0' (xgboost, TFM) = trening na karcie."""
+    return normalize_device(device) == "gpu"
 
 
 def done_device(done: Mapping[str, Any]) -> tuple[str | None, str | None]:
@@ -369,9 +418,10 @@ def eval_done(run_dir: Path) -> bool:
 
 def gpu_planned_models(models: Sequence[str], devices: Mapping[str, str], gpu_ok: bool) -> list[str]:
     """
-    Modele, które trafią na GPU: xgboost/catboost z urządzeniem 'gpu' (udana próba GPU w preflight
-    albo SOR_AI_DEVICE_*=gpu) lub 'auto' (bez preflight — decyzja procesu treningu), gdy GPU
-    wygląda na dostępne. Pozostałe (także xgboost/catboost na 'cpu') idą na CPU.
+    Modele, które trafią na GPU: modele z GPU_MODELS (xgboost, catboost, tabpfn, tabicl) z urządzeniem
+    'gpu' (udana próba GPU w preflight — dla TFM próba torch — albo SOR_AI_DEVICE_*=gpu) lub 'auto' (bez
+    preflight — decyzja procesu treningu), gdy GPU wygląda na dostępne. Pozostałe (także modele GPU na
+    'cpu', np. TFM w profilu smoke bez CUDA) idą na CPU.
     """
     return [m for m in models if m in GPU_MODELS
             and (devices.get(m) == "gpu" or (devices.get(m) == "auto" and gpu_ok))]
@@ -407,8 +457,8 @@ def assign_lanes(
 ) -> list[Lane]:
     """
     1 tor: wszystkie modele w kolejności MODEL_ORDER, wszystkie wątki.
-    2 tory: GPU (tylko modele z `gpu_models`, xgboost → catboost, min(6, połowa) wątków) i CPU
-    (pozostałe w kolejności MODEL_ORDER — także xgboost/catboost na CPU; reszta wątków).
+    2 tory: GPU (tylko modele z `gpu_models`, xgboost → catboost → tabpfn → tabicl, min(6, połowa) wątków)
+    i CPU (pozostałe w kolejności MODEL_ORDER — także modele GPU na CPU; reszta wątków).
     Budżety rozłączne.
     """
     total = max(1, int(total_threads))
@@ -421,13 +471,17 @@ def assign_lanes(
     return [Lane("gpu", gpu, gpu_threads), Lane("cpu", cpu, max(1, total - gpu_threads))]
 
 
-def resolve_devices(env: Mapping[str, str], detected: Mapping[str, str] | None) -> dict[str, str]:
+def resolve_devices(env: Mapping[str, str], detected: Mapping[str, str] | None,
+                    models: Sequence[str] | None = None) -> dict[str, str]:
     """
-    Urządzenie xgboost/catboost dla procesów treningu: jawne SOR_AI_DEVICE_<LIB> / SOR_AI_DEVICE
-    użytkownika > wynik próby GPU z preflight ('gpu'/'cpu') > 'auto' (próbę zrobi proces treningu).
+    Urządzenie modeli GPU dla procesów treningu: jawne SOR_AI_DEVICE_<MODEL> / SOR_AI_DEVICE
+    użytkownika > wynik próby GPU z preflight ('gpu'/'cpu'; TFM: próba torch) > 'auto' (próbę zrobi
+    proces treningu). xgboost/catboost zawsze; TFM (tabpfn, tabicl) tylko, gdy są w `models`.
     """
     out: dict[str, str] = {}
     for lib in GPU_MODELS:
+        if lib in TFM_MODELS and (models is None or lib not in models):
+            continue
         explicit = (env.get(f"SOR_AI_DEVICE_{lib.upper()}") or env.get("SOR_AI_DEVICE") or "").strip().lower()
         if explicit:
             out[lib] = "gpu" if explicit == "cuda" else explicit
@@ -454,6 +508,16 @@ def build_child_env(base: Mapping[str, str], n_jobs: int, devices: Mapping[str, 
     return env
 
 
+def child_devices(devices: Mapping[str, str], models: Sequence[str] | None = None) -> dict[str, str]:
+    """
+    Urządzenia przekazywane procesowi kroku: xgboost/catboost zawsze, klucze TFM tylko procesom tych TFM
+    (`models`) — proces modelu klasycznego nie dostaje SOR_AI_DEVICE_TABPFN/_TABICL (hardware.env w jego
+    run_info bez zmian).
+    """
+    wanted = set(models or ())
+    return {k: v for k, v in devices.items() if k not in TFM_MODELS or k in wanted}
+
+
 def python_cmd() -> list[str]:
     return [sys.executable, "-X", "utf8"]
 
@@ -474,7 +538,11 @@ def compare_command(feature_set: str, run_names: Sequence[str], out_path: Path) 
 
 
 def analysis_command(name: str, feature_set: str, tag: str, models: Sequence[str]) -> list[str]:
-    """scripts/09|10|11 z tagiem runów źródłowych i listą modeli (reszta opcji: domyślne skryptu)."""
+    """
+    scripts/09|10|11|14|15 z tagiem runów źródłowych i listą modeli (reszta opcji: domyślne skryptu).
+    Kontrakt skryptów TFM (14_small_data_curve.py, 15_tfm_blend.py): ten sam rdzeń CLI co 09–11
+    (`--feature-set FS --tag TAG --models M1,M2`, nazwy modeli z rejestru).
+    """
     script, _ = ANALYSIS_STEPS[name]
     return [*python_cmd(), str(SCRIPTS_DIR / script), "--feature-set", feature_set, "--tag", tag,
             "--models", ",".join(models)]
@@ -492,12 +560,133 @@ def analysis_eta_s(name: str, durations: Mapping[str, float | None]) -> float:
     return ANALYSIS_ETA_FACTOR[name] * total
 
 
+def analysis_path(name: str, feature_set: str, tag: str, runs_dir: Path | str | None = None) -> Path:
+    """runs/analyses/<analiza>__<fs>__<tag>/ — także dla kroków TFM (spoza common.ANALYSIS_KINDS)."""
+    from src.analysis.common import analyses_root
+
+    return analyses_root(runs_dir) / f"{name}__{feature_set}__{tag}"
+
+
+def tfm_libraries() -> dict[str, bool]:
+    """
+    Czy biblioteka TFM jest zainstalowana (torch + tabpfn / tabicl) — `find_spec`, BEZ importu torch
+    (import trwa sekundy; orkiestrator nigdy nie ładuje torch).
+    """
+    import importlib.util
+
+    def present(name: str) -> bool:
+        try:
+            return importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            return False
+
+    torch_ok = present("torch")
+    return {m: torch_ok and present(m) for m in TFM_MODELS}
+
+
+def analysis_script_exists(name: str) -> bool:
+    """Czy skrypt kroku analizy jest w scripts/ (kroki TFM pochodzą z osobnych modułów eksperymentów A / B)."""
+    script, _ = ANALYSIS_STEPS[name]
+    return (SCRIPTS_DIR / script).is_file()
+
+
+def tfm_analysis_models(
+    name: str,
+    feature_set: str,
+    tag: str,
+    runs_dir: Path,
+    fingerprint: str,
+    *,
+    planned: Sequence[str] | None = None,
+) -> tuple[list[str], str | None]:
+    """
+    Modele kroku TFM i powód pominięcia (None = krok rusza):
+        small_data — lightgbm + TFM z zainstalowaną biblioteką (torch + tabpfn / tabicl); bez żadnej → pominięty,
+        tfm_blend  — lightgbm + TFM z gotowym runem z tagiem `tag` (z tuningiem, bieżące dane); brak runu
+                     lightgbm albo żadnego runu TFM → pominięty. Runy szukane niezależnie od --models.
+    planned : (plan na sucho `--stage all`) modele, których runy powstaną w etapie treningu.
+    """
+    from src.utils.config import DATA_VERSION
+
+    if name not in TFM_ANALYSES:
+        raise ValueError(f"'{name}' nie jest krokiem TFM ({', '.join(TFM_ANALYSES)})")
+    if not analysis_script_exists(name):
+        return [], f"brak skryptu scripts/{ANALYSIS_STEPS[name][0]}"
+    if name == "small_data":
+        libs = tfm_libraries()
+        tfms = [m for m in TFM_MODELS if libs.get(m)]
+        if not tfms:
+            return [], ("brak bibliotek TFM (torch + tabpfn / tabicl) — instalacja: training/docs/TFM.md "
+                        "(koło torch z CUDA, potem pip install -r requirements-tfm.txt)")
+        return ["lightgbm", *tfms], None
+    # tfm_blend
+    wanted = set(planned or ())
+
+    def has_run(model: str) -> bool:
+        return model in wanted or find_done_run(runs_dir, model, feature_set, tag, DATA_VERSION, fingerprint,
+                                                tuned=True) is not None
+
+    if not has_run("lightgbm"):
+        return [], f"brak ukończonego runu lightgbm z tagiem '{tag}' (z tuningiem, bieżące dane)"
+    tfms = [m for m in TFM_MODELS if has_run(m)]
+    if not tfms:
+        return [], (f"brak ukończonego runu TFM (tabpfn / tabicl) z tagiem '{tag}' — najpierw: "
+                    f"python scripts/run_all.py --profile {tag.split('-')[0]} --models tfm")
+    return ["lightgbm", *tfms], None
+
+
+def tfm_benchmark(runs_dir: Path | str | None = None) -> dict[str, Any] | None:
+    """runs/analyses/tfm_setup/benchmark.json (scripts/13_tfm_setup.py) albo None."""
+    from src.analysis.common import analyses_root
+
+    return read_json(analyses_root(runs_dir) / TFM_SETUP_SUBDIR / TFM_BENCHMARK_JSON)
+
+
+def tfm_analysis_eta_s(name: str, runs_dir: Path | str | None = None) -> float | None:
+    """Szacunek kroku TFM: tfm_blend — stały; small_data — `estimates.experiment_a.total_s` z benchmarku."""
+    if name in ANALYSIS_FIXED_ETA_S:
+        return ANALYSIS_FIXED_ETA_S[name]
+    bench = tfm_benchmark(runs_dir) or {}
+    value = ((bench.get("estimates") or {}).get("experiment_a") or {}).get("total_s")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def tfm_failure_hint(log_text: str) -> str:
+    """Wskazówka po nieudanym treningu TFM (bez powtórki na CPU) — z ostatnich linii logu kroku."""
+    text = log_text.lower()
+    if any(s in text for s in ("tfmweightserror", "brak wag", "brak checkpointu")):
+        return "brak lokalnych wag — pobierz je raz: python scripts/13_tfm_setup.py (potem trening działa offline)"
+    if any(s in text for s in ("tfmoutofmemoryerror", "brak pamięci gpu", "out of memory")):
+        return ("brak pamięci GPU — zamknij inne programy na karcie (np. `ollama stop <model>`), sprawdź wolną "
+                "VRAM i zapas: python scripts/13_tfm_setup.py (benchmark); albo mniejszy profil / n_ctx / "
+                "n_estimators")
+    if any(f"no module named '{lib}'" in text for lib in ("torch", "tabpfn", "tabicl", "huggingface_hub")):
+        return ("brak bibliotek TFM — koło torch z CUDA, potem pip install -r requirements-tfm.txt "
+                "(training/docs/TFM.md) i python scripts/13_tfm_setup.py")
+    if any(s in text for s in ("tfmdeviceerror", "brak gpu", "cuda", "torch")):
+        from src.utils.hardware import TORCH_CUDA_INDEX_URL, TORCH_CUDA_INDEX_URL_OLD_DRIVER
+
+        return (f"GPU / CUDA niedostępne dla torch — koło CUDA: pip install torch --index-url {TORCH_CUDA_INDEX_URL} "
+                f"(sterownik NVIDIA < 580: {TORCH_CUDA_INDEX_URL_OLD_DRIVER}), potem python scripts/13_tfm_setup.py; "
+                f"test bez GPU: --profile smoke")
+    return "sprawdź środowisko TFM: python scripts/13_tfm_setup.py --offline-check"
+
+
 def prepare_command(split: str) -> list[str]:
     return [*python_cmd(), str(SCRIPTS_DIR / "02_preprocess.py"), "--split", split]
 
 
-def preflight_command(out_dir: Path) -> list[str]:
-    return [*python_cmd(), str(SCRIPTS_DIR / "00_check_env.py"), "--out-dir", str(out_dir)]
+def preflight_command(out_dir: Path, models: Sequence[str] | None = None, profile: str | None = None,
+                      tune: bool = True) -> list[str]:
+    """00_check_env.py; z listą modeli i profilem (kontrola TFM: torch + CUDA, wersje, wagi offline, VRAM)."""
+    cmd = [*python_cmd(), str(SCRIPTS_DIR / "00_check_env.py"), "--out-dir", str(out_dir)]
+    if models is not None:
+        cmd += ["--models", ",".join(models)]
+    if profile:
+        cmd += ["--profile", profile]
+    if not tune:
+        cmd.append("--no-tune")
+    return cmd
 
 
 def log_has_gpu_error(text: str, tail_lines: int = 400) -> bool:
@@ -509,7 +698,7 @@ def log_has_gpu_error(text: str, tail_lines: int = 400) -> bool:
 
 
 def model_budget(model: str, profile: str, device: str) -> dict[str, Any]:
-    """Budżet tuningu modelu z profilu (CPU_FALLBACK_BUDGETS dla xgboost/catboost na CPU)."""
+    """Budżet tuningu modelu z profilu (CPU_FALLBACK_BUDGETS dla xgboost/catboost na CPU; TFM go nie mają)."""
     prof = config.TUNING_PROFILES[profile]
     budget = dict(prof[model])
     if model in GPU_MODELS and device == "cpu":
@@ -517,10 +706,26 @@ def model_budget(model: str, profile: str, device: str) -> dict[str, Any]:
     return budget
 
 
-def model_eta_s(model: str, profile: str, device: str, tune: bool) -> float:
-    """Górne oszacowanie czasu modelu: limit czasu tuningu z profilu + trening finalny i ewaluacja."""
+def fit_allowance_s(model: str, profile: str) -> float:
+    """
+    Zapas na trening finalny + ewaluację ponad limit czasu tuningu. Modele klasyczne: FINAL_FIT_ALLOWANCE_S
+    (pełne dane) albo SAMPLED_FIT_ALLOWANCE_S (profil z próbką). TFM: `final_budget_s` profilu — finalna
+    predykcja VAL + TEST dominuje także na profilu z próbką TRAIN (quick: pełne VAL + TEST).
+    """
+    if model in TFM_MODELS:
+        final = (config.TUNING_PROFILES[profile].get(model) or {}).get("final_budget_s")
+        if final:
+            return float(final)
     sampled = config.TUNING_PROFILES[profile].get("train_sample") is not None
-    allowance = SAMPLED_FIT_ALLOWANCE_S if sampled else FINAL_FIT_ALLOWANCE_S.get(model, 600)
+    return float(SAMPLED_FIT_ALLOWANCE_S if sampled else FINAL_FIT_ALLOWANCE_S.get(model, 600))
+
+
+def model_eta_s(model: str, profile: str, device: str, tune: bool) -> float:
+    """
+    Górne oszacowanie czasu modelu: limit czasu tuningu z profilu (TFM: limit wyboru konfiguracji)
+    + trening finalny i ewaluacja (`fit_allowance_s`; TFM: `final_budget_s`).
+    """
+    allowance = fit_allowance_s(model, profile)
     if not tune:
         return float(allowance)
     return float(model_budget(model, profile, device)["timeout_s"] + allowance)
@@ -741,6 +946,19 @@ def run_metrics(run_dir: Path | str | None) -> dict[str, Any]:
     }
 
 
+def _run_duration_s(run_dir: Path) -> float | None:
+    """
+    Czas treningu finalnego runa (s) do szacunku refitów analiz. TFM: `training_duration_s` mierzy tylko
+    zapis kontekstu (≈ 0 s), więc doliczany jest czas finalnej predykcji (`run_info.tfm.predict_s`).
+    """
+    info = read_json(Path(run_dir) / "run_info.json") or {}
+    duration = info.get("training_duration_s")
+    tfm = info.get("tfm") if isinstance(info.get("tfm"), dict) else None
+    if tfm:
+        duration = float(duration or 0.0) + float(tfm.get("predict_s") or 0.0)
+    return duration
+
+
 def optuna_progress(storage_dir: Path, model: str, feature_set: str, profile: str,
                     fingerprint: str) -> dict[str, int] | None:
     """
@@ -772,6 +990,23 @@ def optuna_progress(storage_dir: Path, model: str, feature_set: str, profile: st
     return counts if found else None
 
 
+def tfm_selection_progress(storage_dir: Path, model: str, feature_set: str, profile: str,
+                           fingerprint: str) -> dict[str, int] | None:
+    """
+    Postęp wyboru konfiguracji TFM (`src.models.tfm_tuning.selection_progress`: pliki kandydatów
+    `tfm_<model>_*.json` w katalogu Optuny): {complete, oom, failed}; None = brak plików / modułu.
+    """
+    try:
+        from src.models.tfm_tuning import selection_progress
+    except ImportError:
+        return None
+    try:
+        return selection_progress(Path(storage_dir), model, feature_set=feature_set, profile=profile,
+                                  data_fp=fingerprint)
+    except OSError:
+        return None
+
+
 # ─────────────────────────────────────────
 # Orkiestrator
 # ─────────────────────────────────────────
@@ -795,6 +1030,7 @@ class Orchestrator:
         self.interrupted = False
         self.tasks: list[ModelTask] = []
         self.analysis_tasks: list[AnalysisTask] = []
+        self.analysis_skipped: list[dict[str, str]] = []   # kroki TFM bez warunków: {fs, name, reason}
         self.lanes: list[Lane] = []
         self.devices: dict[str, str] = {}
         self.gpu_models: list[str] = []
@@ -1027,8 +1263,11 @@ class Orchestrator:
             self._file_handler.close()
             self._file_handler = None
 
-    def _base_env(self, n_jobs: int, devices: Mapping[str, str] | None = None) -> dict[str, str]:
-        return build_child_env(os.environ, n_jobs, devices if devices is not None else self.devices)
+    def _base_env(self, n_jobs: int, devices: Mapping[str, str] | None = None,
+                  models: Sequence[str] | None = None) -> dict[str, str]:
+        """Środowisko kroku; klucze urządzeń TFM tylko dla kroków tych TFM (`models`, `child_devices`)."""
+        chosen = devices if devices is not None else self.devices
+        return build_child_env(os.environ, n_jobs, child_devices(chosen, models))
 
     def _total_threads(self) -> int:
         from src.utils import hardware
@@ -1036,9 +1275,14 @@ class Orchestrator:
         return hardware.n_jobs()
 
     def run_preflight(self) -> bool:
-        """00_check_env.py w osobnym procesie (kontekst CUDA próby GPU nie zostaje w orkiestratorze)."""
-        rc = self.runner(preflight_command(self.log_dir), self._base_env(self._total_threads(), {}),
-                         self.log_dir / "preflight.log", "preflight")
+        """
+        00_check_env.py w osobnym procesie (kontekst CUDA próby GPU i import torch nie zostają
+        w orkiestratorze) — z listą modeli i profilem: przy TFM także torch + CUDA, wersje, wagi offline,
+        wolna VRAM; bez CUDA odmowa (kod ≠ 0), chyba że profil smoke.
+        """
+        o = self.opts
+        rc = self.runner(preflight_command(self.log_dir, o.models, o.profile, o.tune),
+                         self._base_env(self._total_threads(), {}), self.log_dir / "preflight.log", "preflight")
         self.preflight = read_json(self.log_dir / "preflight.json") or {}
         if rc != 0:
             self.say(f"Preflight: błędy krytyczne (kod {rc}) — popraw je i uruchom ponownie "
@@ -1067,7 +1311,7 @@ class Orchestrator:
     def plan(self) -> None:
         """Urządzenia, tory (wg urządzeń modeli), wątki i zadania (z oznaczeniem już ukończonych)."""
         gpu_ok, detected = self._gpu_hint()
-        self.devices = resolve_devices(os.environ, detected)
+        self.devices = resolve_devices(os.environ, detected, self.opts.models)
         self.gpu_models = gpu_planned_models(self.opts.models, self.devices, gpu_ok)
         physical, ram = self._resources()
         n_lanes = decide_lanes(self.opts.lanes, self.gpu_models, physical, ram, self.opts.models)
@@ -1112,12 +1356,18 @@ class Orchestrator:
     def print_plan(self) -> None:
         o = self.opts
         self.say("═" * 72)
+        tfms = [m for m in o.models if m in TFM_MODELS]
+        tuning = ("tuning Optuną" + (" / wybór konfiguracji TFM" if tfms else "")) if o.tune else \
+            "bez tuningu (parametry domyślne)"
         self.say(f" run_all · profil '{o.profile}' · zestawy {', '.join(o.feature_sets)} · podział '{o.split}' · "
-                 f"{'tuning Optuną' if o.tune else 'bez tuningu (parametry domyślne)'} · tag '{o.tag}'")
+                 f"{tuning} · tag '{o.tag}'")
         self.say("═" * 72)
         self.say("Urządzenia: " + ", ".join(f"{k}={v}" for k, v in self.devices.items())
                  + f" | tory: {len(self.lanes)} — " + "; ".join(
                      f"{lane.name}: {' → '.join(lane.models)} (wątki: {lane.n_jobs})" for lane in self.lanes))
+        if tfms:
+            self.say(f"TFM ({', '.join(tfms)}): kontekst z TRAIN, wybór konfiguracji na holdoucie z TRAIN; "
+                     f"urządzenie z próby torch (preflight); błąd GPU bez powtórki na CPU")
         lane_totals: dict[str, float] = {}
         for task in self.tasks:
             state = ("pomijam — gotowy run " + str(task.run_name)) if task.status == SKIPPED else \
@@ -1133,7 +1383,8 @@ class Orchestrator:
                      + ("" if len(lane_totals) < 2 else
                         " (" + ", ".join(f"tor {k}: {format_duration(v)}" for k, v in lane_totals.items()) + ")"))
         if self.opts.stage == "all":
-            self.say("Po treningu: analizy (seedy → leave-site-out → krzywa uczenia) na gotowych runach")
+            self.say("Po treningu: analizy (seedy → leave-site-out → krzywa uczenia; kroki TFM, gdy są ich "
+                     "warunki: małe dane → łączenie z LightGBM) na gotowych runach")
         if not self.opts.dry_run:
             self.say(f"Logi: {self.log_dir}")
 
@@ -1190,19 +1441,24 @@ class Orchestrator:
             self._write_status()
             self.say(f"▶ {task.key}: trening (ETA ≤ {format_duration(task.eta_s)}, wątki: {task.n_jobs}, "
                      f"tor {task.lane})")
-            env = self._base_env(task.n_jobs)
+            env = self._base_env(task.n_jobs, models=[task.model])
             cmd = train_command(task.model, task.fs, self.opts.profile, self.opts.tag, self.opts.tune)
             log_path = self._step_log(task, "train")
             rc = self.runner(cmd, env, log_path, self._prefix(task))
-            if (rc != 0 and not self.stop.is_set() and task.model in GPU_MODELS
-                    and env.get(f"SOR_AI_DEVICE_{task.model.upper()}") != "cpu"
-                    and log_has_gpu_error(_tail(log_path, 400))):
+            gpu_error = (rc != 0 and not self.stop.is_set() and task.model in GPU_MODELS
+                         and env.get(f"SOR_AI_DEVICE_{task.model.upper()}") != "cpu"
+                         and log_has_gpu_error(_tail(log_path, 400)))
+            if gpu_error and task.model in TFM_MODELS:
+                # TFM: bez powtórki na CPU (kontekst 25k–100k na CPU = wiele godzin; wrapper i tak odmawia)
+                self.say(f"{task.key}: błąd GPU modelu fundamentalnego — BEZ powtórki na CPU. "
+                         f"{tfm_failure_hint(_tail(log_path, 400))}", logging.WARNING)
+            elif gpu_error:
                 threads = self._cpu_retry_threads(task)
                 self.say(f"{task.key}: błąd GPU w logu — ponawiam RAZ na CPU "
                          f"(SOR_AI_DEVICE_{task.model.upper()}=cpu, budżet zastępczy, wątki: {threads})",
                          logging.WARNING)
                 task.retried_on_cpu, task.retry_n_jobs = True, threads
-                env = {**self._base_env(threads), f"SOR_AI_DEVICE_{task.model.upper()}": "cpu"}
+                env = {**self._base_env(threads, models=[task.model]), f"SOR_AI_DEVICE_{task.model.upper()}": "cpu"}
                 log_path = self._step_log(task, "train_cpu")
                 rc = self.runner(cmd, env, log_path, self._prefix(task) + "·cpu")
             task.rc = rc
@@ -1225,13 +1481,15 @@ class Orchestrator:
                 task.status = FAILED
                 task.error = (f"kod wyjścia {rc}" if rc != 0 else "kod 0, ale brak DONE.json") \
                     + f" — log: {log_path}"
+                if task.model in TFM_MODELS:
+                    task.error += f" — {tfm_failure_hint(_tail(log_path, 400))}"
                 self.say(f"✗ {task.key}: NIEUDANY ({task.error})", logging.ERROR)
         if task.status in _OK_STATES and task.run_dir and (self.opts.force or not eval_done(Path(task.run_dir))):
             if self.stop.is_set():
                 task.eval_status = NOT_STARTED
             else:
                 self._write_status()
-                rc = self.runner(eval_command(task.run_dir), self._base_env(task.n_jobs),
+                rc = self.runner(eval_command(task.run_dir), self._base_env(task.n_jobs, models=[task.model]),
                                  self._step_log(task, "eval"), self._prefix(task) + "·eval")
                 task.eval_status = DONE if rc == 0 else (INTERRUPTED if self.stop.is_set() else FAILED)
                 if task.eval_status == FAILED:
@@ -1331,6 +1589,7 @@ class Orchestrator:
             "lanes": [asdict(lane) for lane in self.lanes],
             "tasks": [asdict(t) for t in self.tasks],
             "analyses": [asdict(t) for t in self.analysis_tasks],
+            "analyses_skipped": list(self.analysis_skipped),
             "compare": self.compare,
             "interrupted": self.interrupted,
             "summaries": [str(p) for p in self.summaries],
@@ -1356,6 +1615,7 @@ class Orchestrator:
         hw = facts.get("hardware") or {}
         smi = hw.get("nvidia_smi") or facts.get("nvidia_smi") or {}
         counts = {s: sum(t.status == s for t in tasks) for s in (DONE, SKIPPED, FAILED, INTERRUPTED, NOT_STARTED)}
+        has_tfm = any(t.model in TFM_MODELS for t in tasks)
         lines = [
             f"# run_all — {fs} · profil {o.profile}",
             "",
@@ -1363,7 +1623,9 @@ class Orchestrator:
             f"czas {format_duration((ended - self.started).total_seconds())}"
             + (" — **PRZERWANO (Ctrl+C)**" if self.interrupted else ""),
             f"- dane `{config.DATA_VERSION}`, odcisk `{self.fingerprint}`, podział `{o.split}`; tag runów `{o.tag}`; "
-            + ("tuning Optuną (cel: log loss, CV na TRAIN)" if o.tune else "bez tuningu (parametry domyślne)"),
+            + ("tuning Optuną (cel: log loss, CV na TRAIN)" if o.tune else "bez tuningu (parametry domyślne)")
+            + ("; modele fundamentalne (TFM): wybór konfiguracji na holdoucie z TRAIN (bez Optuny)"
+               if has_tfm and o.tune else ""),
             "- tory: " + "; ".join(f"{lane.name}: {' → '.join(lane.models)} (wątki: {lane.n_jobs})"
                                    for lane in self.lanes),
             "- urządzenia (żądane): " + ", ".join(f"{k} `{v}`" for k, v in self.devices.items())
@@ -1411,7 +1673,9 @@ class Orchestrator:
             "",
             "Kolumny: *CV* = najlepszy wynik tuningu (k-fold na TRAIN, ± odchylenie między foldami); "
             "*koszt* = reguła minimalnego kosztu oczekiwanego (niedotriażowanie 3× droższe); "
-            "*vc* = podgrupa z kompletem HR/SBP/RR przy triażu (populacja jak w TOPSOR).",
+            "*vc* = podgrupa z kompletem HR/SBP/RR przy triażu (populacja jak w TOPSOR)."
+            + (" TFM: *CV* = log loss holdoutu z TRAIN (`holdout_logloss`), *próby* = kandydaci konfiguracji "
+               "(ukończeni / pominięci przez limit czasu / błędy lub brak pamięci)." if has_tfm else ""),
             "",
         ]
         cmp = self.compare.get(fs) or {}
@@ -1453,6 +1717,9 @@ class Orchestrator:
                   + (f" --feature-set {fs}" if fs != "triage" else "") + "`"]
         if o.profile in ("smoke", "quick"):
             lines.append("- to był przebieg testowy — właściwy: `python scripts/run_all.py` (profil standard)")
+            if has_tfm:
+                lines.append("- modele fundamentalne na GPU: najpierw `python scripts/13_tfm_setup.py` (wagi, benchmark, "
+                             "szacunki czasu), potem `python scripts/run_all.py --profile thorough --models tfm`")
         elif o.profile == "standard":
             lines.append("- dłuższy tuning (≈1,7× próby i czas): `python scripts/run_all.py --profile thorough`")
         path = self.runs_dir / f"run_all_summary__{fs}__{o.profile}__{self.ts}.md"
@@ -1606,6 +1873,8 @@ class Orchestrator:
         o = self.opts
         assume_trained = o.dry_run and o.stage == "all"     # plan na sucho: runy powstaną w etapie train
         self.analysis_tasks = []
+        self.analysis_skipped = []
+        self.fingerprint = data_fingerprint()
         found = False
         for fs in o.feature_sets:
             runs = {m: None for m in o.models} if assume_trained else self._source_run_dirs(fs)
@@ -1614,15 +1883,27 @@ class Orchestrator:
             if runs and missing:
                 self.say(f"Analizy {fs}: brak ukończonych runów '{o.tag}' (z tuningiem, bieżące dane) dla: "
                          f"{', '.join(missing)} — analizy bez tych modeli", logging.WARNING)
-            durations = {m: (read_json(Path(d) / "run_info.json") or {}).get("training_duration_s")
-                         for m, d in runs.items() if d is not None}
+            durations = {m: _run_duration_s(Path(d)) for m, d in runs.items() if d is not None}
             for name in ANALYSIS_STEPS:
+                if name in TFM_ANALYSES:
+                    models, reason = tfm_analysis_models(name, fs, o.tag, self.runs_dir, self.fingerprint,
+                                                         planned=o.models if assume_trained else None)
+                    if reason is not None:          # warunki kroku TFM niespełnione — bez zadania
+                        self.analysis_skipped.append({"fs": fs, "name": name, "reason": reason})
+                        continue
+                    self.analysis_tasks.append(AnalysisTask(fs=fs, name=name, models=models,
+                                                            eta_s=tfm_analysis_eta_s(name, self.runs_dir)))
+                    continue
                 models = analysis_models(name, list(runs))
                 task = AnalysisTask(fs=fs, name=name, models=models,
                                     eta_s=analysis_eta_s(name, {m: durations.get(m) for m in models}))
                 if not models:
                     task.status, task.note = NOT_STARTED, "brak modeli tej analizy z gotowym runem"
                 self.analysis_tasks.append(task)
+            seeds_tfm = [m for m in runs if m in TFM_MODELS]
+            if seeds_tfm:
+                self.say(f"Analizy {fs}: refity seedów obejmą modele fundamentalne ({', '.join(seeds_tfm)} — "
+                         f"jawnie w --models); każdy refit TFM = pełna predykcja VAL + TEST", logging.WARNING)
         if not found:
             self.say(f"Analizy: brak ukończonych runów profilu '{o.profile}' (tag '{o.tag}', z tuningiem, dane "
                      f"{config.DATA_VERSION} / odcisk {self.fingerprint}) dla modeli {', '.join(o.models)} i zestawu "
@@ -1641,11 +1922,13 @@ class Orchestrator:
                          f"(gotowe jednostki są pomijane)")
             else:
                 self.say(f"  {task.fs:7s} {task.name:15s} pomijam — {task.note}")
+        for skipped in self.analysis_skipped:
+            self.say(f"  {skipped['fs']:7s} {skipped['name']:15s} pomijam — {skipped['reason']}")
 
     def _read_analysis_progress(self, task: AnalysisTask) -> None:
-        from src.analysis.common import analysis_dir, analysis_progress
+        from src.analysis.common import analysis_progress
 
-        progress = analysis_progress(analysis_dir(task.name, task.fs, self.opts.tag, self.runs_dir))
+        progress = analysis_progress(analysis_path(task.name, task.fs, self.opts.tag, self.runs_dir))
         if progress:
             task.units_done, task.units_total, task.results = progress["done"], progress["total"], progress["results"]
 
@@ -1667,8 +1950,11 @@ class Orchestrator:
             prefix = f"{task.name}·{task.fs}" if multi else task.name
             result: dict[str, int] = {}
 
-            def job(cmd: list[str] = cmd, log_path: Path = log_path, prefix: str = prefix) -> None:
-                result["rc"] = self.runner(cmd, self._base_env(self._total_threads()), log_path, prefix)
+            env = self._base_env(self._total_threads(), models=task.models)
+
+            def job(cmd: list[str] = cmd, log_path: Path = log_path, prefix: str = prefix,
+                    env: dict[str, str] = env) -> None:
+                result["rc"] = self.runner(cmd, env, log_path, prefix)
 
             t0 = time.time()
             self._run_jobs([job])
@@ -1709,7 +1995,7 @@ class Orchestrator:
             return 2
         if not self.devices:
             gpu_ok, detected = self._gpu_hint()
-            self.devices = resolve_devices(os.environ, detected)
+            self.devices = resolve_devices(os.environ, detected, self.opts.models)
         if not self.plan_analyses():
             self._write_status()
             return 2
@@ -1732,6 +2018,8 @@ class Orchestrator:
             self.say(f"  {t.fs:7s} analiza {t.name:15s} {STATUS_PL.get(t.status, t.status):17s}{units}"
                      + (f" → {Path(t.results).parent / 'summary.md'}" if t.results else "")
                      + (f" ({t.note})" if t.note else ""))
+        for skipped in self.analysis_skipped:
+            self.say(f"  {skipped['fs']:7s} analiza {skipped['name']:15s} pominięta — {skipped['reason']}")
         if any(t.status in (FAILED, INTERRUPTED, NOT_STARTED) and t.models for t in self.analysis_tasks):
             self.say(f"Wznowienie analiz (gotowe jednostki zostaną pominięte): {resume_command(self.opts.argv)}",
                      logging.WARNING)
@@ -1780,7 +2068,7 @@ def status_report(opts: Options) -> str:
     running = {f"{t.get('fs')}/{t.get('model')}" for t in status.get("tasks", []) if t.get("status") == RUNNING}
     active = status.get("state") in (None, "running")
     alive = orchestrator_alive(status) if status and active else False
-    planned = resolve_devices(os.environ, status.get("devices") if same_run else None)
+    planned = resolve_devices(os.environ, status.get("devices") if same_run else None, opts.models)
 
     lines = [
         f"Stan: profil '{opts.profile}', tag '{opts.tag}', dane {config.DATA_VERSION} "
@@ -1802,13 +2090,19 @@ def status_report(opts: Options) -> str:
                        f"{_fmt_metric(m.get('val_cost_quadratic_weighted_kappa'), 3)}")
                 lines.append(f"{fs:7s} {model:14s} {state:30s} {qwk:18s} {str(actual or '—'):11s} {run_dir.name}")
                 continue
-            progress = optuna_progress(Path(config.OPTUNA_STORAGE_DIR), model, fs, opts.profile, fingerprint)
+            tfm = model in TFM_MODELS
+            progress = (tfm_selection_progress if tfm else optuna_progress)(
+                Path(config.OPTUNA_STORAGE_DIR), model, fs, opts.profile, fingerprint)
             partial = [p for p in runs_dir.glob(f"*_{model}_{fs}_{opts.tag}") if not (p / DONE_JSON).exists()]
             detail = ""
             if progress:
-                finished = progress.get("complete", 0) + progress.get("pruned", 0)
                 target = config.TUNING_PROFILES[opts.profile][model]["n_trials"]
-                state = f"tuning {finished}/{target} prób"
+                if tfm:                          # kandydaci wyboru konfiguracji (holdout z TRAIN)
+                    finished = sum(int(v) for v in progress.values())
+                    state = f"wybór konfiguracji {finished}/{target}"
+                else:
+                    finished = progress.get("complete", 0) + progress.get("pruned", 0)
+                    state = f"tuning {finished}/{target} prób"
                 detail = ", ".join(f"{k} {v}" for k, v in sorted(progress.items()))
             elif partial:
                 state, detail = "przerwany", f"niedokończony katalog {sorted(partial)[-1].name}"
@@ -1821,7 +2115,7 @@ def status_report(opts: Options) -> str:
                 elif alive:
                     state = "w toku — " + state if progress else "w toku"
             lines.append(f"{fs:7s} {model:14s} {state:30s} {'—':18s} {'—':11s} {detail}")
-    lines += _analyses_status_lines(opts, status if same_run and active else {}, alive)
+    lines += _analyses_status_lines(opts, status if same_run and active else {}, alive, fingerprint)
     if status_path is not None:
         line = f"Ostatnie uruchomienie: {status_path.parent} (aktualizacja {status.get('updated_at')})"
         if active and alive is False:
@@ -1837,18 +2131,31 @@ def status_report(opts: Options) -> str:
     return "\n".join(lines)
 
 
-def _analyses_status_lines(opts: Options, status: Mapping[str, Any], alive: bool | None) -> list[str]:
-    """Postęp analiz (runs/analyses/…: plan.json, pliki jednostek, results.json) dla `--status`."""
+def _analyses_status_lines(opts: Options, status: Mapping[str, Any], alive: bool | None,
+                           fingerprint: str | None = None) -> list[str]:
+    """
+    Postęp analiz (runs/analyses/…: plan.json, pliki jednostek, results.json) dla `--status`; kroki TFM
+    (small_data, tfm_blend) bez spełnionych warunków i bez wyników → „pominięta: <powód>”.
+    """
     try:
-        from src.analysis.common import analyses_status
+        from src.analysis.common import analyses_status, analysis_progress
     except ImportError:             # niepełna instalacja — stan treningu i tak jest pokazany
         return []
     running = {f"{t.get('fs')}/{t.get('name')}" for t in status.get("analyses", []) if t.get("status") == RUNNING}
     lines = ["", f"Analizy (tag '{opts.tag}', runs/analyses; uruchom: --stage analyses):"]
+    runs_dir = Path(config.RUNS_DIR)
     for fs in opts.feature_sets:
-        for name, progress in analyses_status(fs, opts.tag, Path(config.RUNS_DIR)).items():
+        steps: dict[str, dict | None] = dict(analyses_status(fs, opts.tag, runs_dir))
+        skipped: dict[str, str] = {}
+        for name in TFM_ANALYSES:
+            steps[name] = analysis_progress(analysis_path(name, fs, opts.tag, runs_dir))
+            if steps[name] is None:
+                _, reason = tfm_analysis_models(name, fs, opts.tag, runs_dir, fingerprint or data_fingerprint())
+                if reason is not None:
+                    skipped[name] = reason
+        for name, progress in steps.items():
             if progress is None:
-                state, detail = "nierozpoczęta", ""
+                state, detail = ("pominięta", skipped[name]) if name in skipped else ("nierozpoczęta", "")
             else:
                 state = f"{progress['done']}/{progress['total']} jednostek" + (" — gotowe" if progress["complete"] else "")
                 if progress["failures"]:
@@ -1873,7 +2180,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", choices=list(config.TUNING_PROFILES), default=config.DEFAULT_TUNING_PROFILE,
                         help="Budżet: smoke (5–10 min test), quick (~30 min), standard (noc), thorough")
     parser.add_argument("--feature-set", default="triage", help="triage | full | triage,full")
-    parser.add_argument("--models", default="all", help="all albo lista po przecinku, np. lightgbm,xgboost")
+    parser.add_argument("--models", default="all",
+                        help="all (6 modeli klasycznych), tfm (modele fundamentalne TabPFN-3.5 + TabICLv2, GPU) "
+                             "albo lista po przecinku, np. lightgbm,xgboost albo all,tfm (aliasy: lr, lgbm, xgb, "
+                             "cb, rf, pfn, icl)")
     parser.add_argument("--split", choices=list(SPLITS), default="random",
                         help="Podział danych: random (stratyfikowany) albo site (oddział B jako test)")
     parser.add_argument("--no-tune", action="store_true", help="Bez tuningu — parametry domyślne z config.py")
@@ -1890,7 +2200,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-keep-awake", action="store_true", help="Nie blokuj uśpienia komputera")
     parser.add_argument("--stage", choices=list(STAGES), default="train",
                         help="train = trening; analyses = analizy do pracy na gotowych runach (seedy, "
-                             "leave-site-out, krzywa uczenia; scripts/09–11); all = trening, potem analizy")
+                             "leave-site-out, krzywa uczenia; scripts/09–11; kroki TFM, gdy są ich warunki: "
+                             "krzywa małych danych 14, łączenie z LightGBM 15); all = trening, potem analizy")
     return parser
 
 
@@ -1924,30 +2235,43 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "AnalysisTask",
+    "CLASSICAL_MODELS",
     "Lane",
     "ModelTask",
     "Options",
     "Orchestrator",
+    "TFM_MODELS",
     "analysis_command",
     "analysis_eta_s",
     "analysis_models",
+    "analysis_path",
+    "analysis_script_exists",
     "assign_lanes",
     "build_child_env",
+    "child_devices",
     "data_fingerprint",
     "decide_lanes",
     "done_device",
     "find_done_run",
+    "fit_allowance_s",
     "gpu_planned_models",
     "is_gpu_device",
     "kill_process_tree",
     "log_has_gpu_error",
     "main",
     "model_eta_s",
+    "normalize_device",
     "orchestrator_alive",
     "parse_feature_sets",
     "parse_models",
     "popen_group_kwargs",
+    "preflight_command",
     "resolve_devices",
     "resume_command",
     "status_report",
+    "tfm_analysis_eta_s",
+    "tfm_analysis_models",
+    "tfm_failure_hint",
+    "tfm_libraries",
+    "tfm_selection_progress",
 ]

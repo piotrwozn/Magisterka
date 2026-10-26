@@ -16,6 +16,17 @@ raportuje ~31,8 GB), GPU niedostępne dla xgboost/catboost (→ CPU z budżetem 
 sterownik NVIDIA, ścieżka w OneDrive / ze znakami spoza ASCII / bardzo długa na Windows, kodowanie
 konsoli inne niż UTF-8, Windows: plan zasilania inny niż wysoka wydajność.
 
+Modele fundamentalne (TFM: tabpfn, tabicl) — kontrola tylko, gdy są na liście modeli (`check_tfm`;
+torch / tabpfn / tabicl NIE są pakietami wymaganymi — główny venv działa bez nich):
+    błąd krytyczny — brak torch / biblioteki TFM albo wersja starsza niż tabpfn 9.2.0 / tabicl 2.2.0,
+                     brak wag w lokalnej pamięci podręcznej (sprawdzane BEZ sieci; hak testowy
+                     SOR_AI_TABPFN_MODEL_PATH / SOR_AI_TABICL_MODEL_PATH / SOR_AI_TFM_FAKE omija kontrolę wag),
+                     brak CUDA (koło tylko-CPU, brak karty, nieudana próba torch, wymuszone CPU) — chyba że
+                     profil smoke z kontekstem ≤ TFM_CPU_MAX_CONTEXT (wtedy TFM na CPU),
+    ostrzeżenie   — WOLNA VRAM < 12 GB (torch.cuda.mem_get_info: Ollama, przeglądarka i pulpit zajmują
+                     kartę), mało miejsca w katalogu pamięci podręcznej wag.
+Urządzenie TFM z próby torch trafia do facts["devices"] (tory i środowisko procesów treningu).
+
 Kontrola, która sama się wywróci (np. brak pandas w świeżym venv), daje wpis w raporcie zamiast
 tracebacku — brak pakietu to błąd krytyczny z poleceniem instalacji.
 """
@@ -30,7 +41,7 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from importlib import metadata
@@ -93,6 +104,23 @@ REQUIRED_PACKAGES: dict[str, tuple[str, ...]] = {
 
 STATUS_OK, STATUS_WARN, STATUS_FAIL, STATUS_INFO = "ok", "warn", "fail", "info"
 _LABELS = {STATUS_OK: "[ OK  ]", STATUS_WARN: "[UWAGA]", STATUS_FAIL: "[BŁĄD ]", STATUS_INFO: "[INFO ]"}
+
+# Modele fundamentalne (TFM)
+TFM_MIN_VERSIONS: dict[str, str] = {"tabpfn": "9.2.0", "tabicl": "2.2.0"}
+TFM_VRAM_RECOMMENDED_GB: float = 12.0   # zalecana WOLNA VRAM (plan pamięci: szczyty profili ≤ ~11 GiB)
+TFM_DISK_WARN_GB: float = 2.0           # wolne miejsce w katalogu pamięci podręcznej wag (pobranie ~1 GB)
+TFM_CPU_PROFILE: str = "smoke"          # jedyny profil, w którym TFM mogą działać bez CUDA (kontekst ≤ limitu CPU)
+TFM_SETUP_COMMAND: str = "python scripts/13_tfm_setup.py"
+
+
+def tfm_install_advice() -> str:
+    """Polecenia instalacji TFM: koło torch z CUDA (cu130 / cu128 dla starszego sterownika) + requirements-tfm."""
+    from src.utils.hardware import TORCH_CUDA_INDEX_URL, TORCH_CUDA_INDEX_URL_OLD_DRIVER
+
+    return (f"pip install torch --index-url {TORCH_CUDA_INDEX_URL}  (sterownik NVIDIA < 580: --index-url "
+            f"{TORCH_CUDA_INDEX_URL_OLD_DRIVER}), potem pip install -r requirements-tfm.txt -c requirements-lock.txt "
+            f"i {TFM_SETUP_COMMAND} (training/docs/TFM.md)")
+
 
 _GPU_ADVICE: dict[str, str] = {
     "xgboost": "Zaktualizuj sterownik NVIDIA do >= 580 (Game Ready/Studio): koło xgboost 3.4 jest zbudowane "
@@ -409,6 +437,288 @@ def check_gpu(
     return devices
 
 
+# ─────────────────────────────────────────
+# Modele fundamentalne (TFM)
+# ─────────────────────────────────────────
+def _version_tuple(text: str) -> tuple[int, ...]:
+    """'9.2.0' / '2.2.0.post1' → (9, 2, 0) — porównanie bez pakietu `packaging`."""
+    parts = []
+    for piece in str(text).split("."):
+        match = re.match(r"\d+", piece)
+        if not match:
+            break
+        parts.append(int(match.group(0)))
+    return tuple(parts)
+
+
+def _version_at_least(version: str, minimum: str) -> bool:
+    try:
+        from packaging.version import InvalidVersion, Version
+
+        try:
+            return Version(version) >= Version(minimum)
+        except InvalidVersion:
+            pass
+    except ImportError:
+        pass
+    return _version_tuple(version) >= _version_tuple(minimum)
+
+
+def tfm_weights_status(model: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """
+    Wagi modelu TFM w LOKALNEJ pamięci podręcznej — bez sieci i bez pobierania:
+    {'present', 'path', 'cache_dir', 'size_mb', 'label', 'override'}.
+
+    Hak testowy (SOR_AI_TABPFN_MODEL_PATH / SOR_AI_TABICL_MODEL_PATH / SOR_AI_TFM_FAKE) ma pierwszeństwo:
+    sprawdzany jest wtedy tylko wskazany plik. Ścieżki jak w wrapperach: TabPFN — plik wersji
+    `model_version` w katalogu TabPFN (TABPFN_MODEL_CACHE_DIR, także z pliku .env w bieżącym katalogu),
+    TabICL — `hf_hub_download(..., local_files_only=True)` (HF_HUB_CACHE / HF_HOME). Importuje bibliotekę
+    (torch, kilka sekund) — tylko w procesie preflight / 13_tfm_setup; ImportError przechodzi dalej.
+    """
+    from src.models.tfm_base import FAKE_ENV, fake_mode, weights_override_active
+
+    if model not in config.TFM_MODELS:
+        raise ValueError(f"'{model}' nie jest modelem TFM ({', '.join(config.TFM_MODELS)})")
+    defaults = dict(getattr(config, f"{model.upper()}_DEFAULT_PARAMS", {}))
+    params = {**defaults, **dict(params or {})}
+    out: dict[str, Any] = {"present": False, "path": None, "cache_dir": None, "size_mb": None,
+                           "label": model, "override": weights_override_active(model)}
+    if out["override"]:
+        if fake_mode():
+            out.update(present=True, label=f"atrapa ({FAKE_ENV}=1)")
+            return out
+        raw = str(out["override"]).split("=", 1)[1]
+        path = Path(raw).expanduser()
+        out.update(path=str(path), cache_dir=str(path.parent), label=f"{model} (przekierowanie)")
+    elif model == "tabpfn":
+        from src.models.tabpfn_model import default_weights_path
+
+        version = str(params.get("model_version") or "v3.5")
+        path = default_weights_path(version)
+        out.update(path=str(path), cache_dir=str(path.parent), label=f"TabPFN {version}")
+    elif model == "tabicl":
+        from src.models.tabicl_model import cached_checkpoint
+        from src.models.tfm_base import TFMWeightsError
+
+        name = str(params.get("checkpoint_version") or "tabicl-classifier-v2-20260212.ckpt")
+        out["label"] = f"TabICL {name}"
+        try:
+            from huggingface_hub import constants as hf_constants
+
+            out["cache_dir"] = str(hf_constants.HF_HUB_CACHE)
+        except Exception:  # noqa: BLE001 — tylko opis katalogu
+            pass
+        try:
+            path = cached_checkpoint(name)
+        except TFMWeightsError:
+            return out
+        out["path"] = str(path)
+    else:                                   # nieosiągalne (sprawdzone na początku)
+        raise ValueError(f"'{model}' nie jest modelem TFM ({', '.join(config.TFM_MODELS)})")
+    if path.is_file() and path.stat().st_size > 0:
+        out.update(present=True, size_mb=round(path.stat().st_size / 2**20, 1))
+    return out
+
+
+def _tfm_planned_context(model: str, profile: str, tune: bool) -> int:
+    """Największy kontekst worka planowany przez profil (kandydaci wyboru konfiguracji albo n_ctx domyślne)."""
+    from src.models.tfm_base import planned_max_context
+
+    prof = config.TUNING_PROFILES[profile]
+    budget = {**dict(prof.get(model) or {}), "train_sample": prof.get("train_sample")}
+    return int(planned_max_context(model, budget, None, tune))
+
+
+def check_tfm(
+    report: PreflightReport,
+    models: Sequence[str],
+    profile: str,
+    *,
+    tune: bool = True,
+    torch_info: Callable[[], dict[str, Any]] | None = None,
+    probe: Callable[[str], tuple[bool, str]] | None = None,
+    preference: Callable[[str], tuple[str, str]] | None = None,
+    version_of: Callable[[str], str | None] | None = None,
+    weights: Callable[[str], dict[str, Any]] | None = None,
+    disk_free: Callable[[Path], float | None] | None = None,
+    fake: bool | None = None,
+    planned_context: Callable[[str, str, bool], int] | None = None,
+) -> dict[str, str]:
+    """
+    Kontrola TFM (tylko gdy `models` zawiera tabpfn / tabicl): torch + CUDA, wersje bibliotek, wagi offline,
+    wolna VRAM, miejsce na dysku. Zwraca urządzenie TFM ('gpu' | 'cpu') — także w facts["devices"].
+
+    Bez CUDA (brak torch, koło tylko-CPU, brak karty / sterownika, nieudana próba torch, wymuszone CPU):
+    błąd krytyczny, chyba że profil smoke z kontekstem ≤ config.TFM_CPU_MAX_CONTEXT (wtedy 'cpu' z
+    ostrzeżeniem — tor CPU). probe=None (--no-gpu-probe): bez próbnej alokacji — decyduje
+    torch.cuda.is_available(). Parametry funkcyjne podstawiają testy (bez torch i karty).
+    """
+    tfms = [m for m in config.TFM_MODELS if m in models]
+    if not tfms:
+        return {}
+    from src.utils import hardware
+
+    torch_info = torch_info or hardware.torch_info
+    preference = preference or hardware.device_preference
+    version_of = version_of or _dist_version
+    weights = weights or tfm_weights_status
+    disk_free = disk_free or _disk_free_gb
+    planned_context = planned_context or _tfm_planned_context
+    if fake is None:
+        fake = os.environ.get("SOR_AI_TFM_FAKE", "").strip().lower() not in ("", "0", "false", "no", "off", "nie")
+    limit = int(config.TFM_CPU_MAX_CONTEXT)
+    install = tfm_install_advice()
+    facts: dict[str, Any] = {"models": tfms, "profile": profile, "fake": fake, "cpu_max_context": limit,
+                             "versions": {}, "weights": {}, "devices": {}, "planned_context": {}}
+    report.facts["tfm"] = facts
+    if fake:
+        report.add("TFM: hak testowy", STATUS_WARN, "SOR_AI_TFM_FAKE=1 — atrapa estymatora zamiast TabPFN / TabICL "
+                   "(tylko testy): wersje bibliotek i wagi nie są sprawdzane",
+                   "Usuń zmienną SOR_AI_TFM_FAKE przed prawdziwym treningiem.")
+
+    # ── torch i CUDA ──
+    info = dict(torch_info())
+    facts["torch"] = info
+    version, build = info.get("version"), info.get("cuda_build")
+    cuda_ok, why_not, torch_msg, torch_missing = False, None, "", False
+    if not info.get("installed"):
+        torch_missing, why_not = True, "torch nie jest zainstalowany"
+        if fake:
+            report.add("TFM: torch", STATUS_INFO, "torch nie jest zainstalowany — atrapa TFM działa bez niego (CPU)")
+        else:
+            report.add("TFM: torch", STATUS_FAIL, "torch nie jest zainstalowany (wymagany przez TabPFN i TabICL)",
+                       install)
+    elif info.get("error") and str(info["error"]).startswith("import torch"):
+        torch_missing, why_not = True, f"torch {version}: {info['error']}"
+        report.add("TFM: torch", STATUS_FAIL, f"{why_not} (uszkodzona instalacja?)", "Przeinstaluj: " + install)
+    elif build is None:
+        why_not = (f"torch {version} zbudowany BEZ CUDA (koło tylko-CPU — tak instaluje się torch z PyPI na "
+                   f"Windows)")
+    elif not info.get("cuda_available"):
+        why_not = (f"torch {version} (CUDA {build}): "
+                   + (info.get("error") or "torch.cuda.is_available() == False — brak karty NVIDIA albo "
+                      "sterownik za stary dla tej wersji CUDA"))
+    elif probe is not None:
+        ok, reason = probe("torch")
+        cuda_ok, torch_msg = bool(ok), reason
+        if not ok:
+            why_not = f"próba GPU torch nieudana: {reason}"
+    else:
+        cuda_ok = True
+        torch_msg = f"torch {version} (CUDA {build}) na {info.get('device_name')} — bez próbnej alokacji (--no-gpu-probe)"
+    if cuda_ok:
+        report.add("TFM: torch", STATUS_OK, torch_msg)
+    elif not torch_missing:
+        report.add("TFM: torch", STATUS_INFO if profile == TFM_CPU_PROFILE else STATUS_WARN,
+                   f"{why_not}. Modele TFM potrzebują GPU", install)
+
+    # ── urządzenie każdego TFM ──
+    devices: dict[str, str] = {}
+    for model in tfms:
+        try:
+            ctx = int(planned_context(model, profile, tune))
+        except Exception:  # noqa: BLE001 — brak budżetu w profilu: zachowawczo ponad limit CPU
+            ctx = limit + 1
+        facts["planned_context"][model] = ctx
+        try:
+            pref, source = preference(model)
+        except ValueError as exc:
+            report.add(f"TFM: {model}", STATUS_FAIL, str(exc), "Dozwolone wartości: auto | cpu | gpu")
+            devices[model] = "cpu"
+            continue
+        if pref != "cpu" and cuda_ok:
+            devices[model] = "gpu"
+            report.add(f"TFM: {model}", STATUS_OK, f"GPU (kontekst do {ctx:,} wierszy)")
+            continue
+        devices[model] = "cpu"
+        reason = f"CPU wymuszone ({source}=cpu)" if pref == "cpu" else (why_not or "brak CUDA")
+        if torch_missing and not fake:
+            continue                                 # błąd krytyczny już zgłoszony (TFM: torch)
+        if pref == "gpu":
+            report.add(f"TFM: {model}", STATUS_FAIL, f"{source}=gpu, ale GPU niedostępne: {reason}", install)
+        elif profile == TFM_CPU_PROFILE and ctx <= limit:
+            report.add(f"TFM: {model}", STATUS_WARN,
+                       f"CPU ({reason}) — profil {profile}, kontekst {ctx:,} ≤ {limit:,} wierszy: trening TFM na "
+                       f"CPU (tylko test mechaniki)", install)
+        else:
+            report.add(f"TFM: {model}", STATUS_FAIL,
+                       f"odmowa: {model} bez GPU ({reason}); profil '{profile}' planuje kontekst do {ctx:,} wierszy "
+                       f"> TFM_CPU_MAX_CONTEXT={limit:,} (na CPU predykcja trwałaby wiele godzin)",
+                       f"{install}. Test bez GPU: --profile {TFM_CPU_PROFILE}; albo usuń tfm z --models.")
+    facts["devices"] = devices
+    report.facts.setdefault("devices", {}).update(devices)
+
+    # ── wolna VRAM ──
+    if any(d == "gpu" for d in devices.values()):
+        free, total = info.get("free_vram_mb"), info.get("total_vram_mb")
+        if free is not None:
+            free_gb, total_gb = float(free) / 1024, float(total or 0) / 1024
+            msg = f"wolna VRAM {free_gb:.1f} GB z {total_gb:.1f} GB"
+            if free_gb < TFM_VRAM_RECOMMENDED_GB:
+                report.add("TFM: VRAM", STATUS_WARN, f"{msg} < {TFM_VRAM_RECOMMENDED_GB:.0f} GB zalecanych",
+                           "Zamknij programy używające karty (Ollama: `ollama ps`, `ollama stop <model>`; przeglądarka "
+                           "z akceleracją, gry). Przy braku pamięci TFM obniżają porcje same (drabina awaryjna), "
+                           "ostatecznie run kończy się błędem z listą parametrów do zmniejszenia.")
+            else:
+                report.add("TFM: VRAM", STATUS_OK, msg)
+
+    # ── biblioteki i wagi ──
+    if fake or torch_missing:
+        return devices
+    for model in tfms:
+        installed = version_of(model)
+        facts["versions"][model] = installed
+        minimum = TFM_MIN_VERSIONS[model]
+        if installed is None:
+            report.add(f"TFM: pakiet {model}", STATUS_FAIL, f"{model} nie jest zainstalowany (wymagany >= {minimum})",
+                       install)
+            continue
+        if not _version_at_least(installed, minimum):
+            report.add(f"TFM: pakiet {model}", STATUS_FAIL, f"{model} {installed} < {minimum} (requirements-tfm.txt)",
+                       "pip install -r requirements-tfm.txt -c requirements-lock.txt")
+            continue
+        report.add(f"TFM: pakiet {model}", STATUS_OK, f"{model} {installed}")
+        try:
+            status = weights(model)
+        except ImportError as exc:
+            report.add(f"TFM: wagi {model}", STATUS_FAIL, f"nie sprawdzono — import {model}: {exc}", install)
+            continue
+        except Exception as exc:  # noqa: BLE001 — opis błędu zamiast tracebacku
+            report.add(f"TFM: wagi {model}", STATUS_FAIL, f"nie sprawdzono — {type(exc).__name__}: {exc}",
+                       f"{TFM_SETUP_COMMAND} --offline-check")
+            continue
+        facts["weights"][model] = status
+        label = status.get("label") or model
+        if status.get("override"):
+            if status.get("present"):
+                report.add(f"TFM: wagi {model}", STATUS_WARN,
+                           f"PRZEKIEROWANIE WAG (tylko testy — predykcje bezwartościowe): {status['override']}",
+                           "Usuń zmienną przed prawdziwym treningiem.")
+            else:
+                report.add(f"TFM: wagi {model}", STATUS_FAIL,
+                           f"przekierowanie {status['override']} wskazuje nieistniejący plik",
+                           "Popraw ścieżkę albo usuń zmienną.")
+            continue
+        if status.get("present"):
+            size = f" ({status['size_mb']:,.0f} MB)" if status.get("size_mb") else ""
+            report.add(f"TFM: wagi {model}", STATUS_OK, f"{label}: {status.get('path')}{size} — offline")
+            continue
+        where = status.get("path") or status.get("cache_dir") or "?"
+        free = disk_free(Path(status["cache_dir"])) if status.get("cache_dir") else None
+        report.add(f"TFM: wagi {model}", STATUS_FAIL,
+                   f"{label}: brak w lokalnej pamięci podręcznej ({where}; sprawdzone bez sieci)"
+                   + (f"; wolne miejsce {free:.1f} GB" if free is not None else ""),
+                   f"Pobierz raz: {TFM_SETUP_COMMAND}"
+                   + (" (TabPFN-3.5: akceptacja licencji niekomercyjnej, TABPFN_TOKEN)" if model == "tabpfn" else
+                      " (checkpoint z Hugging Face, jingang/TabICL)")
+                   + " — potem trening działa offline.")
+        if free is not None and free < TFM_DISK_WARN_GB:
+            report.add("TFM: dysk", STATUS_WARN,
+                       f"wolne {free:.1f} GB w {status['cache_dir']} < {TFM_DISK_WARN_GB:.0f} GB (pobranie wag ~1 GB)",
+                       "Zwolnij miejsce albo przenieś pamięć podręczną (TABPFN_MODEL_CACHE_DIR, HF_HOME).")
+    return devices
+
+
 def check_data(report: PreflightReport) -> None:
     """Surowy Yale (parquet / rdata) albo gotowe splity; stan przygotowanych danych."""
     from src.data.dataset import is_prepared
@@ -568,13 +878,18 @@ def _safe_check(report: PreflightReport, name: str, check: Callable[..., Any], *
     return None
 
 
-def run_preflight(probe_gpus: bool = True, out_dir: Path | None = None) -> PreflightReport:
+def run_preflight(probe_gpus: bool = True, out_dir: Path | None = None, *,
+                  models: Sequence[str] | None = None, profile: str | None = None,
+                  tune: bool = True) -> PreflightReport:
     """
     Wszystkie kontrole. `out_dir` → zapis `preflight.json` (UTF-8).
 
     Próby GPU trenują po kilka iteracji na karcie (kilka–kilkanaście sekund przy pierwszym
     uruchomieniu); dodatni wynik jest zapamiętywany w logs/hardware_probe.json i używany
     przez procesy treningu.
+
+    models / profile / tune : plan przebiegu (run_all.py) — gdy `models` zawiera TFM (tabpfn, tabicl),
+    dochodzi `check_tfm` dla profilu (domyślnie config.DEFAULT_TUNING_PROFILE). None = bez TFM (jak dotąd).
     """
     from src.utils import hardware
 
@@ -590,6 +905,11 @@ def run_preflight(probe_gpus: bool = True, out_dir: Path | None = None) -> Prefl
     _safe_check(report, "Zasoby", check_resources, hw, _disk_free_gb(config.RUNS_DIR))
     _safe_check(report, "GPU", check_gpu, hw.get("nvidia_smi"), hardware.probe_gpu if probe_gpus else None,
                 hardware.device_preference, hw.get("xgboost_cuda_build"))
+    if models is not None and any(m in config.TFM_MODELS for m in models):
+        report.facts["models"] = list(models)
+        _safe_check(report, "TFM", lambda r: check_tfm(
+            r, list(models), profile or config.DEFAULT_TUNING_PROFILE, tune=tune,
+            probe=hardware.probe_gpu if probe_gpus else None))
     _safe_check(report, "Dane", check_data)
     _safe_check(report, "Ścieżki", check_paths, config.PROJECT_ROOT, system)
     _safe_check(report, "Kodowanie", check_encoding)
@@ -614,5 +934,8 @@ __all__ = [
     "check_power",
     "check_python",
     "check_resources",
+    "check_tfm",
     "run_preflight",
+    "tfm_install_advice",
+    "tfm_weights_status",
 ]

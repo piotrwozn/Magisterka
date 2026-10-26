@@ -29,10 +29,12 @@ from src.models.train import (
     run_training,
 )
 from src.utils.config import (
+    CLASSICAL_MODELS,
     CPU_FALLBACK_BUDGETS,
     DATA_VERSION,
     N_CLASSES,
     PROJECT_ROOT,
+    TFM_MODELS,
     TUNING_PROFILES,
 )
 
@@ -320,7 +322,14 @@ def test_resolve_budget_profiles_and_cpu_fallback():
         for model in MODEL_REGISTRY:
             budget = resolve_budget(model, profile, device="gpu")
             assert set(budget) >= {"n_trials", "tune_rows", "n_folds", "timeout_s", "train_sample", "eval_sample"}
-            assert budget["n_trials"] >= 1 and budget["n_folds"] >= 2 and budget["timeout_s"] > 0
+            assert budget["n_trials"] >= 1 and budget["timeout_s"] > 0
+            if model in CLASSICAL_MODELS:
+                assert budget["n_folds"] >= 2
+            else:
+                # TFM: ten sam kształt (n_trials = liczba kandydatów, tune_rows 0, n_folds 1) + klucze wyboru
+                assert model in TFM_MODELS and budget["n_folds"] == 1 and budget["tune_rows"] == 0
+                assert budget["n_trials"] == len(budget["candidates"])
+                assert {"candidates", "holdout_rows", "bags_stage", "final_budget_s", "max_bags"} <= set(budget)
     assert set(TUNING_PROFILES) == {"smoke", "quick", "standard", "thorough"}
 
     gpu = resolve_budget("xgboost", "standard", device="gpu")

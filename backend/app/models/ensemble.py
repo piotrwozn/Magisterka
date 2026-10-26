@@ -51,6 +51,14 @@ manual blend):
 An invalid file (also an unknown key, e.g. a typo "temprature") raises ValueError
 at startup — a mistake in the ensemble must be loud, not silently replaced by
 defaults.
+
+Tabular foundation models (TFM_MODELS: "tabpfn", "tabicl") may appear in "weights"
+(a recipe from training `scripts/15_tfm_blend.py` → `08_final_report.py`), but they
+never join the default equal-weight blend and the backend serves them only on
+opt-in (`SOR_AI_BACKEND_TFM=1`, CUDA required — app/models/registry.py). For that
+case 08 also writes the same recipe re-fitted WITHOUT the TFMs; deploy it next to
+this file as `ensemble_weights_no_tfm.json` (ENSEMBLE_WEIGHTS_NO_TFM_FILE): the
+registry switches to it (WARNING) whenever a weighted TFM is not served.
 """
 from __future__ import annotations
 
@@ -65,14 +73,20 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-# Models served by the backend (training/src/models MODEL_REGISTRY)
+# Classical models served by the backend (training/src/models MODEL_REGISTRY, config.CLASSICAL_MODELS)
 ENSEMBLE_MODELS: tuple[str, ...] = (
     "xgboost", "lightgbm", "catboost", "random_forest", "ebm", "logreg",
 )
-# Default weights: equal (no stale test-set scores baked into the code)
+# Pretrained tabular foundation models (training config.TFM_MODELS) — opt-in serving only, never in defaults
+TFM_MODELS: tuple[str, ...] = ("tabpfn", "tabicl")
+# Model names accepted in ensemble_weights.json
+KNOWN_MODELS: tuple[str, ...] = ENSEMBLE_MODELS + TFM_MODELS
+# Default weights: equal over the CLASSICAL models (no stale test-set scores baked into the code)
 MODEL_WEIGHTS: dict[str, float] = dict.fromkeys(ENSEMBLE_MODELS, 1.0)
 
 ENSEMBLE_WEIGHTS_FILE = "ensemble_weights.json"
+# The same recipe re-fitted on VAL without TFM members (training 08_final_report.py)
+ENSEMBLE_WEIGHTS_NO_TFM_FILE = "ensemble_weights_no_tfm.json"
 DEFAULT_SOURCE = "default (equal weights)"
 DECISION_RULES: tuple[str, ...] = ("argmax", "cost", "target", "bayes_target")
 # Parameters each rule accepts (training src/evaluation/decision.py RULE_PARAMS)
@@ -320,6 +334,11 @@ class EnsembleConfig:
         """Loaded models that take part in the ensemble (weight > 0), in the given order."""
         return [m for m in loaded_ids if self.weight(m) > 0]
 
+    @property
+    def tfm_members(self) -> list[str]:
+        """Foundation models (TFM_MODELS) with weight > 0 in this configuration."""
+        return [m for m in TFM_MODELS if self.weight(m) > 0]
+
     def combine(self, probas: dict[str, np.ndarray]) -> np.ndarray:
         """Per-model probabilities → blended (method, weights renormalised over the given
         models) → temperature-scaled when configured. The decision rule comes next."""
@@ -341,8 +360,8 @@ def _parse_weights(raw: Any, path: Path) -> dict[str, float]:
             raise ValueError(f"{path}: weight of {name!r} is not a number: {value!r}") from None
         if math.isnan(w) or math.isinf(w) or w < 0:
             raise ValueError(f"{path}: weight of {name!r} must be a finite number ≥ 0 (got {value!r})")
-        if name not in ENSEMBLE_MODELS:
-            log.warning("%s: unknown model %r ignored (known: %s)", path, name, ", ".join(ENSEMBLE_MODELS))
+        if name not in KNOWN_MODELS:
+            log.warning("%s: unknown model %r ignored (known: %s)", path, name, ", ".join(KNOWN_MODELS))
             continue
         weights[name] = w
     if sum(weights.values()) <= 0:

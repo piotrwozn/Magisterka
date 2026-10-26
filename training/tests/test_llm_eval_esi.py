@@ -558,3 +558,87 @@ class TestKnowledge:
         assert set(crit["punkty_decyzyjne"]) == {"B", "D"} and "10 min" in crit["opis"]
         with pytest.raises(ValueError):
             esi_criteria(6)
+
+
+# ─────────────────────────────────────────
+# Receptura z modelem fundamentalnym (TFM)
+# ─────────────────────────────────────────
+class _StubModel:
+    """Model receptury jak BaseTriageModel (unwrap_model → `.model`), bez trenowania."""
+
+    def __init__(self, raw: Any, pretrained: bool = False):
+        self.model = raw
+        self.feature_names = ["age"]
+        self.is_fitted = True
+        self.pretrained = pretrained
+        self.keep_fitted_bags: int | str = 1
+
+
+def _raw(kind: str) -> Any:
+    if kind == "linear":
+        return SimpleNamespace(coef_=np.zeros((5, 1)), intercept_=np.zeros(5))
+    names = {"tree": "LGBMClassifier", "ebm": "ExplainableBoostingClassifier", "tfm": "TFMPredictor"}
+    return type(names[kind], (), {"predict_proba": lambda self, X: None})()
+
+
+class TestTfmMembers:
+    @pytest.fixture
+    def explainer(self, monkeypatch):
+        from src.explain import shap_explainer
+
+        chosen: list[Any] = []
+
+        class FakeExplainer:
+            def __init__(self, model):
+                chosen.append(model)
+                self.method = "fake"
+
+            def fit(self):
+                return self
+
+        monkeypatch.setattr(shap_explainer, "SHAPTriageExplainer", FakeExplainer)
+        return chosen
+
+    @staticmethod
+    def _predictor(members: dict[str, tuple[str, float]]) -> SimpleNamespace:
+        models = {k: _StubModel(_raw(kind), pretrained=kind == "tfm") for k, (kind, _) in members.items()}
+        return SimpleNamespace(models=models, weights={k: w for k, (_, w) in members.items()})
+
+    def test_classical_recipe_keeps_tree_ebm_linear_preference(self, explainer):
+        from src.llm_eval.esi_cases import ShapHelper
+
+        assert ShapHelper(self._predictor({"logreg": ("linear", 0.6)})).model_key == "logreg"
+        helper = ShapHelper(self._predictor({"logreg": ("linear", 0.5), "ebm": ("ebm", 0.5)}))
+        assert helper.model_key == "ebm"
+
+    def test_recipe_with_tfm_uses_tree_model_only(self, explainer):
+        from src.llm_eval.esi_cases import ShapHelper
+
+        helper = ShapHelper(self._predictor({"logreg": ("linear", 0.4), "lightgbm": ("tree", 0.2),
+                                             "tabpfn": ("tfm", 0.4)}))
+        assert helper.model_key == "lightgbm" and not getattr(explainer[-1], "pretrained", True)
+
+    def test_recipe_with_tfm_and_no_tree_model_has_no_shap(self, explainer):
+        from src.llm_eval.esi_cases import CasesUnavailable, ShapHelper
+
+        for members in ({"tabpfn": ("tfm", 1.0)}, {"ebm": ("ebm", 0.7), "tabicl": ("tfm", 0.3)}):
+            with pytest.raises(CasesUnavailable, match="model drzewiasty"):
+                ShapHelper(self._predictor(members))
+        assert explainer == []
+
+    def test_recipe_predictor_keeps_all_tfm_bags_fitted(self, monkeypatch, tmp_path):
+        import src.models as models_pkg
+        from src.llm_eval.esi_cases import RecipePredictor
+
+        loaded = {"lightgbm": _StubModel(_raw("tree")), "tabpfn": _StubModel(_raw("tfm"), pretrained=True)}
+        runs = []
+        for name in loaded:
+            run_dir = tmp_path / f"run_{name}"
+            run_dir.mkdir()
+            (run_dir / "model.joblib").write_bytes(b"x")
+            runs.append(SimpleNamespace(name=run_dir.name, path=run_dir))
+        monkeypatch.setattr(models_pkg, "load_model", lambda path: loaded[Path(path).parent.name.split("_", 1)[1]])
+        recipe = SimpleNamespace(keys=list(loaded), runs=runs, weights={"lightgbm": 0.6, "tabpfn": 0.4})
+        predictor = RecipePredictor(recipe)
+        assert predictor.models["tabpfn"].keep_fitted_bags == "all"      # bez ponownego dopasowania na wiersz
+        assert predictor.models["lightgbm"].keep_fitted_bags == 1

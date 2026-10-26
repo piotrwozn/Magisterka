@@ -1,5 +1,6 @@
 """
-Testy modeli ESI (`src.models`): wszystkie 6 modeli z rejestru.
+Testy modeli ESI (`src.models`): 6 modeli klasycznych z rejestru (modele fundamentalne TFM — tabpfn,
+tabicl — mają własne testy: tests/test_tfm_*.py; tu tylko ich rejestracja).
 
 Każdy model na małym numerycznym zbiorze z brakami (NaN) musi:
     - wytrenować się (z early stopping na osobnym zbiorze),
@@ -48,6 +49,7 @@ FAST_PARAMS: dict[str, dict] = {
 }
 
 EXPECTED_MODELS = ["logreg", "lightgbm", "xgboost", "catboost", "random_forest", "ebm"]
+EXPECTED_TFM = ["tabpfn", "tabicl"]          # zarejestrowane PO klasycznych (pretrained = True)
 EARLY_STOPPING_MODELS = {"lightgbm", "xgboost", "catboost"}
 
 ARTIFACT_KEYS = [
@@ -62,7 +64,8 @@ def _cpu_only():
     """Testy zawsze na CPU, także gdy powłoka eksportuje SOR_AI_DEVICE_* (np. z run_all)."""
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("SOR_AI_DEVICE", "cpu")
-        for var in ("SOR_AI_DEVICE_XGBOOST", "SOR_AI_DEVICE_CATBOOST"):
+        for var in ("SOR_AI_DEVICE_XGBOOST", "SOR_AI_DEVICE_CATBOOST", "SOR_AI_DEVICE_TABPFN",
+                    "SOR_AI_DEVICE_TABICL"):
             mp.delenv(var, raising=False)
         yield
 
@@ -119,7 +122,20 @@ def _warnings(records: list[logging.LogRecord]) -> str:
 # ─────────────────────────────────────────
 class TestRegistry:
     def test_registry_contents_and_order(self):
-        assert list(MODEL_REGISTRY) == EXPECTED_MODELS
+        assert list(MODEL_REGISTRY) == EXPECTED_MODELS + EXPECTED_TFM
+
+    def test_classical_and_tfm_groups(self):
+        """'all' = 6 klasycznych (config.CLASSICAL_MODELS), TFM osobno i na końcu rejestru."""
+        from src.models import resolve_model_list
+
+        assert list(config.CLASSICAL_MODELS) == EXPECTED_MODELS
+        assert list(config.TFM_MODELS) == EXPECTED_TFM
+        assert [m for m, c in MODEL_REGISTRY.items() if not c.pretrained] == EXPECTED_MODELS
+        assert [m for m, c in MODEL_REGISTRY.items() if c.pretrained] == EXPECTED_TFM
+        assert resolve_model_list("all") == EXPECTED_MODELS
+        assert resolve_model_list("tfm") == EXPECTED_TFM
+        assert resolve_model_list("lgbm,pfn") == ["lightgbm", "tabpfn"]
+        assert BaseTriageModel.pretrained is False
 
     @pytest.mark.parametrize("removed", ["extra_trees", "hist_gbt", "stacking", "fusion"])
     def test_removed_models_absent(self, removed):

@@ -117,6 +117,7 @@ RANDOM_SEED: int = 42
 # ─────────────────────────────────────────
 # Urządzenie wybiera src.utils.hardware.device_for(biblioteka), czytając zmienne NA BIEŻĄCO:
 #   SOR_AI_DEVICE_XGBOOST / SOR_AI_DEVICE_CATBOOST  >  SOR_AI_DEVICE  >  'auto'
+#   (TFM: SOR_AI_DEVICE_TABPFN / SOR_AI_DEVICE_TABICL — próba GPU przez torch)
 # Wartości auto | cpu | gpu. 'auto' = próbny trening na GPU (porażka → CPU z ostrzeżeniem),
 # 'gpu' = wymuszenie (porażka → błąd zamiast cichego CPU). Poniższa stała tylko informacyjnie.
 DEVICE: str = os.environ.get("SOR_AI_DEVICE", "auto").lower()
@@ -444,6 +445,140 @@ TUNE_SQRT_SCALED_PARAMS: dict[str, list[str]] = {
 }
 # Strażnik rozmiaru RF: próba, której finalny model (500 drzew) miałby > tylu bajtów, jest przerywana
 TUNE_RF_MAX_MODEL_BYTES: float = 1.5e9
+
+# ─────────────────────────────────────────
+# TABULARNE MODELE FUNDAMENTALNE (TFM): TabPFN-3.5, TabICLv2
+# ─────────────────────────────────────────
+# Modele wstępnie wytrenowane (in-context learning): "trening" = zapis kontekstu (wierszy TRAIN) w modelu,
+# predykcja = przebieg sieci na kontekście + wierszach testowych (GPU). `--model all` / `run_all --models all`
+# oznacza WYŁĄCZNIE 6 modeli klasycznych; TFM trzeba zażądać jawnie (`--model tfm`, `tabpfn`, `tabicl`).
+# Szczegóły i źródła liczb: training/docs/TFM.md (notatki z rozpoznania API i planu pamięci).
+CLASSICAL_MODELS: tuple[str, ...] = ("logreg", "lightgbm", "xgboost", "catboost", "random_forest", "ebm")
+TFM_MODELS: tuple[str, ...] = ("tabpfn", "tabicl")
+# Licencje (praca magisterska = użycie niekomercyjne — dozwolone)
+TFM_LICENSES: dict[str, str] = {
+    "tabpfn": "non-commercial (TabPFN)",     # wagi TabPFN-3.5: licencja niekomercyjna Prior Labs
+    "tabicl": "BSD-3 code (TabICL)",          # kod BSD-3; licencja wag: karta modelu jingang/TabICL na HF
+}
+# Największy kontekst (wierszy w worku) dopuszczony na CPU. Powyżej: błąd na starcie zamiast wielogodzinnej
+# inferencji. 5000 = limit CPU samej biblioteki TabPFN v3/v3.5 (cpu_sample_limit; wyżej wymagałaby
+# ignore_pretraining_limits, co wyłącza też kontrolę liczby wierszy i cech).
+TFM_CPU_MAX_CONTEXT: int = 5_000
+# Budżet RAM hosta na jedno wywołanie predykcji TabICL (wyjście osadzeń kolumn: ~137,5 KiB na wiersz ×
+# estymator w przebiegu przy 271 cechach) — z niego wynika `predict_batch="auto"` TabICL.
+TFM_HOST_RAM_BUDGET_GB: float = 24.0
+# Pełny bufor KV TabICL ("kv") tylko, gdy modelowany rozmiar ≤ tej części całkowitej VRAM; inaczej "repr"
+TABICL_KV_VRAM_FRACTION: float = 0.35
+# Wybór konfiguracji: kandydaci z log loss holdoutu w tej odległości od najlepszego → wygrywa tańszy
+TFM_SELECTION_TOLERANCE: float = 0.002
+
+# Parametry domyślne wrapperów (run bez --tune). "device" ustawiane w runtime: hardware.device_for(model)
+# → "cuda" | "cpu" (próba torch); n_jobs = wątki torch na CPU (przygotowanie danych, predykcja na CPU).
+#   n_ctx            — wierszy kontekstu w jednym worku (bag),
+#   n_bags           — liczba worków (int ≥ 1 albo "auto" = min(max_bags, ceil(N_fit / n_ctx))),
+#   bag_mode         — "partition" (rozłączne stratyfikowane części X_fit; n_bags·n_ctx ≥ N → wszystkie wiersze)
+#                      | "resample" (niezależne stratyfikowane losowania),
+#   context_strategy — "stratified" (proporcjonalnie do ESI × oddział) | "balanced" (limit na klasę — rzadkie
+#                      ESI 1/5 nadreprezentowane, potem DOKŁADNA korekta priorów p_k ∝ p_k·π_k(fit)/π_k(kontekst)),
+#   max_features     — None albo limit cech (redukcja bez etykiet: najrzadsze flagi cc_*),
+#   predict_batch    — wierszy testowych na jedno wywołanie biblioteki.
+# softmax_temperature biblioteki zostaje domyślne (temperaturę dobieramy na VAL w łączeniu modeli).
+TABPFN_DEFAULT_PARAMS: dict = {
+    "n_ctx": 50_000,
+    "n_bags": 1,
+    "max_bags": 4,
+    "bag_mode": "partition",
+    "context_strategy": "stratified",
+    "n_estimators": 4,                  # int albo "auto" (biblioteka: 8 przy 271 cechach)
+    "max_features": None,
+    "predict_batch": 32_768,            # = TABPFN_MAX_BATCHED_TEST_ROWS (bufor KV dzieli test sam)
+    "random_state": RANDOM_SEED,
+    "n_jobs": N_JOBS,
+    "model_version": "v3.5",            # "v3.5" | "v3.5-fast" | "v3" → plik wag w pamięci podręcznej TabPFN
+    "fit_mode": "fit_with_cache",       # kontekst przetwarzany raz (bufor KV), test w porcjach
+    "keep_cache_on_device": True,
+    "kv_cache_precision": None,         # None = int8 (domyślne biblioteki dla v3/v3.5)
+    "memory_saving_mode": "auto",
+    "inference_precision": "auto",      # autocast fp16 na CUDA
+}
+TABICL_DEFAULT_PARAMS: dict = {
+    "n_ctx": 50_000,
+    "n_bags": 1,
+    "max_bags": 4,
+    "bag_mode": "partition",
+    "context_strategy": "stratified",
+    "n_estimators": 8,
+    "max_features": None,
+    "predict_batch": "auto",            # z budżetu RAM hosta (TFM_HOST_RAM_BUDGET_GB)
+    "random_state": RANDOM_SEED,
+    "n_jobs": N_JOBS,
+    "checkpoint_version": "tabicl-classifier-v2-20260212.ckpt",
+    "kv_cache": "auto",                 # "auto" → "kv" (≤ TABICL_KV_VRAM_FRACTION VRAM) albo "repr"; False
+    "batch_size": "auto",               # estymatorów na przebieg: "auto" → 1 przy n_ctx ≥ 10 000, inaczej 4
+    "offload_mode": "auto",
+    "use_amp": "auto",
+}
+
+
+def _tfm_budget(candidates: list[dict], *, holdout_rows: int, timeout_s: int, final_budget_s: int,
+                bags_stage: bool, max_bags: int) -> dict:
+    """
+    Budżet TFM w kształcie budżetu Optuny (n_trials = liczba kandydatów, tune_rows 0, n_folds 1, timeout_s)
+    + klucze TFM: kandydaci (od najtańszego), wiersze holdoutu z TRAIN, etap worków, budżet finalnej predykcji.
+    """
+    return {
+        **_budget(len(candidates), 0, 1, timeout_s),
+        "candidates": [dict(c) for c in candidates],
+        "holdout_rows": holdout_rows,
+        "bags_stage": bags_stage,
+        "final_budget_s": final_budget_s,
+        "max_bags": max_bags,
+    }
+
+
+def _grid(n_ctx: tuple[int, ...], n_estimators: tuple[int, ...], **extra) -> list[dict]:
+    return [{"n_ctx": c, "n_estimators": e, **extra} for c in n_ctx for e in n_estimators]
+
+
+# Siatki z planu pamięci (16 GB VRAM, RTX 4080 Super; wszystkie mieszczą się w modelu pamięci):
+#   smoke    — 1000 × 1 estymator (działa na CPU: ≤ TFM_CPU_MAX_CONTEXT), holdout 500,
+#   quick    — {5k, 10k} × 2, holdout 5000, 20 min + 20 min,
+#   standard — TabPFN {25k, 50k} × 4, TabICL {25k, 50k} × 8; etap worków (max 4); holdout 20 000; 2 h + 2 h,
+#   thorough — TabPFN {25k, 50k, 100k} × {4, 8} + balanced 50k × 4 (200k pominięte), TabICL {25k, 50k} × 8
+#              × {wszystkie cechy, max_features=100} + balanced 50k × 8; etap worków; 4 h + 4 h.
+# smoke/quick: jeden worek (n_bags=1); standard/thorough: max_bags 4.
+_TFM_BUDGETS: dict[str, dict[str, dict]] = {
+    "smoke": {
+        "tabpfn": _tfm_budget(_grid((1_000,), (1,)), holdout_rows=500, timeout_s=900, final_budget_s=1_800,
+                              bags_stage=False, max_bags=1),
+        "tabicl": _tfm_budget(_grid((1_000,), (1,)), holdout_rows=500, timeout_s=900, final_budget_s=1_800,
+                              bags_stage=False, max_bags=1),
+    },
+    "quick": {
+        "tabpfn": _tfm_budget(_grid((5_000, 10_000), (2,)), holdout_rows=5_000, timeout_s=20 * 60,
+                              final_budget_s=20 * 60, bags_stage=False, max_bags=1),
+        "tabicl": _tfm_budget(_grid((5_000, 10_000), (2,)), holdout_rows=5_000, timeout_s=20 * 60,
+                              final_budget_s=20 * 60, bags_stage=False, max_bags=1),
+    },
+    "standard": {
+        "tabpfn": _tfm_budget(_grid((25_000, 50_000), (4,)), holdout_rows=20_000, timeout_s=2 * _H,
+                              final_budget_s=2 * _H, bags_stage=True, max_bags=4),
+        "tabicl": _tfm_budget(_grid((25_000, 50_000), (8,)), holdout_rows=20_000, timeout_s=2 * _H,
+                              final_budget_s=2 * _H, bags_stage=True, max_bags=4),
+    },
+    "thorough": {
+        "tabpfn": _tfm_budget(
+            _grid((25_000, 50_000, 100_000), (4, 8))
+            + [{"n_ctx": 50_000, "n_estimators": 4, "context_strategy": "balanced"}],
+            holdout_rows=20_000, timeout_s=4 * _H, final_budget_s=4 * _H, bags_stage=True, max_bags=4),
+        "tabicl": _tfm_budget(
+            _grid((25_000, 50_000), (8,)) + _grid((25_000, 50_000), (8,), max_features=100)
+            + [{"n_ctx": 50_000, "n_estimators": 8, "context_strategy": "balanced"}],
+            holdout_rows=20_000, timeout_s=4 * _H, final_budget_s=4 * _H, bags_stage=True, max_bags=4),
+    },
+}
+for _profile, _spec in _TFM_BUDGETS.items():
+    TUNING_PROFILES[_profile].update(_spec)
 
 OPTUNA_STORAGE_DIR: Path = LOGS_DIR / "optuna"
 OPTUNA_HEARTBEAT_INTERVAL_S: int = 60     # "puls" trwającej próby w bazie SQLite

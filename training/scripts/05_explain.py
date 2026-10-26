@@ -25,6 +25,10 @@ Użycie:
     python scripts/05_explain.py --model-name catboost --include-samples --esi 1 --use-ollama
     python scripts/05_explain.py --model path/do/model.joblib
     python scripts/05_explain.py --run 20261019_115324_xgboost_triage_smoke --global --top-k 6
+
+Modele fundamentalne (TFM: tabpfn, tabicl): SHAP NIE jest liczony (metoda permutacyjna = tysiące przebiegów
+inferencji na GPU, wyjaśnienia TFM niezwalidowane) — skrypt kończy się komunikatem, a wyjaśnienia w pracy
+opierają się na LightGBM. Najnowszy run (bez --run / --model-name) pomija runy TFM.
 """
 
 from __future__ import annotations
@@ -78,6 +82,13 @@ from src.utils.logger import get_logger  # noqa: E402
 log = get_logger(__name__)
 
 PERMUTATION_SUMMARY_LIMIT = 50   # metoda permutacyjna jest wolna — mniejsza próbka globalna
+# Kod wyjścia i komunikat dla modeli fundamentalnych (TFM) — SHAP nie jest dla nich liczony
+TFM_EXIT_CODE = 2
+TFM_EXPLAIN_MESSAGE = (
+    "{model}: model fundamentalny (TFM) — SHAP nie jest liczony: metoda permutacyjna wymagałaby tysięcy "
+    "przebiegów inferencji kontekstu na GPU, a wyjaśnienia post hoc dla TFM nie są zwalidowane. Wyjaśnienia "
+    "w pracy (SHAP, wykresy zależności) opieraj na LightGBM: python scripts/05_explain.py --model-name lightgbm"
+)
 # Tryb --global: parametry życiowe zawsze z wykresem zależności / krzywą kształtu EBM;
 # wartość referencyjna = typowa wartość prawidłowa (Δ log-odds liczone względem niej)
 GLOBAL_VITALS: dict[str, float] = {
@@ -103,7 +114,7 @@ def latest_run_with_model(
     """
     Najnowszy run z zapisanym model.joblib (opcjonalnie danego modelu) albo None. Refity analiz
     (`refit_of`, np. 09_seed_refits.py --save-models) są pomijane — wyjaśniamy run główny; refit
-    można wskazać jawnie przez --run.
+    można wskazać jawnie przez --run. Bez `model_name` pomijane są też runy modeli fundamentalnych (TFM).
     """
     table = list_runs()
     if table.empty:
@@ -117,9 +128,27 @@ def latest_run_with_model(
         run = load_run(name)
         if run.info.get("refit_of"):
             continue
+        if model_name is None and _is_tfm(run.info.get("model"), run.info):
+            continue
         if (run.path / "model.joblib").exists():
             return run
     return None
+
+
+def _is_tfm(model: str | None, info: dict | None = None) -> bool:
+    """Run / model fundamentalny (TFM)."""
+    if info and info.get("pretrained"):
+        return True
+    try:
+        return bool(getattr(MODEL_REGISTRY.get(resolve_model_name(str(model))), "pretrained", False))
+    except ValueError:
+        return False
+
+
+def refuse_tfm(model: str) -> None:
+    """Komunikat dla TFM i wyjście z kodem TFM_EXIT_CODE."""
+    log.warning(TFM_EXPLAIN_MESSAGE.format(model=model))
+    raise SystemExit(TFM_EXIT_CODE)
 
 
 def resolve_run(args: argparse.Namespace) -> tuple[str, Path]:
@@ -138,6 +167,8 @@ def resolve_run(args: argparse.Namespace) -> tuple[str, Path]:
                 + (f" i modelu '{args.model_name}'" if args.model_name else "")
                 + f"{hint}. Wytrenuj model: python scripts/03_train.py --model xgboost"
             )
+    if _is_tfm(run.info.get("model"), run.info):
+        refuse_tfm(str(run.info.get("model")))
     path = run.path / "model.joblib"
     if not path.exists():
         raise SystemExit(f"Run {run.name} nie ma zapisanego modelu ({path})")
@@ -393,6 +424,8 @@ def main(argv: list[str] | None = None) -> None:
     # 1. Model
     log.info(f"[1/5] Ładowanie modelu: {model_path}")
     model = load_model(model_path)          # klasa wg nazwy modelu w artefakcie
+    if getattr(model, "pretrained", False):
+        refuse_tfm(model.name)
     if not model.feature_names:
         raise SystemExit("Model nie ma zapisanych nazw cech (feature_names) — wytrenuj go ponownie.")
     features = list(model.feature_names)

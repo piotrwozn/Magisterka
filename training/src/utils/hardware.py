@@ -1,9 +1,11 @@
 """
 Sprzęt — jedno miejsce decydujące o urządzeniu (CPU/GPU) i liczbie wątków.
 
-Urządzenie wybierane OSOBNO dla każdej biblioteki z obsługą GPU (xgboost, catboost):
+Urządzenie wybierane OSOBNO dla każdej biblioteki z obsługą GPU (xgboost, catboost) i dla modeli
+fundamentalnych TFM (tabpfn, tabicl — próba GPU przez bibliotekę "torch"):
 
-    SOR_AI_DEVICE_XGBOOST / SOR_AI_DEVICE_CATBOOST  >  SOR_AI_DEVICE  >  'auto'
+    SOR_AI_DEVICE_XGBOOST / SOR_AI_DEVICE_CATBOOST / SOR_AI_DEVICE_TABPFN / SOR_AI_DEVICE_TABICL
+        >  SOR_AI_DEVICE  >  'auto'
 
 Wartości: auto | cpu | gpu.
     auto — PRAWDZIWY próbny trening na GPU (`probe_gpu`); porażka → CPU z głośnym ostrzeżeniem,
@@ -11,7 +13,8 @@ Wartości: auto | cpu | gpu.
     gpu  — wymuszenie: porażka próby → RuntimeError (zamiast cichego treningu na CPU).
 
 Samo `nvidia-smi` nie wystarcza: koło xgboost 3.4 jest zbudowane z CUDA 13 i przy sterowniku
-starszym niż 580 po cichu trenuje na CPU, a CatBoost rzuca `CUDA error 35`.
+starszym niż 580 po cichu trenuje na CPU, a CatBoost rzuca `CUDA error 35`. Torch z PyPI na Windows
+jest zbudowany BEZ CUDA — próba "torch" rozpoznaje to i podaje polecenie instalacji koła CUDA.
 
 Wątki CPU: `n_jobs()` = SOR_AI_N_JOBS (> 0) albo liczba FIZYCZNYCH rdzeni (przycięta do maski
 affinity procesu).
@@ -44,9 +47,16 @@ log = get_logger(__name__)
 # ─────────────────────────────────────────
 # Stałe
 # ─────────────────────────────────────────
-GPU_LIBRARIES: tuple[str, ...] = ("xgboost", "catboost")
+GPU_LIBRARIES: tuple[str, ...] = ("xgboost", "catboost", "torch")
 DEVICE_CHOICES: tuple[str, ...] = ("auto", "cpu", "gpu")
 _LIBRARY_ALIASES: dict[str, str] = {"xgb": "xgboost", "cb": "catboost"}
+# Modele, których próba GPU to próba innej biblioteki (TFM → torch). Osobna mapa, NIE alias: zmienna
+# SOR_AI_DEVICE_TABPFN / SOR_AI_DEVICE_TABICL musi być czytana pod nazwą modelu.
+_PROBE_LIBRARY: dict[str, str] = {"tabpfn": "torch", "tabicl": "torch"}
+_MODEL_ALIASES: dict[str, str] = {"pfn": "tabpfn", "icl": "tabicl"}
+# Koło torch z CUDA (PyPI na Windows = tylko CPU); cu130 wymaga sterownika NVIDIA >= 580, starszy → cu128
+TORCH_CUDA_INDEX_URL: str = "https://download.pytorch.org/whl/cu130"
+TORCH_CUDA_INDEX_URL_OLD_DRIVER: str = "https://download.pytorch.org/whl/cu128"
 
 NVIDIA_SMI_TIMEOUT_S: int = 20            # pierwsze wywołanie na Windows (GPU uśpione) bywa wolne
 PROBE_CACHE_MAX_AGE_S: int = 12 * 3600    # dodatni wynik próby GPU ważny 12 h (ten sam sterownik i wersja)
@@ -58,6 +68,7 @@ _GPU_ERROR_PATTERNS: tuple[str, ...] = ("cuda", "out of memory", "cudaerror", "n
 _ENV_KEYS: tuple[str, ...] = (
     "SOR_AI_DEVICE", "SOR_AI_DEVICE_XGBOOST", "SOR_AI_DEVICE_CATBOOST", "SOR_AI_N_JOBS",
     "OMP_NUM_THREADS", "CUDA_VISIBLE_DEVICES", "PYTHONUTF8", "PYTHONIOENCODING",
+    "SOR_AI_DEVICE_TABPFN", "SOR_AI_DEVICE_TABICL",
 )
 
 _GPU_HINTS: dict[str, str] = {
@@ -67,6 +78,12 @@ _GPU_HINTS: dict[str, str] = {
     ),
     "catboost": (
         "Sprawdź sterownik NVIDIA (`nvidia-smi`) i czy pamięć GPU nie jest zajęta przez inny proces."
+    ),
+    "torch": (
+        "Modele TFM (TabPFN, TabICL) potrzebują torch z CUDA. Torch z PyPI na Windows jest tylko-CPU — "
+        f"zainstaluj koło CUDA: `pip install torch --index-url {TORCH_CUDA_INDEX_URL}` (sterownik NVIDIA >= 580; "
+        f"starszy sterownik: `--index-url {TORCH_CUDA_INDEX_URL_OLD_DRIVER}`), potem "
+        "`python scripts/13_tfm_setup.py`."
     ),
 }
 
@@ -93,7 +110,14 @@ def _dist_version(dist: str) -> str | None:
 
 def _normalize_library(library: str) -> str:
     lib = str(library).strip().lower()
+    lib = _MODEL_ALIASES.get(lib, lib)
     return _LIBRARY_ALIASES.get(lib, lib)
+
+
+def probe_library(library: str) -> str:
+    """Biblioteka, której próba GPU decyduje o urządzeniu (tabpfn / tabicl → torch; reszta bez zmian)."""
+    lib = _normalize_library(library)
+    return _PROBE_LIBRARY.get(lib, lib)
 
 
 # ─────────────────────────────────────────
@@ -236,7 +260,73 @@ def _probe_catboost() -> tuple[bool, str]:
     return True, f"catboost {version} trenuje na GPU (urządzeń: {n_devices})"
 
 
-_PROBES = {"xgboost": _probe_xgboost, "catboost": _probe_catboost}
+def torch_info() -> dict[str, Any]:
+    """
+    Stan torch i CUDA bez wyjątków (preflight, 13_tfm_setup, próba GPU TFM).
+
+    Returns
+    -------
+    dict: installed, version, cuda_build (wersja CUDA koła albo None = koło tylko-CPU), cuda_available,
+          device_name, total_vram_mb, free_vram_mb, error (opis porażki) — klucze zawsze obecne.
+    Import torch trwa ~2–3 s — wołaj w procesie treningu / preflight, nie w orkiestratorze.
+    """
+    info: dict[str, Any] = {
+        "installed": _dist_version("torch") is not None, "version": _dist_version("torch"), "cuda_build": None,
+        "cuda_available": False, "device_name": None, "total_vram_mb": None, "free_vram_mb": None, "error": None,
+    }
+    if not info["installed"]:
+        info["error"] = "torch nie jest zainstalowany"
+        return info
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001 — uszkodzona instalacja (DLL na Windows)
+        info["error"] = f"import torch: {type(exc).__name__}: {_short(exc)}"
+        return info
+    info["version"] = str(getattr(torch, "__version__", info["version"]))
+    info["cuda_build"] = getattr(getattr(torch, "version", None), "cuda", None)
+    try:
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        if info["cuda_available"]:
+            props = torch.cuda.get_device_properties(0)
+            info["device_name"] = str(props.name)
+            info["total_vram_mb"] = int(props.total_memory // 2**20)
+            free, _total = torch.cuda.mem_get_info(0)
+            info["free_vram_mb"] = int(free // 2**20)
+    except Exception as exc:  # noqa: BLE001 — sterownik / CUDA
+        info["cuda_available"] = False
+        info["error"] = f"CUDA: {type(exc).__name__}: {_short(exc)}"
+    return info
+
+
+def _probe_torch() -> tuple[bool, str]:
+    """torch: CUDA dostępna + mała alokacja na karcie (koło tylko-CPU → wskazówka instalacji)."""
+    info = torch_info()
+    if not info["installed"] or info["version"] is None:
+        return False, "torch nie jest zainstalowany (requirements-tfm.txt + koło CUDA z download.pytorch.org)"
+    version = info["version"]
+    if info["error"] and str(info["error"]).startswith("import torch"):
+        return False, f"torch {version}: {info['error']}"
+    if info["cuda_build"] is None:
+        return False, f"torch {version} zbudowany BEZ CUDA (koło tylko-CPU, np. z PyPI na Windows)"
+    if not info["cuda_available"]:
+        reason = info["error"] or "torch.cuda.is_available() == False (brak GPU albo za stary sterownik)"
+        return False, f"torch {version} (CUDA {info['cuda_build']}): {reason}"
+    try:
+        import torch
+
+        tensor = torch.ones(1024, device="cuda") * 2.0
+        torch.cuda.synchronize()
+        ok = float(tensor.sum().item()) == 2048.0
+        del tensor
+    except Exception as exc:  # noqa: BLE001 — błąd CUDA przy alokacji
+        return False, f"torch {version} (CUDA {info['cuda_build']}): {type(exc).__name__}: {_short(exc)}"
+    if not ok:
+        return False, f"torch {version}: niepoprawny wynik próbnej operacji na GPU"
+    vram = f"{info['total_vram_mb'] / 1024:.1f} GB" if info["total_vram_mb"] else "?"
+    return True, f"torch {version} (CUDA {info['cuda_build']}) na {info['device_name']} ({vram} VRAM)"
+
+
+_PROBES = {"xgboost": _probe_xgboost, "catboost": _probe_catboost, "torch": _probe_torch}
 
 
 def _probe_cache_path() -> Path:
@@ -282,7 +372,8 @@ def probe_gpu(library: str) -> tuple[bool, str]:
 
     xgboost  — trening z device='cuda' i odczyt urządzenia z `booster.save_config()`
                (xgboost nie rzuca błędu, tylko po cichu przechodzi na CPU),
-    catboost — `get_gpu_device_count()` + kilka iteracji z task_type='GPU'.
+    catboost — `get_gpu_device_count()` + kilka iteracji z task_type='GPU',
+    torch    — `torch.cuda.is_available()` + mała alokacja na karcie (modele TFM: tabpfn, tabicl).
 
     Wynik zapamiętany w procesie (lru_cache) i w `logs/hardware_probe.json`; z pliku używany
     jest tylko DODATNI wynik (ten sam sterownik, wersja biblioteki i interpreter, < 12 h) —
@@ -292,7 +383,7 @@ def probe_gpu(library: str) -> tuple[bool, str]:
     -------
     (ok, opis) — opis zawiera powód porażki do komunikatów i preflight.
     """
-    lib = _normalize_library(library)
+    lib = probe_library(library)            # tabpfn / tabicl → torch
     if lib not in _PROBES:
         return False, f"{lib}: biblioteka bez obsługi GPU w projekcie"
 
@@ -345,19 +436,22 @@ def device_for(library: str) -> str:
 
     Kolejność: SOR_AI_DEVICE_<BIBLIOTEKA> > SOR_AI_DEVICE > auto (próba GPU).
     Biblioteki bez GPU w projekcie (lightgbm, scikit-learn, interpret) → zawsze 'cpu'.
+    Modele TFM ('tabpfn', 'tabicl'; aliasy 'pfn', 'icl'): zmienna SOR_AI_DEVICE_TABPFN / _TABICL,
+    próba GPU biblioteki "torch" (`probe_library`).
 
     Raises
     ------
     RuntimeError — wymuszone 'gpu', a próba GPU się nie powiodła.
     """
     lib = _normalize_library(library)
-    if lib not in GPU_LIBRARIES:
+    probe_lib = probe_library(lib)
+    if probe_lib not in GPU_LIBRARIES:
         return "cpu"
     preference, source = device_preference(lib)
     if preference == "cpu":
         return "cpu"
 
-    ok, reason = probe_gpu(lib)
+    ok, reason = probe_gpu(probe_lib)
     if ok:
         if lib not in _announced:
             _announced.add(lib)
@@ -366,14 +460,14 @@ def device_for(library: str) -> str:
 
     if preference == "gpu":
         raise RuntimeError(
-            f"{source}=gpu, ale {lib} nie może użyć GPU: {reason}. {_GPU_HINTS[lib]} "
+            f"{source}=gpu, ale {lib} nie może użyć GPU: {reason}. {_GPU_HINTS[probe_lib]} "
             f"Aby trenować na CPU, ustaw {source}=cpu (albo auto)."
         )
     if lib not in _announced:
         _announced.add(lib)
         log.warning(
             f"{lib}: GPU NIEDOSTĘPNE — trening na CPU (znacznie wolniej). Powód: {reason}. "
-            f"{_GPU_HINTS[lib]} Wymuś decyzję: SOR_AI_DEVICE_{lib.upper()}=cpu|gpu."
+            f"{_GPU_HINTS[probe_lib]} Wymuś decyzję: SOR_AI_DEVICE_{lib.upper()}=cpu|gpu."
         )
     return "cpu"
 
@@ -634,6 +728,7 @@ def hardware_summary() -> dict[str, Any]:
 __all__ = [
     "DEVICE_CHOICES",
     "GPU_LIBRARIES",
+    "TORCH_CUDA_INDEX_URL",
     "device_for",
     "device_preference",
     "disable_power_throttling",
@@ -643,5 +738,7 @@ __all__ = [
     "nvidia_smi_info",
     "physical_cores",
     "probe_gpu",
+    "probe_library",
+    "torch_info",
     "usable_cpus",
 ]

@@ -73,8 +73,11 @@ REFILL_ORDER: tuple[int, ...] = (2, 1, 3, 4, 5)
 SHAP_TOP_N: int = 5
 SHAP_TOP_STORED: int = 10
 # Preferencja modelu do SHAP (metoda wg src.explain.shap_explainer.detect_method): najpierw drzewiaste
-# (TreeSHAP / natywne SHAP CatBoost), potem EBM, na końcu liniowy; w grupie — największa waga
+# (TreeSHAP / natywne SHAP CatBoost), potem EBM, na końcu liniowy; w grupie — największa waga.
+# Modele fundamentalne (TFM, `pretrained`) nigdy nie są wyjaśniane; receptura z członkiem TFM → SHAP wyłącznie
+# z modelu drzewiastego (TREE_SHAP_METHODS), jak wyjaśnienia w 05_explain (LightGBM).
 SHAP_METHOD_RANK: dict[str, int] = {"tree": 0, "catboost": 0, "ebm": 1, "linear": 2}
+TREE_SHAP_METHODS: tuple[str, ...] = ("tree", "catboost")
 ARRIVAL_COLS: dict[str, str] = {"ambulance": "arrival_ambulance", "self": "arrival_self", "other": "arrival_other"}
 # Kolumny bazowe triażu, które zawsze trafiają do wiersza kanonicznego (cc_* — wszystkie z danych)
 BASE_GROUPS: tuple[str, ...] = ("demographics", "arrival", "time", "triage_vitals", "chief_complaints")
@@ -258,7 +261,10 @@ class RecipePredictor:
     """
     Receptura liczona na żywo z modeli: wiersz kanoniczny → cechy → prawdopodobieństwa → decyzja.
 
-    Ładowane są tylko modele o dodatniej wadze (model o wadze 0 nie zmienia połączenia).
+    Ładowane są tylko modele o dodatniej wadze (model o wadze 0 nie zmienia połączenia). Członek TFM
+    (`pretrained`): `keep_fitted_bags="all"` — przypadki i what_if liczone są wiersz po wierszu, a bez tego
+    każdy wiersz dopasowywałby od nowa każdy worek kontekstu (bufor KV); estymatory zostają w pamięci
+    (GPU) do końca procesu.
     """
 
     def __init__(self, recipe: Recipe):
@@ -273,6 +279,8 @@ class RecipePredictor:
             if not path.exists():
                 raise CasesUnavailable(f"Run {run.name} nie ma pliku modelu {path} (trenowany z --no-save?)")
             self.models[key] = load_model(path)
+            if getattr(self.models[key], "pretrained", False):
+                self.models[key].keep_fitted_bags = "all"
         if not self.models:
             raise CasesUnavailable("Receptura nie ma żadnego modelu o dodatniej wadze")
         names: list[str] = []
@@ -482,18 +490,27 @@ def vitals_for_check(row: dict[str, Any]) -> dict[str, float | None]:
 # SHAP
 # ─────────────────────────────────────────
 class ShapHelper:
-    """SHAP jednego modelu receptury (preferowany drzewiasty o największej wadze)."""
+    """
+    SHAP jednego modelu receptury (preferowany drzewiasty o największej wadze). Modele TFM są pomijane;
+    gdy receptura ma członka TFM, kandydatami są wyłącznie modele drzewiaste (TREE_SHAP_METHODS).
+    """
 
     def __init__(self, predictor: RecipePredictor):
         from src.explain.shap_explainer import SHAPTriageExplainer, detect_method
 
+        has_tfm = any(getattr(m, "pretrained", False) for m in predictor.models.values())
+        allowed = TREE_SHAP_METHODS if has_tfm else tuple(SHAP_METHOD_RANK)
         candidates = []
         for key, model in predictor.models.items():
+            if getattr(model, "pretrained", False):
+                continue
             method = detect_method(model)
-            if method in SHAP_METHOD_RANK:
+            if method in allowed:
                 candidates.append((SHAP_METHOD_RANK[method], -predictor.weights[key], key))
         if not candidates:
-            raise CasesUnavailable("Żaden model receptury nie obsługuje SHAP (drzewiasty / EBM / liniowy)")
+            raise CasesUnavailable("Żaden model receptury nie obsługuje SHAP ("
+                                   + ("receptura z modelem TFM: potrzebny model drzewiasty, np. LightGBM"
+                                      if has_tfm else "drzewiasty / EBM / liniowy") + ")")
         _, _, key = min(candidates)
         self.model_key = key
         self.model = predictor.models[key]

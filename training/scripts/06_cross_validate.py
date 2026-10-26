@@ -112,6 +112,13 @@ def main() -> None:
     model_name = run_cfg.get("model") or resolve_model_name(args.model)
     if args.model and resolve_model_name(args.model) != model_name:
         parser.error(f"--model {args.model} nie zgadza się z modelem runa ({model_name})")
+    if getattr(MODEL_REGISTRY.get(model_name), "pretrained", False):
+        parser.error(
+            f"{model_name} to model fundamentalny (TFM) — K-fold CV jest dla niego pomijane: każdy fold to pełna "
+            f"inferencja kontekstu na GPU (godziny), a model nie ma wag do uczenia. Jakość TFM oceniaj wyborem "
+            f"konfiguracji na holdoucie z TRAIN (`python scripts/03_train.py --model {model_name} --tune`), "
+            f"refitami na seedach (`09_seed_refits.py --models {model_name}`) i analizą łączenia "
+            f"(`15_tfm_blend.py`).")
     feature_set = resolve_feature_set(args.feature_set or run_cfg.get("feature_set") or "triage")
     weights = args.weights or run_cfg.get("weights") or DEFAULT_SAMPLE_WEIGHT_STRATEGY
     params = run_cfg.get("params")

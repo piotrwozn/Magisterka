@@ -217,8 +217,11 @@ class TestModelLoggingIntegration:
 
     def test_registry_matches_checked_models(self):
         from src.models import MODEL_REGISTRY
+        from src.utils.config import TFM_MODELS
 
-        assert set(MODEL_REGISTRY) == set(self.FAST_PARAMS)
+        # 6 modeli klasycznych; modele fundamentalne (TFM) mają logowanie w tests/test_tfm_models.py
+        assert {m for m, c in MODEL_REGISTRY.items() if not c.pretrained} == set(self.FAST_PARAMS)
+        assert {m for m, c in MODEL_REGISTRY.items() if c.pretrained} == set(TFM_MODELS)
         assert "extra_trees" not in MODEL_REGISTRY
         assert "hist_gbt" not in MODEL_REGISTRY
 

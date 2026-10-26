@@ -20,6 +20,11 @@ Wykonuje:
 
 Protokół: rozwój i porównania na VAL; `--split test` tylko do raportu końcowego.
 
+Modele fundamentalne (TFM: tabpfn, tabicl): dla runa (`--run` / `--model-name`) ewaluacja na predykcjach
+zapisanych w treningu (`predictions_<split>.parquet`) zamiast ponownej, wielogodzinnej inferencji na GPU
+(run_all wywołuje ten skrypt po każdym treningu); obejmuje wiersze zapisane w runie (próbka eval_sample
+runa → WARNING). `--sample` albo `--model <plik>` liczą predykcje od nowa (wymaga torch i biblioteki).
+
 Użycie:
     python scripts/04_evaluate.py --run 20261019_115324_xgboost_triage_smoke
     python scripts/04_evaluate.py --model-name xgboost              # najnowszy run modelu
@@ -162,6 +167,39 @@ def _check_saved_predictions(run, split: str, row_ids: pd.Series, proba: np.ndar
 # ─────────────────────────────────────────
 # Główna ewaluacja
 # ─────────────────────────────────────────
+def evaluate_saved_predictions(run, model, split: str) -> tuple[dict, pd.DataFrame, np.ndarray]:
+    """
+    Metryki z predykcji zapisanych w treningu (runy TFM): wiersze splitu z `predictions_<split>.parquet`,
+    prawdopodobieństwa dopasowane po row_id. Zwraca (metryki, ramka splitu, prawdopodobieństwa).
+    """
+    path = run.path / f"predictions_{split}.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Run {run.name} nie ma {path.name} — przetrenuj model (scripts/03_train.py)")
+    saved = pd.read_parquet(path, columns=["row_id"] + PROBA_COLS).drop_duplicates("row_id").set_index("row_id")
+    feature_set = model.feature_set or "triage"
+    full = load_splits((split,), feature_set=feature_set)[split]
+    df = full[full["row_id"].isin(saved.index)]
+    if len(df) != len(saved):
+        raise ValueError(f"{path.name}: {len(saved) - len(df)} wierszy spoza bieżącego splitu '{split}' — "
+                         f"run z innych danych")
+    if len(df) < len(full):
+        log.warning(f"{split.upper()}: predykcje runa obejmują {len(df):,} z {len(full):,} wierszy (próbka "
+                    f"eval_sample runa) — metryki tylko na tych wierszach, nie do raportowania!")
+    raw = saved.loc[df["row_id"].to_numpy(), PROBA_COLS].to_numpy(dtype=np.float64)
+    sums = raw.sum(axis=1, keepdims=True)
+    proba = np.divide(raw, sums, out=np.full_like(raw, 1.0 / raw.shape[1]), where=sums > 0)
+    log.info(f"{split.upper()}: {len(df):,} wierszy — model fundamentalny ({model.name}): metryki z predykcji "
+             f"zapisanych w treningu ({path.name}), bez ponownej inferencji")
+    y = df[TARGET_COL].to_numpy()
+    metrics: dict = {}
+    for rule in DECISION_RULES:
+        log.info(f"Reguła decyzyjna: {rule}")
+        metrics.update(full_evaluation(
+            y, decide(proba, rule), proba, prefix=f"{split}_{rule}", print_report=True,
+        ))
+    return metrics, df, proba
+
+
 def evaluate_model(model, split: str, sample: int | None) -> tuple[dict, pd.DataFrame, np.ndarray]:
     """Predykcje + metryki dla obu reguł. Zwraca (metryki, ramka splitu, prawdopodobieństwa)."""
     feature_set = model.feature_set or "triage"
@@ -499,10 +537,14 @@ def main() -> None:
                   f"— przetrenuj model (scripts/03_train.py)")
         sys.exit(1)
 
-    # 2–3. Predykcje + metryki
-    metrics, df, proba = evaluate_model(model, args.split, args.sample)
+    # 2–3. Predykcje + metryki (TFM z runa: z predykcji zapisanych w treningu — bez ponownej inferencji)
+    from_saved = run is not None and bool(run.info.get("pretrained")) and not args.sample
+    if from_saved:
+        metrics, df, proba = evaluate_saved_predictions(run, model, args.split)
+    else:
+        metrics, df, proba = evaluate_model(model, args.split, args.sample)
     y = df[TARGET_COL].to_numpy()
-    if run is not None:
+    if run is not None and not from_saved:
         _check_saved_predictions(run, args.split, df["row_id"], proba)
 
     # 4. Podgrupy: komplet parametrów (populacja TOPSOR) i oddziały
@@ -535,6 +577,7 @@ def main() -> None:
         "split": args.split,
         "n": int(len(df)),
         "sample": args.sample,
+        **({"from_saved_predictions": True} if from_saved else {}),
         "data_version": DATA_VERSION,
         "evaluated_at": datetime.now().isoformat(timespec="seconds"),
         "metrics": metrics,

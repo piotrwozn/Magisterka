@@ -53,6 +53,11 @@ def _is_tuned(tuned: Any) -> bool:
     return isinstance(tuned, (bool, np.bool_)) and bool(tuned)
 
 
+def _is_pretrained(info: dict) -> bool:
+    """Run modelu fundamentalnego (TFM: `pretrained: true` w run_info.json albo model z config.TFM_MODELS)."""
+    return bool(info.get("pretrained")) or info.get("model") in config.TFM_MODELS
+
+
 @dataclass
 class Run:
     name: str
@@ -93,7 +98,10 @@ def load_run(run: str | Path, runs_dir: Path | str | None = None) -> Run:
 
 
 def list_runs(runs_dir: Path | str | None = None) -> pd.DataFrame:
-    """Wszystkie runy z podstawowymi informacjami (najnowsze na końcu)."""
+    """
+    Wszystkie runy z podstawowymi informacjami (najnowsze na końcu), także modeli fundamentalnych
+    (kolumna `pretrained`) — wywołujący filtrują po modelu; domyślne pomijanie TFM jest w `latest_runs`.
+    """
     rows = []
     for info_path in sorted(_runs_dir(runs_dir).glob("*/run_info.json")):
         try:
@@ -119,6 +127,7 @@ def list_runs(runs_dir: Path | str | None = None) -> pd.DataFrame:
             "done": (run_dir / DONE_JSON).exists(),
             "has_model": (run_dir / "model.joblib").exists(),
             "refit_of": info.get("refit_of"),
+            "pretrained": _is_pretrained(info),
         })
     return pd.DataFrame(rows)
 
@@ -135,11 +144,14 @@ def latest_runs(
     include_weighted: bool = False,
     data_version: str | None = "current",
     require_tuned: bool = True,
+    include_pretrained: bool = False,
 ) -> list[Run]:
     """
     Najnowszy run każdego modelu dla zestawu cech — kandydaci do porównania i łączenia.
 
     Domyślnie pomijane są runy:
+        - modeli fundamentalnych (TFM: tabpfn, tabicl)  → include_pretrained=True albo jawne `models`
+          z nazwą TFM (domyślne zestawy 07/08/niepewności/LLM pozostają przy 6 modelach klasycznych),
         - na próbkach (--sample / --eval-sample)       → include_samples=True,
         - nieukończone (bez DONE.json)                  → require_done=False,
         - bez pliku modelu (--no-save)                  → require_model=False,
@@ -172,6 +184,13 @@ def latest_runs(
         table = table[table["data_version"] == wanted]
     if models is not None:
         table = table[table["model"].isin(models)]
+    if not include_pretrained and not table.empty and "pretrained" in table.columns:
+        named = table["model"].isin(models) if models is not None else pd.Series(False, index=table.index)
+        skip = table["pretrained"].fillna(False).astype(bool) & ~named
+        if skip.any():
+            log.info("Pominięto runy modeli fundamentalnych (TFM; include_pretrained=True albo jawna lista modeli "
+                     "je uwzględni): " + ", ".join(table.loc[skip, "run"]))
+            table = table[~skip]
     if not include_weighted and not table.empty:
         weighted = table[table["weights"].map(_is_weighted)]
         if not weighted.empty:
