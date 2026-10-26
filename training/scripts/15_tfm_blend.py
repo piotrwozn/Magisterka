@@ -109,6 +109,9 @@ def run(argv: list[str] | None = None) -> int:
         except (AnalysisArgumentError, FileNotFoundError) as exc:
             log.error(str(exc))
             return 2
+        except RuntimeError as exc:            # żadne powtórzenie nie zakończyło się (szczegóły wyżej w logu)
+            log.error(f"Eksperyment B nieudany: {exc}")
+            return 1
     except KeyboardInterrupt:
         print("Przerwano (Ctrl+C) — uruchom to samo polecenie, gotowe powtórzenia zostaną pominięte.")
         return 130

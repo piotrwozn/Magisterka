@@ -192,6 +192,18 @@ class TabICLAdapter(TFMAdapter):
     def oom_advice(self) -> str:
         return "n_ctx, n_estimators, max_features (np. 100) albo predict_batch"
 
+    def reencodes_context(self, runtime: Mapping[str, Any]) -> bool:
+        """'repr' / bez bufora: transformer ICL liczony od nowa na całym kontekście przy każdym wywołaniu."""
+        return runtime.get("kv_cache") != "kv"
+
+    def host_cache_runtime(self, runtime: Mapping[str, Any]) -> tuple[dict[str, Any], str] | None:
+        """TabICL trzyma bufor na urządzeniu — mniejszy bufor: 'kv' → 'repr' (~12× mniej VRAM na wiersz)."""
+        rt = dict(runtime)
+        if rt.get("kv_cache") != "kv":
+            return None
+        rt["kv_cache"] = "repr"
+        return rt, "kv_cache 'kv' → 'repr' (mniejszy bufor; kontekst ICL liczony przy każdym wywołaniu)"
+
     def cache_bytes(self, params: Mapping[str, Any], runtime: Mapping[str, Any], n_ctx: int,
                     n_features: int) -> int | None:
         return self.kv_cache_bytes(int(params.get("n_estimators") or 8), int(n_ctx), int(n_features),

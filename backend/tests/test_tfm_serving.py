@@ -73,13 +73,13 @@ def fake_tfm(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
-def _tfm(path: Path, name: str = "tabpfn", n_bags: int = 2) -> Path:
+def _tfm(path: Path, name: str = "tabpfn", n_bags: int = 2, **params) -> Path:
     """TFM artifact saved by the training wrapper (bundle["model"] = TFMPredictor, `pretrained: True`)."""
     from src.models import get_model
 
     X, y = _frame(seed=1)
     model = get_model(name, params={"n_ctx": 80, "n_bags": n_bags, "max_bags": n_bags, "n_estimators": 1,
-                                    "device": "cpu", "n_jobs": 1})
+                                    "device": "cpu", "n_jobs": 1, **params})
     model.fit_estimator(X, y)
     path.parent.mkdir(parents=True, exist_ok=True)
     model.save(path)
@@ -292,6 +292,47 @@ class TestOptInServing:
         reg = _load(*served)
         assert "tabpfn" not in reg.models and "warm-up of tabpfn failed" in reg.tfm_status["tabpfn"]
         assert reg.ensemble.source.endswith(ENSEMBLE_WEIGHTS_NO_TFM_FILE)
+
+    @pytest.mark.parametrize("name, params", [("tabicl", {"kv_cache": "repr"}), ("tabicl", {"kv_cache": False}),
+                                              ("tabpfn", {"fit_mode": "fit_preprocessors"})])
+    def test_context_reencoding_tfm_is_refused(self, deploy, fake_tfm, monkeypatch, name, params):
+        """A runtime that re-encodes the whole context per call (seconds per 1-row request) is not served."""
+        models_dir, runs_dir = deploy
+        monkeypatch.setenv(registry_module.TFM_SERVING_ENV, "1")
+        monkeypatch.setattr(registry_module, "tfm_runtime_status", _cuda())
+        _tfm(models_dir / f"{name}_1.joblib", name=name, **params)
+        _weights(models_dir / ENSEMBLE_WEIGHTS_FILE, {"lightgbm": 0.5, name: 0.5})
+        _weights(models_dir / ENSEMBLE_WEIGHTS_NO_TFM_FILE, {"lightgbm": 1.0})
+        reg = _load(models_dir, runs_dir)
+        assert name not in reg.models and "context re-encoded on every request" in reg.tfm_status[name]
+        assert reg.ensemble.source.endswith(ENSEMBLE_WEIGHTS_NO_TFM_FILE)
+
+    def test_full_kv_cache_tabicl_is_served(self, deploy, fake_tfm, monkeypatch):
+        models_dir, runs_dir = deploy
+        monkeypatch.setenv(registry_module.TFM_SERVING_ENV, "1")
+        monkeypatch.setattr(registry_module, "tfm_runtime_status", _cuda())
+        _tfm(models_dir / "tabicl_1.joblib", name="tabicl", kv_cache="kv")
+        _weights(models_dir / ENSEMBLE_WEIGHTS_FILE, {"lightgbm": 0.5, "tabicl": 0.5})
+        assert _load(models_dir, runs_dir).tfm_status["tabicl"] == "served"
+
+    def test_slow_one_row_predict_is_refused(self, served, monkeypatch):
+        """Warmed-up 1-row probe above SOR_AI_BACKEND_TFM_MAX_LATENCY_S → not served (synchronous requests)."""
+        from src.models.tfm_base import TFMPredictor
+
+        monkeypatch.setattr(TFMPredictor, "probe_latency", lambda self, n_rows=1: 5.0)
+        reg = _load(*served)
+        assert "tabpfn" not in reg.models and "took 5.0 s" in reg.tfm_status["tabpfn"]
+        assert reg.ensemble.source.endswith(ENSEMBLE_WEIGHTS_NO_TFM_FILE)
+        monkeypatch.setenv(registry_module.TFM_MAX_LATENCY_ENV, "10")
+        assert _load(*served).tfm_status["tabpfn"] == "served"
+
+    def test_max_latency_env(self, monkeypatch):
+        monkeypatch.delenv(registry_module.TFM_MAX_LATENCY_ENV, raising=False)
+        assert registry_module.tfm_max_latency_s() == registry_module.DEFAULT_TFM_MAX_LATENCY_S == 2.0
+        monkeypatch.setenv(registry_module.TFM_MAX_LATENCY_ENV, "0.5")
+        assert registry_module.tfm_max_latency_s() == 0.5
+        monkeypatch.setenv(registry_module.TFM_MAX_LATENCY_ENV, "szybko")
+        assert registry_module.tfm_max_latency_s() == 2.0
 
     def test_library_missing_falls_back(self, served, monkeypatch):
         monkeypatch.setattr(registry_module, "tfm_runtime_status", _cuda(libraries=()))

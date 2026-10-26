@@ -36,7 +36,14 @@ opts in with `SOR_AI_BACKEND_TFM=1`; serving then requires:
     (`SOR_AI_BACKEND_TFM_RESERVE_MB`, default 2048) must fit the FREE VRAM
     (`torch.cuda.mem_get_info`; the GPU is shared with Ollama),
   * a successful warm-up of every bag at start-up (`keep_fitted_bags="all"`, so a
-    request never re-fits a bag).
+    request never re-fits a bag),
+  * a context cache that is NOT re-encoded per request: a runtime with TabICL
+    kv_cache "repr" / no cache (the default for 50k-row TabICL contexts on 16 GB) or
+    TabPFN fit_mode "fit_preprocessors" (an OOM fallback) re-runs the transformer over the
+    whole context on every call (`TFMPredictor.reencodes_context()`) — seconds to tens of
+    seconds per 1-row request inside the synchronous request path — and is refused,
+  * a warmed-up 1-row predict within `SOR_AI_BACKEND_TFM_MAX_LATENCY_S` (default 2 s;
+    `TFMPredictor.probe_latency`) — catches e.g. a CPU-side TabPFN cache.
 Any failure — or the default opt-out — means the weighted TFMs are not served:
 the registry then switches to `<models_dir>/ensemble_weights_no_tfm.json` (the same
 recipe re-fitted on VAL without TFMs, written by training 08_final_report.py) with a
@@ -78,6 +85,8 @@ N_CLASSES = 5
 TFM_SERVING_ENV = "SOR_AI_BACKEND_TFM"
 TFM_RESERVE_ENV = "SOR_AI_BACKEND_TFM_RESERVE_MB"
 DEFAULT_TFM_RESERVE_MB = 2048
+TFM_MAX_LATENCY_ENV = "SOR_AI_BACKEND_TFM_MAX_LATENCY_S"
+DEFAULT_TFM_MAX_LATENCY_S = 2.0
 _TRUE_VALUES = ("1", "true", "yes", "on")
 _MB = 2 ** 20
 
@@ -96,6 +105,17 @@ def tfm_reserve_bytes() -> int:
         log.warning("%s=%r is not a number — using %d MB", TFM_RESERVE_ENV, raw, DEFAULT_TFM_RESERVE_MB)
         value = float(DEFAULT_TFM_RESERVE_MB)
     return int(max(0.0, value) * _MB)
+
+
+def tfm_max_latency_s() -> float:
+    """Upper bound for a warmed-up 1-row TFM predict (seconds; the request path is synchronous) — from the env."""
+    raw = os.environ.get(TFM_MAX_LATENCY_ENV, "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_TFM_MAX_LATENCY_S
+    except ValueError:
+        log.warning("%s=%r is not a number — using %.1f s", TFM_MAX_LATENCY_ENV, raw, DEFAULT_TFM_MAX_LATENCY_S)
+        value = DEFAULT_TFM_MAX_LATENCY_S
+    return max(0.0, value)
 
 
 def _has_module(name: str) -> bool:
@@ -451,6 +471,19 @@ class ModelRegistry:
                 _release_tfm(bundle["model"])
             return
 
+        reencoding = [m for m, (bundle, _) in loaded.items()
+                      if callable(getattr(bundle["model"], "reencodes_context", None))
+                      and bundle["model"].reencodes_context()]
+        if reencoding:
+            details = "; ".join(f"{m}: runtime {getattr(loaded[m][0]['model'], 'runtime', {})}" for m in reencoding)
+            self._tfm_unavailable(list(loaded), f"context re-encoded on every request ({details}) — a 1-row "
+                                                f"request would take seconds to tens of seconds; serve a TFM run "
+                                                f"with a full KV cache (TabICL kv_cache='kv', TabPFN "
+                                                f"fit_with_cache) or the no-TFM recipe")
+            for bundle, _ in loaded.values():
+                _release_tfm(bundle["model"])
+            return
+
         sizes: dict[str, int | None] = {}
         for model_id, (bundle, _) in loaded.items():
             try:
@@ -477,6 +510,25 @@ class ModelRegistry:
                 bundle["model"].warm_up()
             except Exception as exc:  # noqa: BLE001 — OOM / CUDA / missing weights → fallback, never a crash
                 self._tfm_unavailable(list(loaded), f"warm-up of {model_id} failed: {type(exc).__name__}: {exc}")
+                for other, _ in loaded.values():
+                    _release_tfm(other["model"])
+                return
+        limit = tfm_max_latency_s()
+        for model_id, (bundle, _) in loaded.items():
+            probe = getattr(bundle["model"], "probe_latency", None)
+            if not callable(probe) or limit <= 0:
+                continue
+            try:
+                seconds = float(probe(1))
+            except Exception as exc:  # noqa: BLE001 — a failing probe is a failing request
+                self._tfm_unavailable(list(loaded), f"1-row probe of {model_id} failed: {type(exc).__name__}: {exc}")
+                for other, _ in loaded.values():
+                    _release_tfm(other["model"])
+                return
+            log.info("  %-15s 1-row predict after warm-up: %.3f s (limit %.1f s)", model_id, seconds, limit)
+            if seconds > limit:
+                self._tfm_unavailable(list(loaded), f"1-row predict of {model_id} took {seconds:.1f} s > "
+                                                    f"{TFM_MAX_LATENCY_ENV}={limit:g} s (request path is synchronous)")
                 for other, _ in loaded.values():
                     _release_tfm(other["model"])
                 return

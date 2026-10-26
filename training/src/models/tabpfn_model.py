@@ -191,6 +191,22 @@ class TabPFNAdapter(TFMAdapter):
     def oom_advice(self) -> str:
         return "n_ctx, n_estimators albo predict_batch (ewentualnie model_version='v3.5-fast')"
 
+    def cache_on_device(self, runtime: Mapping[str, Any]) -> bool:
+        return bool(runtime.get("keep_cache_on_device", True))
+
+    def reencodes_context(self, runtime: Mapping[str, Any]) -> bool:
+        """fit_preprocessors / low_memory: kontekst przechodzi przez transformer przy każdym wywołaniu."""
+        return runtime.get("fit_mode") != "fit_with_cache"
+
+    def host_cache_runtime(self, runtime: Mapping[str, Any]) -> tuple[dict[str, Any], str] | None:
+        rt = dict(runtime)
+        if rt.get("fit_mode") != "fit_with_cache" or (not rt.get("keep_cache_on_device", True)
+                                                       and rt.get("one_cache_at_a_time")):
+            return None
+        rt["keep_cache_on_device"] = False
+        rt["one_cache_at_a_time"] = True
+        return rt, "bufory KV w RAM (keep_cache_on_device=False + max_batched_estimator_rows=0)"
+
     def cache_bytes(self, params: Mapping[str, Any], runtime: Mapping[str, Any], n_ctx: int,
                     n_features: int) -> int | None:
         """Bufor KV v3.5 (plan pamięci): 3840 B/wiersz (int8) lub 6912 B (fp16) + 294 912 B/kolumnę modelu."""

@@ -143,8 +143,26 @@ def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+# Modele fundamentalne (TFM) w demo: predykcja = dopasowanie worków kontekstu na GPU, SHAP nieobsługiwany
+TFM_DEMO_MESSAGE = (
+    "model fundamentalny (TFM) — SHAP nie jest liczony (permutacyjny SHAP wymagałby setek przebiegów "
+    "inferencji kontekstu; wyjaśnienia post hoc dla TFM nie są zwalidowane). Wyjaśnienia: model LightGBM."
+)
+
+
+def _is_pretrained(value: Any) -> bool:
+    """Kolumna `pretrained` z list_runs (True / None / NaN) → bool."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return False
+    return bool(value)
+
+
 def list_model_runs(runs_dir: Path = RUNS_DIR) -> list[dict[str, Any]]:
-    """Runy z zapisanym model.joblib, najnowsze pierwsze (nazwa zaczyna się od znacznika czasu)."""
+    """
+    Runy z zapisanym model.joblib, najnowsze pierwsze (nazwa zaczyna się od znacznika czasu). Bez runów
+    modeli fundamentalnych (TFM: `pretrained`) — te tylko jawnie: `-- --model runs/<run>/model.joblib`
+    (inaczej najnowszy run po `run_all --models tfm` zmieniłby domyślny model demo na TFM).
+    """
     from src.ensemble import list_runs
 
     if not Path(runs_dir).exists():
@@ -152,6 +170,8 @@ def list_model_runs(runs_dir: Path = RUNS_DIR) -> list[dict[str, Any]]:
     table = list_runs(runs_dir)
     out = []
     for row in table.sort_values("run", ascending=False).to_dict("records"):
+        if _is_pretrained(row.get("pretrained")):
+            continue
         path = Path(runs_dir) / row["run"] / "model.joblib"
         if path.exists():
             is_sample = not (pd.isna(row.get("train_sample")) and pd.isna(row.get("eval_sample")))
@@ -285,7 +305,10 @@ def _cache_data(func):
 
 @_cache_resource
 def load_model_cached(model_path: str) -> BaseTriageModel:
-    return load_model(model_path)
+    model = load_model(model_path)
+    if getattr(model, "pretrained", False):
+        model.keep_fitted_bags = "all"        # TFM: worki dopasowane raz (nie przy każdym kliknięciu)
+    return model
 
 
 @_cache_data
@@ -298,6 +321,8 @@ def load_background_cached(feature_names: tuple[str, ...], n: int = 200) -> pd.D
 
 @_cache_resource
 def init_shap_explainer(model_path: str, _model: BaseTriageModel) -> SHAPTriageExplainer:
+    if getattr(_model, "pretrained", False):
+        raise ExplainerUnavailable(f"{_model.name}: {TFM_DEMO_MESSAGE}")
     background = None
     if SHAPTriageExplainer.method_for(_model) in ("linear", "permutation"):
         background = load_background_cached(tuple(_model.feature_names))
@@ -414,7 +439,7 @@ def main() -> None:
         runs = list_model_runs()
         if not runs:
             st.error(
-                f"Brak runów z zapisanym modelem w `{RUNS_DIR}`.\n\n"
+                f"Brak runów z zapisanym modelem w `{RUNS_DIR}` (runy TFM tylko przez `-- --model <ścieżka>`).\n\n"
                 "Wytrenuj model: `python scripts/03_train.py --model xgboost`"
             )
             return
@@ -457,7 +482,13 @@ def main() -> None:
 
     patient_row = build_patient_row(all_complaints=all_complaints, **form)
     X_patient = prepare_model_input(patient_row, model.feature_names)
-    pred = predict_levels(model, X_patient)
+    try:
+        pred = predict_levels(model, X_patient)
+    except Exception as e:
+        if not getattr(model, "pretrained", False):
+            raise
+        st.error(f"Predykcja modelu fundamentalnego nie powiodła się: {e}")   # np. brak CUDA dla dużego kontekstu
+        return
     proba = pred["proba"]
     patient_dict = patient_row.iloc[0].to_dict()
 

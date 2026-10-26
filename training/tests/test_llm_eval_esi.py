@@ -642,3 +642,121 @@ class TestTfmMembers:
         predictor = RecipePredictor(recipe)
         assert predictor.models["tabpfn"].keep_fitted_bags == "all"      # bez ponownego dopasowania na wiersz
         assert predictor.models["lightgbm"].keep_fitted_bags == 1
+
+
+class TestTfmRecipeMemory:
+    """
+    Członkowie TFM w recepturze bake-offu (atrapa estymatora): polityka pamięci (bufory na GPU albo poza VRAM),
+    worki dopasowane raz, przypadki liczone wsadowo, what_if bez ponownego dopasowania worków.
+    """
+
+    @pytest.fixture
+    def tfm_recipe(self, monkeypatch, tmp_path):
+        import src.models as models_pkg
+        from src.llm_eval import esi_cases
+        from src.models import get_model, tfm_fake
+        from tests.tfm_testkit import triage_frame
+
+        monkeypatch.setenv("SOR_AI_TFM_FAKE", "1")
+        monkeypatch.setenv("SOR_AI_DEVICE", "cpu")
+        monkeypatch.delenv(tfm_fake.FAKE_OOM_ENV, raising=False)
+        monkeypatch.setattr(tfm_fake, "FAKE_OOM", None)
+        tfm_fake.reset_calls()
+        X, y, _ = triage_frame(n=500, seed=2)
+        X = X.iloc[:, :12]
+        loaded = {}
+        for name, params in (("tabpfn", {"n_ctx": 100, "n_bags": 2, "max_bags": 2, "n_estimators": 1}),
+                             ("tabicl", {"n_ctx": 100, "kv_cache": "kv", "n_estimators": 1})):
+            model = get_model(name, params={**params, "n_jobs": 1})
+            model.fit_estimator(X.iloc[:400], y.iloc[:400])
+            loaded[name] = model
+        runs = []
+        for name in loaded:
+            run_dir = tmp_path / f"run_{name}"
+            run_dir.mkdir()
+            (run_dir / "model.joblib").write_bytes(b"x")
+            runs.append(SimpleNamespace(name=run_dir.name, path=run_dir))
+        monkeypatch.setattr(models_pkg, "load_model", lambda path: loaded[Path(path).parent.name.split("_", 1)[1]])
+        monkeypatch.setattr(esi_cases.RecipePredictor, "features",
+                            lambda self, base: base[self.feature_names].astype(np.float32))
+        recipe = SimpleNamespace(keys=list(loaded), runs=runs, weights={"tabpfn": 0.5, "tabicl": 0.5},
+                                 method="mean", temperature=None, spec={"rule": "argmax"})
+        yield recipe, X.iloc[400:], loaded
+        tfm_fake.reset_calls()
+
+    @staticmethod
+    def _logs(records: list) -> Any:
+        import logging
+
+        handler = logging.Handler(level=logging.DEBUG)
+        handler.emit = records.append                                         # type: ignore[method-assign]
+        return handler
+
+    def test_caches_fit_in_vram_stay_on_gpu(self, tfm_recipe, monkeypatch):
+        from src.llm_eval import esi_cases
+
+        recipe, _, loaded = tfm_recipe
+        monkeypatch.setattr(esi_cases, "free_vram_bytes", lambda: 12 * 2**30)
+        predictor = esi_cases.RecipePredictor(recipe)
+        plan = predictor.tfm_memory
+        assert plan["placement"] == "gpu" and plan["need_bytes"] > 0 and plan["steps"] == {}
+        assert all(m.keep_fitted_bags == "all" for m in predictor.models.values())
+        assert loaded["tabpfn"].model.runtime["keep_cache_on_device"] is True
+        assert loaded["tabicl"].model.runtime["kv_cache"] == "kv"
+
+    def test_caches_over_budget_move_off_vram_with_warning(self, tfm_recipe, monkeypatch):
+        import logging
+
+        from src.llm_eval import esi_cases
+
+        recipe, _, loaded = tfm_recipe
+        monkeypatch.setattr(esi_cases, "free_vram_bytes", lambda: 2**20)          # 1 MiB wolnej VRAM
+        records: list = []
+        handler = self._logs(records)
+        logging.getLogger("src.llm_eval.esi_cases").addHandler(handler)
+        try:
+            predictor = esi_cases.RecipePredictor(recipe)
+        finally:
+            logging.getLogger("src.llm_eval.esi_cases").removeHandler(handler)
+        plan = predictor.tfm_memory
+        assert plan["placement"] == "host" and set(plan["steps"]) == {"tabpfn", "tabicl"}
+        pfn, icl = loaded["tabpfn"].model, loaded["tabicl"].model
+        assert pfn.runtime["keep_cache_on_device"] is False and pfn.runtime["one_cache_at_a_time"] is True
+        assert icl.runtime["kv_cache"] == "repr"
+        assert plan["need_after_bytes"] == icl.estimated_cache_bytes() < plan["need_bytes"]   # TabPFN poza VRAM
+        assert all(m.keep_fitted_bags == "all" for m in predictor.models.values())      # nigdy refit na wiersz
+        warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+        assert any("wolnej VRAM" in w and "tabpfn" in w for w in warnings)
+        assert any("tabicl" in w and "CAŁY kontekst" in w for w in warnings)              # repr → kodowanie
+        assert any("także po przeniesieniu" in w for w in warnings)                       # 1 MiB to za mało
+
+    def test_cases_batched_and_what_if_never_refits_bags(self, tfm_recipe, monkeypatch):
+        from src.llm_eval import esi_cases
+        from src.models import tfm_fake
+
+        recipe, X_eval, loaded = tfm_recipe
+        monkeypatch.setattr(esi_cases, "free_vram_bytes", lambda: None)
+        predictor = esi_cases.RecipePredictor(recipe)
+        calls: list[int] = []
+        for model in loaded.values():
+            original = model.predict_proba
+
+            def spy(X, _original=original):
+                calls.append(len(X))
+                return _original(X)
+
+            model.predict_proba = spy                                            # type: ignore[method-assign]
+        rows = [{k: float(v) for k, v in X_eval.iloc[i].items()} for i in range(5)]
+        predictor.prefetch(rows)
+        assert calls == [5, 5]                                                   # jedno wywołanie na model
+        fits = tfm_fake.FAKE_CALLS["fit"]
+        assert fits == 3                                                         # 2 worki TabPFN + 1 TabICL
+        results = [predictor.predict_row(row) for row in rows]
+        assert calls == [5, 5] and tfm_fake.FAKE_CALLS["fit"] == fits           # przypadki z pamięci
+        again = predictor.predict_row(rows[0])
+        np.testing.assert_array_equal(again[0], results[0][0])                  # what_if bez zmian = to samo
+        changed = {**rows[0], X_eval.columns[0]: rows[0][X_eval.columns[0]] + 7.0}
+        predictor.predict_row(changed)
+        assert calls == [5, 5, 1, 1] and tfm_fake.FAKE_CALLS["fit"] == fits     # 1 wiersz, bez refitu worków
+        batched = np.vstack([r[0] for r in results])
+        np.testing.assert_allclose(batched.sum(axis=1), 1.0, atol=1e-6)

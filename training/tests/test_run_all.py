@@ -425,6 +425,41 @@ class TestHelpers:
     def test_tfm_failure_hint(self, text, fragment):
         assert fragment in orchestrator.tfm_failure_hint("linia\n" + text)
 
+    def test_tfm_failure_hint_ignores_device_line_and_torch_paths(self):
+        """
+        Zwykły log TFM zawsze zawiera „torch … (CUDA …)” (device_for) i ścieżki site-packages/torch —
+        błąd danych / kodu NIE może dostać wskazówki o przeinstalowaniu torch; wskazówka cytuje wyjątek.
+        """
+        tail = ("10:00:01 | INFO    | tabicl: trening na GPU (torch 2.14.1+cu130 (CUDA 13.0) na NVIDIA GeForce "
+                "RTX 4080 SUPER (16.0 GB VRAM))\n"
+                "Traceback (most recent call last):\n"
+                '  File "C:\\venv\\Lib\\site-packages\\torch\\nn\\functional.py", line 4521, in interpolate\n'
+                "ValueError: Input X contains NaN after preprocessing\n")
+        hint = orchestrator.tfm_failure_hint(tail)
+        assert "cu130" not in hint and "pip install torch" not in hint
+        assert hint.startswith("błąd: ValueError: Input X contains NaN") and "--offline-check" in hint
+        for device_error in ("RuntimeError: CUDA error: no kernel image is available for execution",
+                             "torch nie jest zainstalowany",
+                             "AssertionError: Torch not compiled with CUDA enabled"):
+            assert "cu130" in orchestrator.tfm_failure_hint("linia\n" + device_error), device_error
+
+    def test_tfm_eta_ignores_cpu_or_fake_benchmark(self, isolated_paths):
+        """ETA small_data tylko z benchmarku GPU z prawdziwymi wagami; CPU / atrapa / przekierowanie → brak."""
+        from src.analysis.small_data import lightgbm_eta_s
+
+        runs = Path(config.RUNS_DIR)
+        bench = runs / "analyses" / "tfm_setup" / "benchmark.json"
+        bench.parent.mkdir(parents=True, exist_ok=True)
+        assert orchestrator.tfm_analysis_eta_s("small_data", runs) is None              # brak pliku
+        for extra in ({"device": "cpu"}, {"device": "cuda", "fake": True},
+                      {"device": "cuda", "weights": {"tabpfn": {"override": "SOR_AI_TABPFN_MODEL_PATH=x"}}}):
+            bench.write_text(json.dumps({**extra, "estimates": {"experiment_a": {"total_s": 100.0}}}), encoding="utf-8")
+            assert orchestrator.tfm_analysis_eta_s("small_data", runs) is None, extra
+        bench.write_text(json.dumps({"device": "cuda", "estimates": {"experiment_a": {"total_s": 100.0}}}),
+                         encoding="utf-8")                                              # starszy format: total = TFM
+        assert orchestrator.tfm_analysis_eta_s("small_data", runs) == pytest.approx(100.0 + lightgbm_eta_s())
+        assert orchestrator.tfm_analysis_eta_s("tfm_blend", runs) == 900.0
+
     def test_format_duration(self):
         assert format_duration(None) == "—"
         assert format_duration(42) == "42 s"
@@ -1621,21 +1656,65 @@ class TestAnalysesStage:
         assert [n for n, _ in runner.analyses()] == ["seeds", "site_out", "learning_curve"]
         assert [t.name for t in orch.analysis_tasks] == ["seeds", "site_out", "learning_curve"]
         reasons = {s["name"]: s["reason"] for s in orch.analysis_skipped}
-        assert "brak bibliotek TFM" in reasons["small_data"]
-        assert "brak ukończonego runu TFM" in reasons["tfm_blend"] and "--models tfm" in reasons["tfm_blend"]
-        assert "small_data      pomijam — brak bibliotek TFM" in caplog.text
+        for name in ("small_data", "tfm_blend"):                                    # TFM nie żądane, brak runu TFM
+            assert "nie są w --models" in reasons[name] and "brak ukończonego runu TFM" in reasons[name]
+            assert "--models tfm" in reasons[name]
+        assert "small_data      pomijam — modele TFM nie są w --models" in caplog.text
         status = json.loads((orch.log_dir / "status.json").read_text(encoding="utf-8"))
         assert {s["name"] for s in status["analyses_skipped"]} == {"small_data", "tfm_blend"}
         text = status_report(make_opts())
         lines = {line.split()[1]: line for line in text.splitlines() if line.startswith("triage ")}
-        assert "pominięta" in lines["small_data"] and "brak bibliotek TFM" in lines["small_data"]
+        assert "pominięta" in lines["small_data"] and "nie są w --models" in lines["small_data"]
         assert "pominięta" in lines["tfm_blend"] and "brak ukończonego runu TFM" in lines["tfm_blend"]
+
+    def test_classical_analyses_skip_small_data_even_with_tfm_libraries(self, workspace, monkeypatch):
+        """
+        L1: biblioteki TFM zainstalowane, ale --models klasyczne i brak runu TFM → zwykłe `--stage analyses`
+        NIE uruchamia eksperymentu A (godziny); plan analiz klasycznych bez zmian.
+        """
+        assert Orchestrator(make_opts(), runner=FakeRunner()).run() == 0
+        runner = AnalysisFakeRunner()
+        baseline = Orchestrator(make_opts(stage="analyses"), runner=runner)
+        assert baseline.run() == 0
+        classical_plan = [(t.name, t.models) for t in baseline.analysis_tasks]
+        monkeypatch.setattr(orchestrator, "tfm_libraries", lambda: {"tabpfn": True, "tabicl": True})
+        runner = AnalysisFakeRunner()
+        orch = Orchestrator(make_opts(stage="analyses"), runner=runner)
+        assert orch.run() == 0
+        assert [n for n, _ in runner.analyses()] == ["seeds", "site_out", "learning_curve"]
+        assert [(t.name, t.models) for t in orch.analysis_tasks] == classical_plan
+        reasons = {s["name"]: s["reason"] for s in orch.analysis_skipped}
+        assert "nie są w --models" in reasons["small_data"]
+
+    def test_small_data_runs_when_tfm_requested_without_runs(self, workspace, monkeypatch):
+        """TFM jawnie w --models (bez gotowego runu TFM) → small_data rusza dla żądanych TFM z bibliotekami."""
+        monkeypatch.setattr(orchestrator, "tfm_libraries", lambda: {"tabpfn": True, "tabicl": True})
+        assert Orchestrator(make_opts(models=["lightgbm"]), runner=FakeRunner()).run() == 0
+        runner = AnalysisFakeRunner()
+        orch = Orchestrator(make_opts(stage="analyses", models=["lightgbm", "tabicl"]), runner=runner)
+        assert orch.run() == 0
+        args = {n: _arg(c, "--models") for n, c in runner.analyses()}
+        assert args["small_data"] == "lightgbm,tabicl" and "tfm_blend" not in args
+        reasons = {s["name"]: s["reason"] for s in orch.analysis_skipped}
+        assert "brak ukończonego runu TFM" in reasons["tfm_blend"]
+
+    def test_small_data_runs_when_tfm_run_exists(self, workspace, monkeypatch):
+        """Gotowy run TFM z tagiem (--models klasyczne) → small_data dla TFM z gotowym runem."""
+        monkeypatch.setattr(orchestrator, "tfm_libraries", lambda: {"tabpfn": True, "tabicl": True})
+        assert Orchestrator(make_opts(models=["lightgbm", "tabpfn"]), runner=FakeRunner()).run() == 0
+        runner = AnalysisFakeRunner()
+        assert Orchestrator(make_opts(stage="analyses", models=list(orchestrator.CLASSICAL_MODELS)),
+                            runner=runner).run() == 0
+        args = {n: _arg(c, "--models") for n, c in runner.analyses()}
+        assert args["small_data"] == "lightgbm,tabpfn" and args["tfm_blend"] == "lightgbm,tabpfn"
 
     def test_tfm_steps_run_when_prerequisites_exist(self, workspace, monkeypatch, caplog):
         monkeypatch.setattr(orchestrator, "tfm_libraries", lambda: {"tabpfn": True, "tabicl": False})
         bench = Path(config.RUNS_DIR) / "analyses" / "tfm_setup" / "benchmark.json"
         bench.parent.mkdir(parents=True, exist_ok=True)
-        bench.write_text(json.dumps({"estimates": {"experiment_a": {"total_s": 4321.0}}}), encoding="utf-8")
+        bench.write_text(json.dumps({"device": "cuda", "fake": False,
+                                     "estimates": {"experiment_a": {"tfm_s": 4321.0, "lightgbm_s": 1.0,
+                                                                    "total_s": 4322.0}}}), encoding="utf-8")
         models = ["lightgbm", "tabpfn", "tabicl"]
         assert Orchestrator(make_opts(models=models), runner=FakeRunner()).run() == 0
         runner = AnalysisFakeRunner()
@@ -1648,7 +1727,10 @@ class TestAnalysesStage:
                         "small_data": "lightgbm,tabpfn", "tfm_blend": "lightgbm,tabpfn,tabicl"}
         assert all(_arg(c, "--tag") == "smoke" and _arg(c, "--feature-set") == "triage" for _, c in calls)
         tasks = {t.name: t for t in orch.analysis_tasks}
-        assert tasks["small_data"].eta_s == 4321.0 and tasks["tfm_blend"].eta_s == 900.0
+        from src.analysis.small_data import lightgbm_eta_s
+
+        assert tasks["small_data"].eta_s == pytest.approx(4321.0 + lightgbm_eta_s())    # TFM + LightGBM (~5 h)
+        assert tasks["tfm_blend"].eta_s == 900.0
         assert tasks["seeds"].eta_s > orchestrator.analysis_eta_s("seeds", {"lightgbm": 0.0})  # + predict_s TFM
         assert all(t.status == DONE for t in orch.analysis_tasks) and orch.analysis_skipped == []
         assert "refity seedów obejmą modele fundamentalne" in caplog.text

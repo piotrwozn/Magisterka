@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import json
 import math
+import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -78,6 +80,9 @@ SHAP_TOP_STORED: int = 10
 # z modelu drzewiastego (TREE_SHAP_METHODS), jak wyjaśnienia w 05_explain (LightGBM).
 SHAP_METHOD_RANK: dict[str, int] = {"tree": 0, "catboost": 0, "ebm": 1, "linear": 2}
 TREE_SHAP_METHODS: tuple[str, ...] = ("tree", "catboost")
+# Członkowie TFM w recepturze: bufory wszystkich worków ≤ tego ułamka WOLNEJ VRAM → zostają na GPU;
+# inaczej bufory poza VRAM (TabPFN: RAM; TabICL: mniejszy 'repr') — worki dopasowane raz, nigdy na wiersz
+TFM_CACHE_VRAM_FRACTION: float = 0.8
 ARRIVAL_COLS: dict[str, str] = {"ambulance": "arrival_ambulance", "self": "arrival_self", "other": "arrival_other"}
 # Kolumny bazowe triażu, które zawsze trafiają do wiersza kanonicznego (cc_* — wszystkie z danych)
 BASE_GROUPS: tuple[str, ...] = ("demographics", "arrival", "time", "triage_vitals", "chief_complaints")
@@ -257,14 +262,30 @@ def as_stored_proba(proba: np.ndarray) -> np.ndarray:
     return p / p.sum(axis=1, keepdims=True)
 
 
+def free_vram_bytes() -> int | None:
+    """Wolna VRAM (bajty; torch.cuda.mem_get_info) albo None — brak torch / CUDA."""
+    from src.utils.hardware import torch_info
+
+    info = torch_info()
+    free = info.get("free_vram_mb") if info.get("cuda_available") else None
+    return None if free is None else int(free) * 2**20
+
+
 class RecipePredictor:
     """
     Receptura liczona na żywo z modeli: wiersz kanoniczny → cechy → prawdopodobieństwa → decyzja.
 
     Ładowane są tylko modele o dodatniej wadze (model o wadze 0 nie zmienia połączenia). Członek TFM
-    (`pretrained`): `keep_fitted_bags="all"` — przypadki i what_if liczone są wiersz po wierszu, a bez tego
-    każdy wiersz dopasowywałby od nowa każdy worek kontekstu (bufor KV); estymatory zostają w pamięci
-    (GPU) do końca procesu.
+    (`pretrained`):
+        - `keep_fitted_bags="all"` — worki kontekstu dopasowane RAZ na cały proces, nigdy na wiersz;
+        - pamięć: suma buforów wszystkich worków wszystkich TFM (`estimated_cache_bytes`) ≤
+          TFM_CACHE_VRAM_FRACTION × wolna VRAM → bufory na GPU; inaczej bufory poza VRAM (TabPFN
+          keep_cache_on_device=False + max_batched_estimator_rows=0, TabICL kv_cache 'repr') + WARNING;
+        - wiersze przypadków liczone WSADOWO (`prefetch` — jedno wywołanie na wszystkie przypadki), wyniki
+          zapamiętane po wartościach cech: przypadek i what_if bez zmian dają identyczny wynik; zmieniony
+          what_if = jedno wywołanie 1 wiersza;
+        - TFM kodujący kontekst przy każdym wywołaniu (TabICL 'repr' / bez bufora, TabPFN fit_preprocessors)
+          → WARNING z czasem zmierzonym przy pierwszym wywołaniu (każdy zmieniony what_if kosztuje tyle).
     """
 
     def __init__(self, recipe: Recipe):
@@ -279,14 +300,118 @@ class RecipePredictor:
             if not path.exists():
                 raise CasesUnavailable(f"Run {run.name} nie ma pliku modelu {path} (trenowany z --no-save?)")
             self.models[key] = load_model(path)
-            if getattr(self.models[key], "pretrained", False):
-                self.models[key].keep_fitted_bags = "all"
         if not self.models:
             raise CasesUnavailable("Receptura nie ma żadnego modelu o dodatniej wadze")
         names: list[str] = []
         for model in self.models.values():
             names += [n for n in model.feature_names if n not in names]
         self.feature_names = names
+        self._tfm_memo: dict[str, dict[bytes, np.ndarray]] = {}
+        self._tfm_timed: set[str] = set()
+        self.tfm_memory = self._plan_tfm_memory()
+
+    # ── członkowie TFM: pamięć i wsadowe przypadki ──
+    def tfm_members(self) -> dict[str, Any]:
+        return {k: m for k, m in self.models.items() if getattr(m, "pretrained", False)}
+
+    def _plan_tfm_memory(self) -> dict[str, Any] | None:
+        """Polityka pamięci członków TFM (zob. docstring klasy); opis do logu / testów albo None (bez TFM)."""
+        tfms = self.tfm_members()
+        if not tfms:
+            return None
+        for model in tfms.values():
+            model.keep_fitted_bags = "all"
+        sizes: dict[str, int | None] = {}
+        for key, model in tfms.items():
+            predictor = getattr(model, "model", None)
+            try:
+                sizes[key] = predictor.estimated_cache_bytes() if predictor is not None else None
+            except Exception as exc:  # noqa: BLE001 — brak szacunku = traktujemy jak „nie wiadomo”
+                log.warning(f"{key}: szacunek bufora TFM niedostępny ({exc})")
+                sizes[key] = None
+        need = sum(v for v in sizes.values() if v is not None)
+        free = free_vram_bytes()
+        plan: dict[str, Any] = {"cache_bytes": sizes, "need_bytes": int(need), "free_bytes": free,
+                                "fraction": TFM_CACHE_VRAM_FRACTION, "placement": "gpu", "steps": {}}
+        mib = 2**20
+        if free is None:
+            plan["placement"] = "no_cuda"
+            log.info(f"Członkowie TFM {list(tfms)}: CUDA niedostępna — predykcja na urządzeniu z artefaktu "
+                     f"(CPU tylko dla małego kontekstu); bufory {need / mib:,.0f} MiB w RAM")
+        elif need <= TFM_CACHE_VRAM_FRACTION * free and None not in sizes.values():
+            log.info(f"Członkowie TFM {list(tfms)}: bufory wszystkich worków {need / mib:,.0f} MiB ≤ "
+                     f"{TFM_CACHE_VRAM_FRACTION:.0%} wolnej VRAM ({free / mib:,.0f} MiB) — zostają na GPU")
+        else:
+            plan["placement"] = "host"
+            reason = (f"bufory wszystkich worków TFM {need / mib:,.0f} MiB"
+                      + (" (+ nieznane)" if None in sizes.values() else "")
+                      + f" > {TFM_CACHE_VRAM_FRACTION:.0%} wolnej VRAM ({free / mib:,.0f} MiB; GPU dzielone z Ollamą)")
+            after = 0
+            for key, model in tfms.items():
+                step = model.model.cache_on_host(reason) if hasattr(model.model, "cache_on_host") else None
+                plan["steps"][key] = step
+                log.warning(f"{key}: {reason} — " + (step or "bez zmiany (brak opcji bufora poza VRAM)")
+                            + "; worki i tak dopasowane raz (keep_fitted_bags='all'), nigdy na wiersz")
+                try:
+                    after += int(model.model.estimated_cache_bytes(on_device=True) or 0)
+                except Exception:  # noqa: BLE001 — atrapa / stary artefakt bez szacunku
+                    pass
+            plan["need_after_bytes"] = int(after)
+            if after > TFM_CACHE_VRAM_FRACTION * free:
+                log.warning(f"Członkowie TFM: także po przeniesieniu buforów na karcie zostaje ~{after / mib:,.0f} MiB "
+                            f"(> {TFM_CACHE_VRAM_FRACTION:.0%} wolnej VRAM) — możliwy brak pamięci GPU (drabina OOM "
+                            f"wrappera) albo spowolnienie; zatrzymaj modele Ollamy (`ollama stop <model>`) albo "
+                            f"uruchom bake-off bez --recipe")
+        for key, model in tfms.items():
+            if getattr(model.model, "reencodes_context", None) and model.model.reencodes_context():
+                log.warning(f"{key}: model koduje CAŁY kontekst przy każdym wywołaniu (runtime "
+                            f"{dict(model.model.runtime)}) — przypadki liczone wsadowo, ale każdy zmieniony "
+                            f"what_if = pełny przebieg kontekstu (czas zmierzony przy pierwszym wywołaniu)")
+        return plan
+
+    @staticmethod
+    def _row_keys(X: pd.DataFrame) -> list[bytes]:
+        arr = np.ascontiguousarray(X.to_numpy(dtype=np.float32))
+        return [arr[i].tobytes() for i in range(len(arr))]
+
+    def _tfm_probas(self, key: str, model: Any, X: pd.DataFrame) -> np.ndarray:
+        """TFM: brakujące wiersze w JEDNYM wywołaniu, wyniki zapamiętane po wartościach cech."""
+        memo = self._tfm_memo.setdefault(key, {})
+        keys = self._row_keys(X)
+        missing: dict[bytes, int] = {}
+        for i, k in enumerate(keys):
+            if k not in memo and k not in missing:
+                missing[k] = i
+        if missing:
+            t0 = time.perf_counter()
+            proba = as_stored_proba(model.predict_proba(X.iloc[list(missing.values())]))
+            elapsed = time.perf_counter() - t0
+            for k, row in zip(missing, proba, strict=True):
+                memo[k] = row
+            if key not in self._tfm_timed:
+                self._tfm_timed.add(key)
+                reencodes = bool(getattr(model.model, "reencodes_context", None) and model.model.reencodes_context())
+                message = (f"{key}: pierwsze wywołanie {len(missing)} wiersz(y) — {elapsed:.1f} s (w tym "
+                           f"dopasowanie worków)")
+                if reencodes:
+                    log.warning(message + " — kontekst kodowany przy każdym wywołaniu: każdy zmieniony what_if "
+                                          "kosztuje porównywalny czas")
+                else:
+                    log.info(message)
+        return np.vstack([memo[k] for k in keys]) if keys else np.zeros((0, N_CLASSES))
+
+    def prefetch(self, rows: Sequence[dict[str, float | None]]) -> None:
+        """
+        Członkowie TFM: prawdopodobieństwa wielu wierszy kanonicznych w jednym wywołaniu (przypadki części);
+        cechy liczone dokładnie jak w `predict_row` (wiersz po wierszu), więc późniejsze `predict_row` tych
+        wierszy trafia w zapamiętane wyniki. Bez członków TFM — nic.
+        """
+        tfms = self.tfm_members()
+        if not tfms or not rows:
+            return
+        X = pd.concat([self.features(self.row_frame(r)) for r in rows], ignore_index=True)
+        for key, model in tfms.items():
+            self._tfm_probas(key, model, X[model.feature_names])
 
     @property
     def weights(self) -> dict[str, float]:
@@ -301,7 +426,13 @@ class RecipePredictor:
         return full[self.feature_names].astype(np.float32)
 
     def model_probas(self, X: pd.DataFrame) -> dict[str, np.ndarray]:
-        return {k: as_stored_proba(m.predict_proba(X[m.feature_names])) for k, m in self.models.items()}
+        out: dict[str, np.ndarray] = {}
+        for k, m in self.models.items():
+            if getattr(m, "pretrained", False):
+                out[k] = self._tfm_probas(k, m, X[m.feature_names])
+            else:
+                out[k] = as_stored_proba(m.predict_proba(X[m.feature_names]))
+        return out
 
     def combine(self, probas: dict[str, np.ndarray]) -> np.ndarray:
         """Połączenie + temperatura (dokładnie jak 08)."""
@@ -738,10 +869,12 @@ def build_cases(
 
     cases: list[EsiCase] = []
     proba_cols = [f"p_{n.lower()}" for n in CLASS_NAMES]
+    rows = [_clean_row(base.loc[row_id]) for row_id in row_ids]
+    predictor.prefetch(rows)                          # członkowie TFM: wszystkie przypadki jednym wywołaniem
     for i, row_id in enumerate(row_ids):
         stored = decisions.loc[row_id]
         stored_idx = int(stored["decision"])
-        row = _clean_row(base.loc[row_id])
+        row = rows[i]
         # Decyzja przypadku = receptura na tym jednym wierszu (jak backend i what_if);
         # zgodność z decyzją 08 na zapisanych predykcjach — w decision_check
         p, decision_idx, X_row = predictor.predict_row(row)

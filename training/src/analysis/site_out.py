@@ -341,7 +341,7 @@ def run_leave_site_out(
 ) -> dict[str, Any]:
     """Refity bez wyłączonego oddziału + ocena na nim (wznawialne) → results.json, summary.md."""
     from src.data.dataset import data_fingerprint
-    from src.models.train import REFIT_VERSION, refit_from_run
+    from src.models.train import REFIT_VERSION, refit_from_run, run_duration_s
 
     tag = tag or default_tag()
     try:
@@ -391,7 +391,7 @@ def run_leave_site_out(
         return {"model": u["model"], "site": site, "run": run_dir.name, **unit_metrics(run_dir, run.path, site)}
 
     def estimate(u: Mapping[str, Any]) -> float:
-        return float(runs[u["model"]].info.get("training_duration_s") or 0.0) + 10.0
+        return run_duration_s(runs[u["model"]].info) + 10.0
 
     failures = execute_units(store, units, expect, compute, "site_out", force=force, estimate_s=estimate)
 

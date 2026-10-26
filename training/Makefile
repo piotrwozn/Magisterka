@@ -11,6 +11,10 @@
 #   make final-report — raport końcowy do pracy na TEST (raz, dla receptury wybranej na VAL)
 #   make explain-global MODEL=ebm — SHAP globalny, zależności, krzywe kształtu EBM (runs/<run>/figures/global)
 #   make llm-bakeoff  — porównanie modeli LLM do wyjaśnień (docs/LLM_BAKEOFF.md; Ollama po `ollama signin`)
+#   make tfm-setup    — TFM (docs/TFM.md): torch/CUDA, licencja TabPFN, wagi, benchmark GPU (po treningu klasycznym)
+#   make tfm-train PROFILE=thorough — trening TabPFN-3.5 + TabICLv2 (run_all --models tfm; wznawialny)
+#   make small-data TAG=thorough    — eksperyment A: TFM vs strojony LightGBM przy małym n
+#   make tfm-blend TAG=thorough     — eksperyment B: LightGBM + TFM na VAL z bramką → recommendation.json
 #   make test         — testy
 #
 # Zmienne: PROFILE=standard|thorough|quick|smoke  FEATURES=triage|full|triage,full  MODELS=all|lista
@@ -20,6 +24,8 @@
 #                   REPORT_ARGS="--method geometric --main-rule target --target-undertriage 0.15"
 # Porównanie LLM: make llm-bakeoff PARTS=exams | RECIPE=runs/final_report__triage__<czas>/recipe.json \
 #                   LLM_ARGS="--dry-run";  oceny: make llm-ratings RATINGS="oceny_1.csv oceny_2.csv" KEY=…/key.json
+# TFM: opcje skryptów 13/14/15 w TFM_ARGS, np. make tfm-setup TFM_ARGS="--offline-check",
+#      make small-data TAG=thorough TFM_ARGS="--plan", make tfm-blend TAG=thorough TFM_ARGS="--plan"
 
 PYTHON ?= python
 PROFILE ?= standard
@@ -36,12 +42,14 @@ RECIPE ?=
 LLM_ARGS ?=
 RATINGS ?=
 KEY ?=
+TFM_ARGS ?=
 
 RUN_ALL = $(PYTHON) scripts/run_all.py --feature-set $(FEATURES) --models $(MODELS) $(RUN_ARGS)
 
 .PHONY: install install-app install-dev check-env all smoke quick thorough status dry-run analyses \
         convert prepare prepare-site train train-all tune compare eval explain explain-global cv final-report \
-        llm-bakeoff llm-ratings demo mlflow test test-fast lint format clean clean-all
+        llm-bakeoff llm-ratings tfm-setup tfm-train small-data tfm-blend demo mlflow test test-fast lint format \
+        clean clean-all
 
 # --- Instalacja ---
 install:
@@ -129,6 +137,23 @@ llm-bakeoff:
 
 llm-ratings:
 	$(PYTHON) scripts/12_llm_bakeoff.py score-ratings $(foreach f,$(RATINGS),--csv $(f)) $(if $(KEY),--key $(KEY),)
+
+# --- Modele fundamentalne TFM (docs/TFM.md): TabPFN-3.5 + TabICLv2; instalacja PO treningu klasycznym ---
+# Najpierw: torch z CUDA z indeksu PyTorch, potem pip install -r requirements-tfm.txt -c requirements-lock.txt
+tfm-setup:
+	$(PYTHON) scripts/13_tfm_setup.py $(TFM_ARGS)
+
+# Trening TFM (wybór konfiguracji na holdoucie z TRAIN + predykcja VAL/TEST na GPU; wznawialny)
+tfm-train:
+	$(PYTHON) scripts/run_all.py --feature-set $(FEATURES) --models tfm --profile $(PROFILE) $(RUN_ARGS)
+
+# Eksperyment A (krzywa małych danych); LightGBM liczony zawsze, TFM bez bibliotek/wag → pominięty
+small-data:
+	$(PYTHON) scripts/14_small_data_curve.py --feature-set $(FEATURES) --tag $(TAG) $(TFM_ARGS)
+
+# Eksperyment B (tylko VAL): bramka i polecenie 08 w runs/analyses/tfm_blend__<cechy>__<tag>/recommendation.json
+tfm-blend:
+	$(PYTHON) scripts/15_tfm_blend.py --feature-set $(FEATURES) --tag $(TAG) $(TFM_ARGS)
 
 demo:
 	streamlit run app/streamlit_app.py

@@ -153,7 +153,64 @@ class TestRunTraining:
         budget = info["tfm"]["final_budget"]
         assert budget["reduce"] and info["tfm"]["n_bags"] == budget["n_bags"] == 2      # 3 × 800 s > 1800 s
         assert any(e["kind"] == "bags_reduced" for e in info["tfm"]["events"])
-        assert info["params"]["n_bags"] == 3                               # parametry bez zmian (refit)
+        # Liczba worków po redukcji w parametrach (refit nie wraca do 3); wartość przed — w final_budget
+        assert info["params"]["n_bags"] == 2 and budget["params_before"]["n_bags"] == 3
+        assert not budget["over_budget"]
+        refit = refit_from_run(Path(result["run_dir"]), seed=3, tag="smoke-seed3", eval_splits=("val",))
+        assert _read(Path(refit["run_dir"]) / "run_info.json")["tfm"]["n_bags"] == 2
+
+    def test_final_budget_caps_auto_bags_for_refit(self, prepared_paths, monkeypatch):
+        """n_bags="auto" przycięte budżetem → limit max_bags w parametrach; refit (ten sam N) ≤ tylu worków."""
+        from src.models import tfm_tuning
+
+        original = tfm_tuning.select_config
+
+        def slow_selection(*args, **kwargs):
+            result = original(*args, **kwargs)
+            result["best_params"] = {"n_ctx": 200, "n_estimators": 1, "n_bags": "auto", "max_bags": 4,
+                                     "bag_mode": "partition"}
+            result["throughput"] = {"rows_per_s": 0.25, "fit_s_per_bag": 0.0}   # 800 s na worek, budżet 1800 s
+            return result
+
+        monkeypatch.setattr(tfm_tuning, "select_config", slow_selection)
+        result = run_training("tabpfn", tune=True, profile="smoke")
+        info = _read(Path(result["run_dir"]) / "run_info.json")
+        assert info["tfm"]["n_bags"] == 2 and info["params"]["n_bags"] == "auto" and info["params"]["max_bags"] == 2
+        assert info["tfm"]["final_budget"]["params_before"] == {"n_bags": "auto", "max_bags": 4}
+        refit = refit_from_run(Path(result["run_dir"]), seed=5, tag="smoke-seed5", eval_splits=("val",))
+        refit_info = _read(Path(refit["run_dir"]) / "run_info.json")
+        assert refit_info["tfm"]["n_bags"] == 2 and refit_info["params"]["n_bags"] == "auto"
+
+    def test_single_bag_over_budget_warns_and_records_event(self, prepared_paths, monkeypatch):
+        """1 worek ponad final_budget_s: nie da się zmniejszyć — WARNING + zdarzenie, NIE „w budżecie”."""
+        import logging
+
+        from src.models import tfm_tuning
+
+        original = tfm_tuning.select_config
+
+        def slow_selection(*args, **kwargs):
+            result = original(*args, **kwargs)
+            result["throughput"] = {"rows_per_s": 0.01, "fit_s_per_bag": 0.0}   # ~200 wierszy → ~20 000 s
+            return result
+
+        records: list[logging.LogRecord] = []
+        handler = logging.Handler(level=logging.DEBUG)
+        handler.emit = records.append                                         # type: ignore[method-assign]
+        logging.getLogger("src.models.train").addHandler(handler)
+        monkeypatch.setattr(tfm_tuning, "select_config", slow_selection)
+        try:
+            result = run_training("tabpfn", tune=True, profile="smoke")
+        finally:
+            logging.getLogger("src.models.train").removeHandler(handler)
+        info = _read(Path(result["run_dir"]) / "run_info.json")
+        budget = info["tfm"]["final_budget"]
+        assert info["tfm"]["n_bags"] == 1 and budget["reduce"] is False and budget["over_budget"] is True
+        events = [e for e in info["tfm"]["events"] if e["kind"] == "final_budget_exceeded"]
+        assert len(events) == 1 and events[0]["final_budget_s"] == budget["final_budget_s"]
+        assert any("PRZEKROCZONY" in r.getMessage() and r.levelno == logging.WARNING for r in records)
+        assert not any("w budżecie" in r.getMessage() for r in records)
+        assert "NADAL PONAD BUDŻETEM" in (Path(result["run_dir"]) / "report.md").read_text(encoding="utf-8")
 
 
 # ─────────────────────────────────────────
@@ -284,10 +341,70 @@ def test_train_script_tfm_group_subprocess(prepared_esi_dir, tmp_path):
                            "--tune", "--profile", "smoke"], env=env, capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=600, cwd=str(tmp_path))
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
-    done = sorted((tmp_path / "runs").glob(f"*/{DONE_JSON}"))
-    assert [_read(p)["model"] for p in done] == ["tabpfn", "tabicl"]
+    done = list((tmp_path / "runs").glob(f"*/{DONE_JSON}"))
+    # Katalogi runów w tej samej sekundzie sortują się alfabetycznie (tabicl < tabpfn) — kolejność treningu
+    # z logu ("Run: <nazwa>"), zbiór modeli z DONE.json
+    assert sorted(_read(p)["model"] for p in done) == ["tabicl", "tabpfn"]
+    output = proc.stdout + proc.stderr
+    order = [line.split("Run: ", 1)[1].split()[0] for line in output.splitlines() if "Run: " in line]
+    assert [name.split("_")[2] for name in order] == ["tabpfn", "tabicl"]
     for path in done:
         payload = _read(path)
         assert payload["pretrained"] is True and payload["tag"] == "smoke"
         assert payload["tfm"]["weights_override"] == "SOR_AI_TFM_FAKE=1"
     assert list((tmp_path / "logs" / "optuna").glob("tfm_tabpfn_*.json"))
+
+
+# ─────────────────────────────────────────
+# ETA refitów analiz: TFM = zapis kontekstu (≈ 0 s) + predykcja
+# ─────────────────────────────────────────
+def test_run_duration_includes_tfm_predict_time():
+    assert train.run_duration_s({"training_duration_s": 12.5}) == 12.5            # klasyczny: bez zmian
+    assert train.run_duration_s({"training_duration_s": 0.01, "tfm": {"predict_s": 3600.0}}) == pytest.approx(3600.01)
+    assert train.run_duration_s({}) == 0.0
+
+
+def test_seed_refit_eta_uses_tfm_predict_time(tfm_run, monkeypatch):
+    """Szacunek jednostki seedu TFM = (fit + predykcja) × 1,2 + 5 s, nie ≈ 5 s z samego zapisu kontekstu."""
+    from src.analysis import seeds
+
+    info_path = tfm_run / "run_info.json"
+    info = _read(info_path)
+    info["tfm"]["predict_s"] = 3600.0
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    estimates: dict[str, float] = {}
+
+    def spy(store, units, expect, compute, label, force=False, estimate_s=None):
+        estimates.update({str(u["unit"]): estimate_s(u) for u in units})
+        return []
+
+    monkeypatch.setattr(seeds, "execute_units", spy)
+    seeds.run_seed_refits(tag="smoke", models=["tabpfn"], n_seeds=1, include_source=False)
+    expected = (float(info["training_duration_s"] or 0.0) + 3600.0) * 1.2 + 5.0
+    assert list(estimates.values()) == [pytest.approx(expected)]
+
+
+def test_refit_log_reports_predict_time(tfm_run, monkeypatch):
+    """„Refit gotowy (X s)” dla TFM = dopasowanie + predykcja ramek (nie ≈ 0 s z zapisu kontekstu)."""
+    import logging
+
+    from src.models import tfm_base
+
+    original = tfm_base.TFMTriageModel.predict_proba_many
+
+    def slow_many(self, frames):
+        out = original(self, frames)
+        self.tfm_predict_s = 123.0
+        return out
+
+    monkeypatch.setattr(tfm_base.TFMTriageModel, "predict_proba_many", slow_many)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler(level=logging.DEBUG)
+    handler.emit = records.append                                             # type: ignore[method-assign]
+    logging.getLogger("src.models.train").addHandler(handler)
+    try:
+        refit_from_run(tfm_run, seed=7, tag="smoke-seed7", eval_splits=("val",))
+    finally:
+        logging.getLogger("src.models.train").removeHandler(handler)
+    done = [r.getMessage() for r in records if r.getMessage().startswith("Refit gotowy")]
+    assert len(done) == 1 and done[0].startswith("Refit gotowy (123.")

@@ -18,7 +18,12 @@ Protokół:
     - błąd / brak pamięci kandydata → "failed" / "oom" w tabeli, wybór trwa dalej,
     - wznawialność: wynik każdego kandydata w `<storage_dir>/tfm_<model>_<klucz>.json` ("kind": "tfm_candidate";
       klucz = model, zestaw cech, profil, odcisk danych, efektywna konfiguracja, holdout, biblioteka + wersja,
-      identyfikator wag); ponowne uruchomienie używa gotowych ("complete" i "oom"; "failed" liczone od nowa);
+      identyfikator wag); ponowne uruchomienie używa tylko ukończonych ("complete"); "failed" i "oom" liczone
+      od nowa (OOM zależy od stanu karty — np. Ollama zajmowała VRAM — więc po jej zwolnieniu kandydat ma
+      szansę; zapamiętany "oom" blokowałby wybór na zawsze);
+    - kandydat podejrzanie wolny (czas / koszt > SLOWDOWN_FACTOR × mediana tańszych) → WARNING: na Windows
+      sterownik NVIDIA może przy braku VRAM po cichu użyć pamięci współdzielonej RAM (Sysmem Fallback) zamiast
+      zgłosić OOM — drabina awaryjna wtedy nie działa (docs/TFM.md: "Prefer No Sysmem Fallback");
       blokada `<badanie>.lock` (jeden proces na wybór); podsumowanie `<badanie>.best.json` ("kind": "tfm_selection").
 
 Wynik ma kształt wyniku `tune_model` (klucze czytane przez train.py / orkiestrator): kind="tfm_config_selection",
@@ -59,7 +64,11 @@ CANDIDATE_KIND = "tfm_candidate"
 SELECTION_KIND = "tfm_selection"
 # Klucze ustalane przez maszynę (nie wchodzą do klucza kandydata) — jak REFIT_MACHINE_KEYS w train.py
 _MACHINE_KEYS = ("device", "n_jobs")
-_REUSABLE = ("complete", "oom")
+# Z pamięci podręcznej tylko ukończeni — "oom" zależy od stanu karty (inne programy na GPU), więc po zwolnieniu
+# VRAM liczony jest od nowa (jak "failed"); inaczej wybór, w którym wszyscy dostali OOM, nie ruszyłby nigdy
+_REUSABLE = ("complete",)
+# Kandydat wolniejszy (wall_s / koszt) niż SLOWDOWN_FACTOR × mediana tańszych → WARNING (Sysmem Fallback?)
+SLOWDOWN_FACTOR = 10.0
 
 
 def _now() -> str:
@@ -119,7 +128,7 @@ def final_bag_budget(throughput: Mapping[str, Any] | None, n_bags: int, n_rows: 
     dict: n_bags (po redukcji), reduce (bool), estimate_s, per_bag_s, final_budget_s.
     """
     out = {"n_bags": int(n_bags), "reduce": False, "estimate_s": None, "per_bag_s": None,
-           "final_budget_s": final_budget_s}
+           "final_budget_s": final_budget_s, "estimate_after_s": None, "over_budget": False}
     rows_per_s = (throughput or {}).get("rows_per_s")
     if not rows_per_s or not final_budget_s or n_bags < 1:
         return out
@@ -129,6 +138,9 @@ def final_bag_budget(throughput: Mapping[str, Any] | None, n_bags: int, n_rows: 
     if per_bag * int(n_bags) > float(final_budget_s) and n_bags > 1:
         out["n_bags"] = max(1, int(float(final_budget_s) // per_bag))
         out["reduce"] = out["n_bags"] < int(n_bags)
+    out["estimate_after_s"] = round(per_bag * out["n_bags"], 1)
+    # Nadal ponad budżet (1 worek nie mieści się w budżecie) — nie da się zmniejszyć liczbą worków
+    out["over_budget"] = per_bag * out["n_bags"] > float(final_budget_s)
     return out
 
 
@@ -308,6 +320,14 @@ def select_config(
             result = {"status": status, "error": f"{type(exc).__name__}: {str(exc).strip()[:500]}",
                       "wall_s": round(time.time() - t0, 2)}
             log.warning(f"  [{entry['index']}] {_describe(candidate)}: {status.upper()} — {result['error']}")
+        if result["status"] == "complete":
+            slowdown = _slowdown(entries, entry, result)
+            if slowdown is not None:
+                result["slowdown_vs_cheaper"] = slowdown
+                log.warning(f"  [{entry['index']}] {_describe(candidate)}: czas na jednostkę kosztu {slowdown:.0f}× "
+                            f"większy niż u tańszych kandydatów — możliwe przepełnienie VRAM bez błędu OOM (Windows: "
+                            f"NVIDIA \"CUDA – Sysmem Fallback Policy\" → ustaw \"Prefer No Sysmem Fallback\" dla "
+                            f"python.exe venv; docs/TFM.md §3) albo inny program na karcie")
         entry.update(result)
         write_json_atomic(path, {"kind": CANDIDATE_KIND, "selection": study_name, "key": key,
                                  "key_payload": payload, "config": dict(candidate), "stage": stage,
@@ -403,6 +423,25 @@ def select_config(
         return result
     finally:
         lock.release()
+
+
+def _slowdown(entries: list[dict[str, Any]], entry: Mapping[str, Any], result: Mapping[str, Any]) -> float | None:
+    """
+    Krotność (wall_s / koszt) kandydata względem mediany wcześniejszych ukończonych TAŃSZYCH kandydatów,
+    gdy przekracza SLOWDOWN_FACTOR; inaczej None. Koszt jest liniowy (n_ctx × n_est × worki), a uwaga
+    kontekstu rośnie do ~n_ctx², więc 4× kontekstu daje legalnie ≤ ~4× — próg 10× ma zapas.
+    """
+    cost = float(entry.get("cost") or 0.0)
+    wall = float(result.get("wall_s") or 0.0)
+    if cost <= 0 or wall <= 1.0:                     # krótkie pomiary (atrapa, CPU smoke) — bez sensu
+        return None
+    rates = [float(e["wall_s"]) / float(e["cost"]) for e in entries
+             if e.get("status") == "complete" and e.get("cost") and float(e["cost"]) < cost
+             and float(e.get("wall_s") or 0.0) > 0]
+    if not rates:
+        return None
+    ratio = (wall / cost) / float(np.median(rates))
+    return round(ratio, 1) if ratio > SLOWDOWN_FACTOR else None
 
 
 def _describe(config: Mapping[str, Any]) -> str:

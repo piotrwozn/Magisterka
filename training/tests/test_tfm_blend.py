@@ -471,6 +471,58 @@ class TestScript:
         assert module.run(["--tag", TAG, "--plan", "--repeats", "2"]) == 0
         out = capsys.readouterr().out
         assert "powtórzenia: 2" in out and LGBM in out
+        assert "Bramka (ustalona z góry" in out and "2 × SD seedów LightGBM = 0.0016" in out
+
+    def test_gate_logged_before_numbers(self, runs, caplog, monkeypatch):
+        import logging
+
+        monkeypatch.setattr(tb.log, "propagate", True)            # logger projektu nie propaguje do roota
+        with caplog.at_level(logging.INFO, logger=tb.log.name):
+            tb.run_tfm_blend(_cfg(models="tabpfn"))
+        text = caplog.text
+        assert text.index("Bramka (ustalona z góry") < text.index("log loss (cross-fitted)")
+
+    def test_orchestrator_command_contract(self, runs):
+        """Polecenie z `orchestrator.analysis_command` (lightgbm na liście modeli) → kod 0, wynik kompletny."""
+        from src.pipeline import orchestrator
+
+        cmd = orchestrator.analysis_command("tfm_blend", "triage", TAG, ["lightgbm", "tabpfn", "tabicl"])
+        script = next(i for i, part in enumerate(cmd) if Path(part).name == "15_tfm_blend.py")
+        module = _load_script("tfm_blend_script", "15_tfm_blend.py")
+        assert module.run(cmd[script + 1:] + ["--repeats", "1", "--bootstrap", "30", "--no-plots"]) == 0
+        root = orchestrator.analysis_path("tfm_blend", "triage", TAG)
+        assert root == tb.analysis_path("triage", TAG)
+        stored = json.loads((root / "results.json").read_text(encoding="utf-8"))
+        assert stored["complete"] and set(stored["runs"]) == {"lightgbm", "tabpfn", "tabicl"}
+        plan = json.loads((root / "plan.json").read_text(encoding="utf-8"))
+        unit = json.loads((root / "units" / "repeat1.json").read_text(encoding="utf-8"))
+        assert unit["source_run"] == plan["units"][0]["source_run"] == f"{LGBM}+{PFN}+{ICL}"
+        assert (root / "summary.md").exists()
+        assert analysis_progress(root)["complete"]
+
+    def test_constant_tfm_gives_no_numpy_warnings(self, world):
+        """TFM o stałych predykcjach (np. losowe wagi) → korelacje NaN (w raporcie „—”), bez ostrzeżeń numpy."""
+        import warnings
+
+        y = world["y"]
+        constant = np.tile([0.0, 0.0, 1.0, 0.0, 0.0], (len(y), 1))      # E[ESI] stałe → korelacja 0/0
+        data = tb.ValData(y=y, probas={"lightgbm": world["lightgbm"], "tabpfn": constant}, vc=None, site=None,
+                          row_ids=np.arange(len(y)))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            rows = tb.diversity_rows(data, ["lightgbm", "tabpfn"])
+        assert len(rows) == 1 and np.isnan(rows[0]["corr_expected"]) and np.isfinite(rows[0]["corr_errors"])
+
+    def test_no_repeat_finished_exit_one(self, runs, monkeypatch):
+        def boom(*args, **kwargs):
+            raise ValueError("zepsute dane")
+
+        monkeypatch.setattr(tb, "crossfit_repeat", boom)
+        module = _load_script("tfm_blend_script", "15_tfm_blend.py")
+        assert module.run(["--tag", TAG, "--models", "tabpfn", "--repeats", "1", "--bootstrap", "20",
+                           "--no-plots"]) == 1
+        progress = analysis_progress(tb.analysis_path("triage", TAG))
+        assert progress["total"] == 1 and progress["done"] == 0
 
     def test_run_then_recommended_final_report(self, runs, capsys):
         module = _load_script("tfm_blend_script", "15_tfm_blend.py")

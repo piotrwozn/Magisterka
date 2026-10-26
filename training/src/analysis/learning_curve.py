@@ -267,7 +267,7 @@ def run_learning_curve(
     """Refity na ułamkach X_fit (wznawialne) → results.json, summary.md, learning_curve.png."""
     from src.data.dataset import data_fingerprint
     from src.models import MODEL_REGISTRY
-    from src.models.train import REFIT_VERSION, refit_from_run
+    from src.models.train import REFIT_VERSION, refit_from_run, run_duration_s
 
     tag = tag or default_tag()
     fractions = parse_fractions(fractions)
@@ -302,7 +302,7 @@ def run_learning_curve(
         return {"model": u["model"], "fraction": u["fraction"], "run": run_dir.name, **unit_metrics(run_dir)}
 
     def estimate(u: Mapping[str, Any]) -> float:
-        return float(runs[u["model"]].info.get("training_duration_s") or 0.0) * float(u["fraction"]) + 5.0
+        return run_duration_s(runs[u["model"]].info) * float(u["fraction"]) + 5.0
 
     failures = execute_units(store, units, expect, compute, "learning_curve", force=force, estimate_s=estimate)
 

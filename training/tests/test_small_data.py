@@ -229,6 +229,61 @@ class TestStatistics:
         few = sd.crossover_bootstrap({500: ([0.9], [1.0]), 1000: ([0.8], [0.9])}, 50, seed=1)
         assert few["status"] == "no_fit" and "za mało" in few["reason"]
 
+    def test_crossover_ci_indicative_with_few_repeats(self):
+        rng = np.random.default_rng(3)
+        per_size = {}
+        for n, repeats in zip([500, 1000, 2000, 5000, 10000, 50000], [5, 5, 5, 5, 5, 3], strict=True):
+            arm = 0.70 + 2.0 / math.sqrt(n) + rng.normal(0, 0.0005, repeats)
+            base = 0.60 + 10.0 / math.sqrt(n) + rng.normal(0, 0.0005, repeats)
+            per_size[n] = (arm.tolist(), base.tolist())
+        res = sd.crossover_bootstrap(per_size, 200, seed=1)
+        assert res["ci_low"] is not None and res["ci_indicative"] is True and res["min_repeats"] == 3
+        assert "orientacyjny" in res["ci_note"]
+        full = sd.crossover_bootstrap({n: (a + a[:2], b + b[:2]) if len(a) == 3 else (a, b)
+                                       for n, (a, b) in per_size.items()}, 200, seed=1)
+        assert full["ci_indicative"] is False and "ci_note" not in full
+
+    def test_decision_p_is_max_of_bootstrap_and_t(self):
+        assert sd.decision_p(0.001, 0.07, 3) == 0.07                          # bootstrap zbyt wąski przy R = 3
+        assert sd.decision_p(0.20, 0.01, 5) == 0.20
+        assert sd.decision_p(None, 0.03, 4) == 0.03                           # --bootstrap 0
+        assert sd.decision_p(0.001, None, 1) is None                          # R = 1 → bez testu
+
+    def test_known_answer_three_repeats_not_significant(self, tmp_path):
+        """
+        R = 3, Δ log loss na powtórzenie = 0,01 / 0,02 / 0,03 i ZEROWY szum wierszy (Δ identyczne w każdym
+        wierszu): bootstrap dawał CI [0,01; 0,03], p = 1/B i werdykt „przegrana”; test t (df = 2): p ≈ 0,074 —
+        werdykt nie może być wygraną / przegraną.
+        """
+        rng = np.random.default_rng(5)
+        n_eval = 500
+        y = rng.choice(5, n_eval, p=[0.1, 0.25, 0.35, 0.2, 0.1])
+        base = rng.dirichlet(np.ones(5) * 2, n_eval) * 0.5 + np.eye(5)[y] * 0.5
+        (tmp_path / "preds").mkdir()
+        done = []
+        for r, delta in enumerate((0.01, 0.02, 0.03)):
+            arm = base.copy()
+            rows = np.arange(n_eval)
+            p_true = base[rows, y] * math.exp(-delta)                       # −log p rośnie dokładnie o Δ
+            scale = (1 - p_true) / (1 - base[rows, y])
+            arm *= scale[:, None]
+            arm[rows, y] = p_true
+            for name, proba in (("tabpfn", arm), (sd.BASELINE, base)):
+                rel = f"preds/{name}_{r}.npy"
+                np.save(tmp_path / rel, proba.astype(np.float64))
+                done.append({"arm": name, "n": 50_000, "repeat": r, "preds": rel, "metrics": sd.unit_metrics(y, proba)})
+        block = sd.collect_statistics(tmp_path, "pooled", done, y, n_boot=500, seed=1)
+        row = next(c for c in block["comparisons"] if c["arm"] == "tabpfn" and c["metric"] == "log_loss")
+        assert row["delta"] == pytest.approx(0.02, abs=1e-4)
+        assert row["p_boot"] <= 0.01                                         # sam bootstrap: „istotne”
+        assert row["p_t"] == pytest.approx(0.0742, abs=0.002)
+        assert row["p"] == pytest.approx(row["p_t"]) and row["p_holm"] == pytest.approx(row["p_t"])
+        assert row["verdict"] not in ("win", "loss") and row["verdict"] == "tie"
+        single = sd.collect_statistics(tmp_path, "pooled", [u for u in done if u["repeat"] == 0], y,
+                                       n_boot=100, seed=1)
+        one = next(c for c in single["comparisons"] if c["arm"] == "tabpfn" and c["metric"] == "log_loss")
+        assert one["R"] == 1 and one["verdict"] == "na" and one["p"] is None
+
     def test_verdict_rule(self):
         assert sd.verdict(-0.02, 0.01, "log_loss")[0] == "win"
         assert sd.verdict(0.02, 0.01, "log_loss")[0] == "loss"
@@ -358,6 +413,48 @@ class TestUnits:
         assert gpu == pytest.approx(6.0)                                                 # plan pamięci
         assert sd.estimate_unit_s({"arm": "lightgbm_tuned", "base_model": "lightgbm", "n": 500}, 2000, 40, {}, None) > 0
         assert sd._benchmark_rates(tmp_path / "brak.json") == {}
+
+    def test_cpu_fake_or_redirected_benchmark_ignored(self, tmp_path):
+        """Benchmark z CPU / atrapy / przekierowanych wag nie zasila szacunków GPU."""
+        rows = [{"model": "tabpfn", "n_ctx": 1000, "n_estimators": 8, "status": "ok", "rows_per_s": 50.0, "fit_s": 1.0}]
+        for extra, fragment in (({"device": "cpu"}, "cpu"), ({"device": "cuda", "fake": True}, "atrapa"),
+                                ({"device": "cuda", "weights": {"tabpfn": {"override": "SOR_AI_TABPFN_MODEL_PATH=x"}}},
+                                 "przekierowane"),
+                                ({"device": "cuda", "mechanics_only": "urządzenie 'cpu'"}, "mechaniki")):
+            bench = tmp_path / "bench.json"
+            bench.write_text(json.dumps({"kind": "tfm_setup_benchmark", "results": rows, **extra}), encoding="utf-8")
+            assert fragment in sd.benchmark_unusable_reason(json.loads(bench.read_text(encoding="utf-8")))
+            assert sd._benchmark_rates(bench) == {}
+        bench.write_text(json.dumps({"kind": "tfm_setup_benchmark", "results": rows, "device": "cuda", "fake": False,
+                                     "weights": {"tabpfn": {"override": None}}}), encoding="utf-8")
+        assert sd.benchmark_unusable_reason(json.loads(bench.read_text(encoding="utf-8"))) is None
+        assert list(sd._benchmark_rates(bench)) == ["tabpfn"]
+
+    def test_lightgbm_eta_matches_plan_formula(self):
+        """Część LightGBM planu bez danych = suma estimate_unit_s jednostek LightGBM (domyślnie ~5 h)."""
+        total = sd.lightgbm_eta_s()
+        assert 4 * 3600 < total < 6 * 3600
+        counts = sd.SourceCounts(n_train=10**6, n_val=10**5, sites_train={}, sites_val={}, local_train=10**6,
+                                 local_val=10**5, foreign_train=10**6, local_esi1_val=0)
+        cfg = sd.SmallDataConfig(models=[])
+        units, _ = sd.build_units(cfg, counts, {}, None)
+        lgbm = [u for u in units if u["base_model"] == "lightgbm"]
+        assert total == pytest.approx(sum(sd.estimate_unit_s(u, 0, cfg.lgbm_trials, {}, None) for u in lgbm))
+        assert sd.lightgbm_eta_s(sd.SmallDataConfig(sizes=[500], repeats=[1], scenarios=["pooled"])) < 300
+
+    def test_plan_esi1_count_only_for_full_local_val(self, tmp_path):
+        """Plan: liczba ESI 1 oddziału dotyczy całego VAL oddziału — przy --local-eval-rows opisana jako tło."""
+        def ocena(local_eval_rows: int) -> str:
+            cfg = sd.validate_config(small_cfg(local_eval_rows=local_eval_rows))
+            units, skipped = sd.build_units(cfg, self.COUNTS, self.statuses("cpu"), None)
+            lines = sd.plan_lines(cfg, units, skipped, self.statuses("cpu"), self.COUNTS, tmp_path,
+                                  tmp_path / "brak_benchmarku.json")
+            return next(line for line in lines if line.strip().startswith("ocena:"))
+
+        assert ocena(0).endswith("site_local (oddział B) 600 wierszy VAL (6 ESI 1)")
+        sampled = ocena(300)
+        assert "300 wierszy VAL (próba warstwowa; cały VAL oddziału: 600 wierszy, 6 ESI 1)" in sampled
+        assert ocena(10_000).endswith("600 wierszy VAL (6 ESI 1)")          # próba ≥ VAL oddziału = cały VAL
 
 
 # ─────────────────────────────────────────

@@ -16,6 +16,7 @@ import os
 import pickle
 import subprocess
 import sys
+import types
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -433,6 +434,32 @@ class TestOOM:
         assert steps == ["batch_size 4 → 1 (jeden estymator na przebieg)", "kv_cache 'kv' → 'repr'"]
         assert model.model.runtime == {**model.model.runtime, "batch_size": 1, "kv_cache": "repr"}
 
+    def test_tabicl_fit_oom_on_last_rung_rebuilds_estimator(self, frame, monkeypatch):
+        """
+        TabICL na ostatnim szczeblu (batch_size=1, bez bufora): OOM w fazie FIT (np. model_.to(cuda)) →
+        krok bez przebudowy (predict_batch / 2), ale estymator i tak budowany od nowa — nie predykcja na
+        częściowo dopasowanym estymatorze.
+        """
+        X, y, _ = frame
+        params = {"n_ctx": 150, "kv_cache": False, "batch_size": 1, "n_estimators": 2, "predict_batch": 4096}
+        reference = fit_tfm("tabicl", X.iloc[:400], y.iloc[:400], **params).predict_proba(X.iloc[400:])
+        model = fit_tfm("tabicl", X.iloc[:400], y.iloc[:400], **params)
+        original = tfm_fake.FakeTFMClassifier.fit
+        attempts: list = []                                          # referencje (id po GC bywa powtórzone)
+
+        def flaky_fit(self, X_, y_):
+            attempts.append(self)
+            if len(attempts) == 1:                                    # jednorazowy OOM w fit
+                raise tfm_fake.FakeOutOfMemoryError("CUDA out of memory (model_.to)")
+            return original(self, X_, y_)
+
+        monkeypatch.setattr(tfm_fake.FakeTFMClassifier, "fit", flaky_fit)
+        out = model.predict_proba(X.iloc[400:])
+        np.testing.assert_allclose(out, reference, atol=1e-12)
+        event = [e for e in model.tfm_events if e["kind"] == "oom_downgrade"][0]
+        assert event["phase"] == "fit" and event["step"] == "predict_batch 4096 → 2048"
+        assert len(attempts) == 2 and attempts[0] is not attempts[1]  # drugi fit na NOWYM estymatorze
+
     def test_non_oom_error_propagates(self, frame, monkeypatch):
         X, y, _ = frame
         model = fit_tfm("tabicl", X.iloc[:400], y.iloc[:400], n_ctx=150)
@@ -613,6 +640,52 @@ class TestSettingsAndHooks:
         X, y, _ = frame
         model = fit_tfm("tabpfn", X.iloc[:300], y.iloc[:300], n_ctx=100, n_bags=2, n_estimators=2)
         assert model.model.estimated_cache_bytes() > 0
+        assert model.model.estimated_cache_bytes(on_device=True) == model.model.estimated_cache_bytes()
+
+    def test_reencodes_context_and_cache_on_host(self, frame):
+        """Bufor kodowany przy każdym wywołaniu (repr / bez bufora / fit_preprocessors) i przeniesienie buforów."""
+        X, y, _ = frame
+        icl = fit_tfm("tabicl", X.iloc[:300], y.iloc[:300], n_ctx=100, kv_cache="kv", n_estimators=2)
+        assert icl.model.reencodes_context() is False
+        before = icl.model.estimated_cache_bytes()
+        assert icl.model.cache_on_host("test") == ("kv_cache 'kv' → 'repr' (mniejszy bufor; kontekst ICL liczony "
+                                                   "przy każdym wywołaniu)")
+        assert icl.model.runtime["kv_cache"] == "repr" and icl.model.reencodes_context() is True
+        assert icl.model.estimated_cache_bytes() < before and icl.params.get("kv_cache") == "kv"   # params bez zmian
+        assert icl.model.cache_on_host("test") is None                         # nic więcej do zrobienia
+        assert [e["kind"] for e in icl.tfm_events].count("cache_on_host") == 1
+        for kv in ("repr", False):
+            assert fit_tfm("tabicl", X.iloc[:300], y.iloc[:300], n_ctx=100, kv_cache=kv,
+                           n_estimators=2).model.reencodes_context() is True
+        pfn = fit_tfm("tabpfn", X.iloc[:300], y.iloc[:300], n_ctx=100, n_bags=2, n_estimators=2)
+        assert pfn.model.reencodes_context() is False
+        assert pfn.model.cache_on_host("test").startswith("bufory KV w RAM")
+        assert pfn.model.runtime["keep_cache_on_device"] is False and pfn.model.runtime["one_cache_at_a_time"]
+        assert pfn.model.estimated_cache_bytes(on_device=True) == 0 and pfn.model.estimated_cache_bytes() > 0
+        assert pfn.model.reencodes_context() is False                          # bufor w RAM, nie kodowanie
+        np.testing.assert_allclose(pfn.predict_proba(X.iloc[300:350]).sum(axis=1), 1.0)
+        slow = fit_tfm("tabpfn", X.iloc[:300], y.iloc[:300], n_ctx=100, fit_mode="fit_preprocessors")
+        assert slow.model.reencodes_context() is True and slow.model.cache_on_host("x") is None
+        assert slow.model.estimated_cache_bytes() == 0
+
+    def test_probe_latency(self, frame):
+        X, y, _ = frame
+        model = fit_tfm("tabpfn", X.iloc[:300], y.iloc[:300], n_ctx=100, n_bags=2)
+        model.keep_fitted_bags = "all"
+        model.model.warm_up()
+        assert model.model.probe_latency(1) >= 0.0 and len(model.model._fitted) == 2
+
+    def test_throughput_from_unrounded_times(self, frame, monkeypatch):
+        """Predykcja < 0,5 ms: suma zaokrąglonych czasów dawała 0 → rows_per_s=None (niestabilny test wyboru)."""
+        X, y, _ = frame
+        model = fit_tfm("tabpfn", X.iloc[:300], y.iloc[:300], n_ctx=100)
+        ticks = iter(np.arange(0.0, 10.0, 0.0001))                       # każdy pomiar = 0,1 ms
+        monkeypatch.setattr(tfm_base, "time", types.SimpleNamespace(perf_counter=lambda: float(next(ticks))))
+        model.model.predict_proba(X.iloc[300:550])
+        stats = model.model.throughput()
+        assert stats["rows_per_s"] == pytest.approx(250 / 0.0001, rel=1e-6)
+        assert stats["per_bag"]["0"]["predict_s"] == 0.0                   # opis: zaokrąglony do ms
+        assert model.model.stats["bags"][0]["predict_s"] == pytest.approx(0.0001)   # surowy pomiar
 
 
 # ─────────────────────────────────────────

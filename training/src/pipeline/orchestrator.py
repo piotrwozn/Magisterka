@@ -38,7 +38,8 @@ Kroki (każdy w OSOBNYM procesie — awaria natywna/CUDA/OOM zabija jeden krok, 
        --models <modele z gotowym runem ∩ domyślne modele analizy>; każdy skrypt jest wznawialny
        (gotowe jednostki pomija), wyniki w runs/analyses/<analiza>__<fs>__<tag>/results.json.
        Seedy: domyślnie 6 modeli klasycznych (refity TFM tylko, gdy TFM są w --models). Potem kroki TFM —
-       tylko gdy są ich warunki (inaczej „pomijam — <powód>” w planie i w --status):
+       tylko gdy TFM są w --models albo istnieje ukończony run TFM z tym tagiem, i gdy są ich warunki
+       (inaczej „pomijam — <powód>” w planie i w --status):
        14_small_data_curve.py (eksperyment A: biblioteki torch + tabpfn/tabicl zainstalowane),
        15_tfm_blend.py (eksperyment B: gotowy run lightgbm i co najmniej jeden run TFM z tym tagiem).
 
@@ -147,7 +148,8 @@ STAGES: tuple[str, ...] = ("train", "analyses", "all")
 # Domyślne modele = DEFAULT_MODELS w src/analysis/{site_out,learning_curve}.py (bez importu tutaj).
 # Seedy: modele z gotowym runem spośród --models — domyślnie ('all') 6 klasycznych; refity seedów TFM
 # tylko na jawne żądanie (--models tfm / all,tfm). Kroki TFM (TFM_ANALYSES) mają własne warunki
-# (`tfm_analysis_models`): small_data — biblioteki TFM zainstalowane; tfm_blend — run lightgbm + ≥ 1 run TFM.
+# (`tfm_analysis_models`): oba tylko gdy TFM są w --models albo istnieje run TFM z tagiem; small_data —
+# biblioteki TFM zainstalowane; tfm_blend — run lightgbm + ≥ 1 run TFM.
 ANALYSIS_STEPS: dict[str, tuple[str, tuple[str, ...] | None]] = {
     "seeds": ("09_seed_refits.py", None),
     "site_out": ("10_leave_site_out.py", ("lightgbm", "xgboost", "catboost", "logreg")),
@@ -598,13 +600,19 @@ def tfm_analysis_models(
     fingerprint: str,
     *,
     planned: Sequence[str] | None = None,
+    requested: Sequence[str] | None = None,
 ) -> tuple[list[str], str | None]:
     """
-    Modele kroku TFM i powód pominięcia (None = krok rusza):
-        small_data — lightgbm + TFM z zainstalowaną biblioteką (torch + tabpfn / tabicl); bez żadnej → pominięty,
+    Modele kroku TFM i powód pominięcia (None = krok rusza). Oba kroki ruszają TYLKO gdy modele TFM są w
+    --models (`requested`, np. `--models tfm` / `all,tfm`) ALBO istnieje ukończony run TFM z tagiem `tag` —
+    zwykłe `--stage analyses` dla modeli klasycznych nie uruchamia godzin eksperymentu A tylko dlatego, że
+    biblioteki TFM są zainstalowane. Dalej:
+        small_data — lightgbm + TFM (żądane w --models, inaczej te z gotowym runem) z zainstalowaną biblioteką
+                     (torch + tabpfn / tabicl); bez żadnej → pominięty,
         tfm_blend  — lightgbm + TFM z gotowym runem z tagiem `tag` (z tuningiem, bieżące dane); brak runu
                      lightgbm albo żadnego runu TFM → pominięty. Runy szukane niezależnie od --models.
-    planned : (plan na sucho `--stage all`) modele, których runy powstaną w etapie treningu.
+    planned   : (plan na sucho `--stage all`) modele, których runy powstaną w etapie treningu.
+    requested : modele z --models (None = żadnych TFM).
     """
     from src.utils.config import DATA_VERSION
 
@@ -612,27 +620,32 @@ def tfm_analysis_models(
         raise ValueError(f"'{name}' nie jest krokiem TFM ({', '.join(TFM_ANALYSES)})")
     if not analysis_script_exists(name):
         return [], f"brak skryptu scripts/{ANALYSIS_STEPS[name][0]}"
-    if name == "small_data":
-        libs = tfm_libraries()
-        tfms = [m for m in TFM_MODELS if libs.get(m)]
-        if not tfms:
-            return [], ("brak bibliotek TFM (torch + tabpfn / tabicl) — instalacja: training/docs/TFM.md "
-                        "(koło torch z CUDA, potem pip install -r requirements-tfm.txt)")
-        return ["lightgbm", *tfms], None
-    # tfm_blend
     wanted = set(planned or ())
 
     def has_run(model: str) -> bool:
         return model in wanted or find_done_run(runs_dir, model, feature_set, tag, DATA_VERSION, fingerprint,
                                                 tuned=True) is not None
 
+    requested_tfms = [m for m in TFM_MODELS if m in set(requested or ())]
+    run_tfms = [m for m in TFM_MODELS if has_run(m)]
+    if not requested_tfms and not run_tfms:
+        return [], (f"modele TFM nie są w --models i brak ukończonego runu TFM (tabpfn / tabicl) z tagiem '{tag}' "
+                    f"— krok TFM tylko na żądanie: python scripts/run_all.py --profile {tag.split('-')[0]} "
+                    f"--models tfm (trening), potem --stage analyses --models all,tfm")
+    if name == "small_data":
+        libs = tfm_libraries()
+        tfms = [m for m in (requested_tfms or run_tfms) if libs.get(m)]
+        if not tfms:
+            return [], ("brak bibliotek TFM (torch + tabpfn / tabicl) — instalacja: training/docs/TFM.md "
+                        "(koło torch z CUDA, potem pip install -r requirements-tfm.txt)")
+        return ["lightgbm", *tfms], None
+    # tfm_blend
     if not has_run("lightgbm"):
         return [], f"brak ukończonego runu lightgbm z tagiem '{tag}' (z tuningiem, bieżące dane)"
-    tfms = [m for m in TFM_MODELS if has_run(m)]
-    if not tfms:
+    if not run_tfms:
         return [], (f"brak ukończonego runu TFM (tabpfn / tabicl) z tagiem '{tag}' — najpierw: "
                     f"python scripts/run_all.py --profile {tag.split('-')[0]} --models tfm")
-    return ["lightgbm", *tfms], None
+    return ["lightgbm", *run_tfms], None
 
 
 def tfm_benchmark(runs_dir: Path | str | None = None) -> dict[str, Any] | None:
@@ -642,13 +655,36 @@ def tfm_benchmark(runs_dir: Path | str | None = None) -> dict[str, Any] | None:
     return read_json(analyses_root(runs_dir) / TFM_SETUP_SUBDIR / TFM_BENCHMARK_JSON)
 
 
+def _number(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 def tfm_analysis_eta_s(name: str, runs_dir: Path | str | None = None) -> float | None:
-    """Szacunek kroku TFM: tfm_blend — stały; small_data — `estimates.experiment_a.total_s` z benchmarku."""
+    """
+    Szacunek kroku TFM: tfm_blend — stały; small_data — jednostki TFM z benchmarku GPU 13_tfm_setup
+    (`estimates.experiment_a.tfm_s`; starszy format: `total_s` = same TFM) + część LightGBM (strojony Optuną
+    na podpróbce — zwykle DOMINUJE: ~5 h przy domyślnych rozmiarach; formuła planu 14 --plan,
+    `small_data.lightgbm_eta_s`). Benchmark z CPU / atrapy / przekierowanych wag jest ignorowany; bez
+    benchmarku GPU → None (brak szacunku).
+    """
     if name in ANALYSIS_FIXED_ETA_S:
         return ANALYSIS_FIXED_ETA_S[name]
-    bench = tfm_benchmark(runs_dir) or {}
-    value = ((bench.get("estimates") or {}).get("experiment_a") or {}).get("total_s")
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    from src.analysis.small_data import benchmark_unusable_reason, lightgbm_eta_s
+
+    bench = tfm_benchmark(runs_dir)
+    if bench is None or benchmark_unusable_reason(bench) is not None:
+        return None
+    exp = (bench.get("estimates") or {}).get("experiment_a") or {}
+    tfm = _number(exp.get("tfm_s"))
+    if tfm is None and "lightgbm_s" not in exp:
+        tfm = _number(exp.get("total_s"))
+    if tfm is None:
+        return None
+    try:
+        lightgbm = lightgbm_eta_s()
+    except Exception:  # noqa: BLE001 — szacunek wyświetlany; bez części LightGBM nie podajemy żadnego
+        return None
+    return tfm + lightgbm
 
 
 def tfm_failure_hint(log_text: str) -> str:
@@ -663,13 +699,34 @@ def tfm_failure_hint(log_text: str) -> str:
     if any(f"no module named '{lib}'" in text for lib in ("torch", "tabpfn", "tabicl", "huggingface_hub")):
         return ("brak bibliotek TFM — koło torch z CUDA, potem pip install -r requirements-tfm.txt "
                 "(training/docs/TFM.md) i python scripts/13_tfm_setup.py")
-    if any(s in text for s in ("tfmdeviceerror", "brak gpu", "cuda", "torch")):
+    if any(s in text for s in TFM_DEVICE_SIGNATURES):
         from src.utils.hardware import TORCH_CUDA_INDEX_URL, TORCH_CUDA_INDEX_URL_OLD_DRIVER
 
         return (f"GPU / CUDA niedostępne dla torch — koło CUDA: pip install torch --index-url {TORCH_CUDA_INDEX_URL} "
                 f"(sterownik NVIDIA < 580: {TORCH_CUDA_INDEX_URL_OLD_DRIVER}), potem python scripts/13_tfm_setup.py; "
                 f"test bez GPU: --profile smoke")
-    return "sprawdź środowisko TFM: python scripts/13_tfm_setup.py --offline-check"
+    last = _last_exception_line(log_text)
+    return ((f"błąd: {last} — " if last else "")
+            + "zob. log kroku; środowisko TFM: python scripts/13_tfm_setup.py --offline-check")
+
+
+# Sygnatury błędów urządzenia (NIE same słowa "cuda" / "torch" — są w każdym logu TFM: linia device_for
+# "torch X (CUDA Y) na <karta>" i ścieżki site-packages/torch w śladach wyjątków)
+TFM_DEVICE_SIGNATURES: tuple[str, ...] = (
+    "tfmdeviceerror", "zbudowany bez cuda", "torch.cuda.is_available() == false", "no cuda gpus",
+    "cuda error", "cudaerror", "torch nie jest zainstalowany", "torch not compiled with cuda",
+    "found no nvidia driver", "cuda driver version is insufficient", "cuda niedostępna",
+)
+_EXCEPTION_LINE = re.compile(r"^\s*(?:[\w.]+\.)?([A-Z]\w*(?:Error|Exception|Interrupt))\b:?(.*)$")
+
+
+def _last_exception_line(log_text: str) -> str | None:
+    """Ostatnia linia „NazwaBłędu: komunikat” z logu (skrócona) albo None."""
+    for line in reversed(log_text.splitlines()):
+        match = _EXCEPTION_LINE.match(line)
+        if match:
+            return (match.group(1) + (":" + match.group(2) if match.group(2).strip() else "")).strip()[:200]
+    return None
 
 
 def prepare_command(split: str) -> list[str]:
@@ -1887,7 +1944,8 @@ class Orchestrator:
             for name in ANALYSIS_STEPS:
                 if name in TFM_ANALYSES:
                     models, reason = tfm_analysis_models(name, fs, o.tag, self.runs_dir, self.fingerprint,
-                                                         planned=o.models if assume_trained else None)
+                                                         planned=o.models if assume_trained else None,
+                                                         requested=o.models)
                     if reason is not None:          # warunki kroku TFM niespełnione — bez zadania
                         self.analysis_skipped.append({"fs": fs, "name": name, "reason": reason})
                         continue
@@ -2150,7 +2208,8 @@ def _analyses_status_lines(opts: Options, status: Mapping[str, Any], alive: bool
         for name in TFM_ANALYSES:
             steps[name] = analysis_progress(analysis_path(name, fs, opts.tag, runs_dir))
             if steps[name] is None:
-                _, reason = tfm_analysis_models(name, fs, opts.tag, runs_dir, fingerprint or data_fingerprint())
+                _, reason = tfm_analysis_models(name, fs, opts.tag, runs_dir, fingerprint or data_fingerprint(),
+                                                requested=opts.models)
                 if reason is not None:
                     skipped[name] = reason
         for name, progress in steps.items():

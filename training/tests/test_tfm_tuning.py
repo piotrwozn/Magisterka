@@ -208,18 +208,31 @@ class TestResume:
         assert [c["params"]["n_ctx"] for c in calls] == [150, 300]
         assert result["n_cached"] == 1 and result["best_params"]["n_ctx"] == 300
 
-    def test_resume_reuses_complete_and_oom_retries_failed(self, data, tmp_path, monkeypatch):
+    def test_resume_reuses_only_complete(self, data, tmp_path, monkeypatch):
+        """Wznowienie: "complete" z pamięci; "oom" (stan karty) i "failed" liczone od nowa."""
         calls: list = []
         losses = {80: 0.8, 150: tfm_fake.FakeOutOfMemoryError("out of memory"), 300: ValueError("chwilowy błąd")}
         monkeypatch.setattr(tfm_tuning, "_evaluate", scripted(losses, calls))
         cands = [{"n_ctx": n, "n_estimators": 1} for n in (80, 150, 300)]
         first = run_select(data, tmp_path, cands)
-        assert len(calls) == 3
+        assert len(calls) == 3 and first["n_oom"] == 1
         calls.clear()
         second = run_select(data, tmp_path, cands)
-        assert [c["params"]["n_ctx"] for c in calls] == [300]              # tylko "failed" od nowa
-        assert [c["cached"] for c in second["candidates"]] == [True, True, False]
-        assert second["study_name"] == first["study_name"] and second["n_cached"] == 2
+        assert [c["params"]["n_ctx"] for c in calls] == [150, 300]         # "oom" i "failed" od nowa
+        assert [c["cached"] for c in second["candidates"]] == [True, False, False]
+        assert second["study_name"] == first["study_name"] and second["n_cached"] == 1
+
+    def test_all_oom_then_freed_vram_recovers(self, data, tmp_path, monkeypatch):
+        """Sesja 1: wszyscy kandydaci OOM (GPU zajęte) → błąd; sesja 2 po zwolnieniu VRAM liczy ich od nowa."""
+        monkeypatch.setattr(tfm_fake, "FAKE_OOM", {"always": True})
+        cands = [{"n_ctx": 80, "n_estimators": 1}, {"n_ctx": 150, "n_estimators": 1}]
+        with pytest.raises(RuntimeError, match="żaden kandydat"):
+            run_select(data, tmp_path, cands)
+        stored = [json.loads(p.read_text(encoding="utf-8")) for p in (tmp_path / "optuna").glob("tfm_tabpfn_*.json")]
+        assert sorted(d["status"] for d in stored if d.get("kind") == "tfm_candidate") == ["oom", "oom"]
+        monkeypatch.setattr(tfm_fake, "FAKE_OOM", None)
+        result = run_select(data, tmp_path, cands)
+        assert result["n_complete"] == 2 and result["n_cached"] == 0 and result["n_oom"] == 0
 
     def test_cache_key_includes_library_version_and_weights(self, data, tmp_path, monkeypatch):
         calls: list = []
@@ -272,13 +285,33 @@ def test_candidate_cost():
 def test_final_bag_budget():
     thr = {"rows_per_s": 100.0, "fit_s_per_bag": 10.0}
     ok = final_bag_budget(thr, 4, 1_000, 200)               # 4 × (10 + 10) = 80 s ≤ 200 s
-    assert ok == {"n_bags": 4, "reduce": False, "estimate_s": 80.0, "per_bag_s": 20.0, "final_budget_s": 200}
-    cut = final_bag_budget(thr, 4, 1_000, 50)               # 80 s > 50 s → 2 worki
-    assert cut["reduce"] and cut["n_bags"] == 2
-    assert final_bag_budget(thr, 4, 10_000, 5)["n_bags"] == 1
+    assert ok == {"n_bags": 4, "reduce": False, "estimate_s": 80.0, "per_bag_s": 20.0, "final_budget_s": 200,
+                  "estimate_after_s": 80.0, "over_budget": False}
+    cut = final_bag_budget(thr, 4, 1_000, 50)               # 80 s > 50 s → 2 worki (40 s, w budżecie)
+    assert cut["reduce"] and cut["n_bags"] == 2 and cut["estimate_after_s"] == 40.0 and not cut["over_budget"]
+    low = final_bag_budget(thr, 4, 10_000, 5)                # 1 worek = 110 s, nadal > 5 s
+    assert low["n_bags"] == 1 and low["reduce"] and low["over_budget"]
     assert final_bag_budget({}, 4, 1_000, 50)["reduce"] is False
     assert final_bag_budget(thr, 4, 1_000, None)["reduce"] is False
-    assert final_bag_budget(thr, 1, 10**6, 1)["reduce"] is False
+    single = final_bag_budget(thr, 1, 10**6, 1)
+    assert single["reduce"] is False and single["over_budget"] is True    # 1 worek ponad budżetem — bez redukcji
+
+
+def test_slowdown_warning_flags_candidate(data, tmp_path, monkeypatch):
+    """Kandydat wielokrotnie wolniejszy na jednostkę kosztu niż tańsi → WARNING (Sysmem Fallback) + pole w wpisie."""
+    def evaluate(model_name, params, *args, **kwargs):
+        wall = 2.0 if int(params["n_ctx"]) < 300 else 200.0         # 2× koszt, 100× czas
+        return {"status": "complete", "holdout_logloss": 1.0 - int(params["n_ctx"]) / 1e4, "qwk_argmax": 0.5,
+                "wall_s": wall, "rows_per_s": 10.0, "fit_s_per_bag": 0.0, "predict_s": wall, "peak_vram_mb": None,
+                "n_ctx_used": int(params["n_ctx"]), "n_bags_used": 1, "runtime": {}, "events": []}
+
+    monkeypatch.setattr(tfm_tuning, "_evaluate", evaluate)
+    cands = [{"n_ctx": 150, "n_estimators": 1}, {"n_ctx": 300, "n_estimators": 1}]
+    with capture_logs("src.models.tfm_tuning") as records:
+        result = run_select(data, tmp_path, cands)
+    by_ctx = {c["config"]["n_ctx"]: c for c in result["candidates"]}
+    assert "slowdown_vs_cheaper" not in by_ctx[150] and by_ctx[300]["slowdown_vs_cheaper"] == pytest.approx(50.0)
+    assert any("Sysmem Fallback" in r.getMessage() for r in records)
 
 
 def test_module_does_not_bind_storage_dir():

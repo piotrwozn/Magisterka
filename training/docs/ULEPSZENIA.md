@@ -138,6 +138,20 @@ Pozycje C1–C5 to minimum. Pozostałe są uporządkowane od najbardziej przydat
 
 ---
 
+## Grupa E: modele fundamentalne (TFM), eksperymenty A i B
+
+Wstępnie wytrenowane modele tabelaryczne TabPFN-3.5 i TabICLv2 obok LightGBM. Robi się to **po** treningu
+klasycznym. Instalacja, polecenia, tabela decyzji i ograniczenia: [`TFM.md`](TFM.md). Liczb z naszych
+danych jeszcze nie ma: wymagają prawdziwych wag i GPU, a czasy poniżej to szacunki.
+
+| # | Co to jest | Zmierzony efekt | Nakład | Ryzyko | Rekomendacja |
+|---|---|---|---|---|---|
+| E1 | **Krzywa małych danych (eksperyment A)**, `14_small_data_curve.py`. TFM „z pudełka” kontra LightGBM strojony na tej samej podpróbie, n = 500–50 000, wszystkie oddziały i sam oddział B. Do tego TFM z danymi innych oddziałów w kontekście oraz LightGBM przeniesiony z korektą priorów | Nie zmierzony. Literatura: przewaga TFM zwykle przy setkach–tysiącach wierszy, ale są kontrprzykłady (np. omdlenia na SOR, n = 257) | Kod gotowy. Ok. 1 noc: części TFM ok. 1,5–3 h GPU, LightGBM ok. 5 h CPU | Mała moc przy dużym n (3 powtórzenia). Oddział B ma w VAL 68 wizyt ESI 1. Dane z USA | **Warto do pracy.** Odpowiada na pytanie o polski szpital z małą liczbą etykiet |
+| E2 | **Blend z LightGBM na pełnych danych (eksperyment B)**, `15_tfm_blend.py`. Cross-fitting na VAL i bramka ustalona z góry: Δ log loss ≤ −0,005 z CI < 0, \|Δ\| > 2 × SD seedów, niedotriażowanie ≤ +1 pp, ECE ESI 1 ≤ +0,01 | Nie zmierzony. Oczekiwany efekt (literatura, nasz wniosek): rzędu MID albo mniejszy | Kod gotowy. Trening TFM ok. 1,5–3 h GPU (`thorough`, szacunek), analiza kilka minut | Wynik negatywny jest realny. Licencja TabPFN-3.5 jest niekomercyjna | **Warto do pracy.** Do systemu końcowego tylko po przejściu bramki (najwyżej 2 TFM) |
+| E3 | **Serwowanie TFM w backendzie** (`SOR_AI_BACKEND_TFM=1`) | — | Konfiguracja; wymaga CUDA i wolnej VRAM | Karta 16 GB dzielona z Ollamą; duże konfiguracje się nie zmieszczą. Domyślnie backend używa receptury bez TFM | **Nie domyślnie.** Tylko gdy E2 przeszło i starcza VRAM |
+
+---
+
 ## Zależności między pozycjami
 
 - **B1, B4, korekta α i wagi klas rozwiązują ten sam problem:** reguła kosztowa ściska przewidywania do ESI2–3. Wybierz jedno rozwiązanie: B1 albo B4.
@@ -155,3 +169,5 @@ Pozycje C1–C5 to minimum. Pozostałe są uporządkowane od najbardziej przydat
 2. **Po treningu, ok. 1,5–2 dni:** B3 → B1 + B2 (albo B4) → wykres C6 → test B5.
 3. **Do pracy, ok. 2–3 dni pisania i kodu:** najpierw C1–C5, potem C7–C11, na końcu C12–C14.
    - Dodatkowe obliczenia w domu to refity bez tuningu: seedy, wyłączone szpitale, krzywa uczenia, model monotoniczny.
+4. **Opcjonalnie, po treningu klasycznym:** E1 i E2 według [`TFM.md`](TFM.md). Raport końcowy 08 dla
+   receptury z TFM uruchamiasz tylko wtedy, gdy E2 przeszło bramkę.

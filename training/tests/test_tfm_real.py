@@ -221,3 +221,50 @@ def test_weights_mismatch_at_predict_is_reported(frame, monkeypatch, tmp_path):
     assert [e["kind"] for e in loaded.tfm_events].count("weights_mismatch") == 1
     loaded.predict_proba(X.iloc[330:340])                              # zgłoszone raz na proces
     assert [e["kind"] for e in loaded.tfm_events].count("weights_mismatch") == 1
+
+
+@pytest.mark.parametrize("name", LIBS)
+def test_cache_on_host_keeps_predictions_and_bags(frame, name):
+    """Bufory poza VRAM (bake-off): TabPFN keep_cache_on_device=False, TabICL kv → repr — te same predykcje,
+    wszystkie worki dopasowane raz (warm_up), pomiar 1 wiersza działa."""
+    X, y, _ = frame
+    params = {"n_ctx": 150, "n_bags": 2, **({"kv_cache": "kv", "batch_size": 1} if name == "tabicl" else {})}
+    reference = fit(name, X.iloc[:320], y.iloc[:320], **params).predict_proba(X.iloc[320:])
+    model = fit(name, X.iloc[:320], y.iloc[:320], **params)
+    assert model.model.reencodes_context() is False
+    assert model.model.cache_on_host("test") is not None
+    model.keep_fitted_bags = "all"
+    model.model.warm_up()
+    assert len(model.model._fitted) == 2
+    assert model.model.probe_latency(1) > 0
+    np.testing.assert_allclose(model.predict_proba(X.iloc[320:]), reference, atol=1e-5)
+    assert len(model.model._fitted) == 2                                    # bez ponownego dopasowania
+    assert model.model.reencodes_context() is (name == "tabicl")           # repr koduje kontekst przy wywołaniu
+    model.release()
+
+
+@requires_tabicl
+def test_tabicl_fit_oom_on_last_rung_retries_fit(frame, monkeypatch):
+    """Prawdziwy TabICL: OOM przy `model_.to(device)` w fit na ostatnim szczeblu → ponowne dopasowanie
+    (wcześniej: predykcja na częściowo dopasowanym estymatorze → RuntimeError „Cannot predict…”)."""
+    import torch
+
+    X, y, _ = frame
+    params = {"n_ctx": 150, "kv_cache": False, "batch_size": 1, "predict_batch": 4096}
+    reference = fit("tabicl", X.iloc[:320], y.iloc[:320], **params).predict_proba(X.iloc[320:])
+    model = fit("tabicl", X.iloc[:320], y.iloc[:320], **params)
+    original = torch.nn.Module.to
+    state = {"raised": False}
+
+    def flaky_to(self, *args, **kwargs):
+        if not state["raised"] and type(self).__name__ == "TabICL":
+            state["raised"] = True
+            raise torch.OutOfMemoryError("CUDA out of memory (test: model_.to)")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.Module, "to", flaky_to)
+    out = model.predict_proba(X.iloc[320:])
+    assert state["raised"]
+    np.testing.assert_allclose(out, reference, atol=1e-6)
+    event = [e for e in model.tfm_events if e["kind"] == "oom_downgrade"][0]
+    assert event["phase"] == "fit" and event["step"] == "predict_batch 4096 → 2048"

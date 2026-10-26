@@ -105,6 +105,44 @@ class TestStreamlitHelpers:
     def test_arrival_labels_cover_categories(self, app):
         assert list(app.ARRIVAL_LABELS_PL) == ARRIVAL_CATEGORIES
 
+    def test_demo_run_list_skips_tfm_runs(self, app, tmp_path):
+        """Najnowszy run po `run_all --models tfm` to TFM — demo domyślnie nadal otwiera model klasyczny."""
+        from tests.test_ensemble import write_run
+
+        y = np.arange(10) % 5
+        proba = {"val": np.full((10, 5), 0.2)}
+        write_run(tmp_path, "20261025_120000_lightgbm_triage_thorough", "lightgbm", proba, y)
+        for name, model in (("20261026_080000_tabpfn_triage_thorough", "tabpfn"),
+                            ("20261026_090000_tabicl_triage_thorough", "tabicl")):
+            run_dir = write_run(tmp_path, name, model, proba, y)
+            info = json.loads((run_dir / "run_info.json").read_text(encoding="utf-8"))
+            info["pretrained"] = True
+            (run_dir / "run_info.json").write_text(json.dumps(info), encoding="utf-8")
+        runs = app.list_model_runs(tmp_path)
+        assert [r["model"] for r in runs] == ["lightgbm"]
+        assert runs[app.default_run_index(runs)]["run"] == "20261025_120000_lightgbm_triage_thorough"
+
+    def test_demo_tfm_model_keeps_bags_and_refuses_shap(self, app, monkeypatch):
+        """TFM tylko jawnie (--model): worki dopasowane raz (keep_fitted_bags='all'), SHAP odmówiony."""
+        from src.explain.shap_explainer import ExplainerUnavailable
+
+        class _Tfm:
+            name = "tabpfn"
+            pretrained = True
+            keep_fitted_bags = 1
+            feature_names = ["age"]
+
+        class _Classic:
+            name = "lightgbm"
+            keep_fitted_bags = 1
+
+        loaded = {"tfm": _Tfm(), "classic": _Classic()}
+        monkeypatch.setattr(app, "load_model", lambda path: loaded[path])
+        assert app.load_model_cached("tfm").keep_fitted_bags == "all"
+        assert app.load_model_cached("classic").keep_fitted_bags == 1               # klasyczny bez zmian
+        with pytest.raises(ExplainerUnavailable, match="model fundamentalny"):
+            app.init_shap_explainer("tfm", loaded["tfm"])
+
     def test_trauma_activation_in_curated_complaints(self, app):
         assert TRAUMA_ACTIVATION_COL in app.COMPLAINT_LABELS_PL
 

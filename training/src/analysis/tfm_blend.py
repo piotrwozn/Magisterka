@@ -872,7 +872,9 @@ def fold_summary(records: Sequence[Mapping[str, Any]], variants: Sequence[Varian
 def diversity_rows(data: ValData, models: Sequence[str]) -> list[dict[str, Any]]:
     from src.ensemble import diversity
 
-    table = diversity({m: data.probas[m] for m in models if m in data.probas}, data.y)
+    # Model bez zmienności błędów (np. zawsze ta sama klasa) → korelacja NaN („—” w raporcie), bez ostrzeżeń numpy
+    with np.errstate(invalid="ignore", divide="ignore"):
+        table = diversity({m: data.probas[m] for m in models if m in data.probas}, data.y)
     return [{k: (float(v) if isinstance(v, (float, np.floating)) else v) for k, v in row.items()}
             for row in table.to_dict(orient="records")]
 
@@ -1371,6 +1373,24 @@ def estimate_repeat_s(variants: Sequence[Variant], n: int) -> float:
     return total
 
 
+def gate_console_lines(mid: float, seed_info: Mapping[str, Any], cfg: BlendConfig) -> list[str]:
+    """Bramka w skrócie — logowana PRZED obliczeniami (pre-rejestracja; pełna wersja: report.md, sekcja 1)."""
+    from src.evaluation import report_sections as rs
+
+    sd = seed_info.get("sd")
+    noise = (f"|Δ| > {rs.SEED_SD_FACTOR:g} × SD seedów LightGBM = {rs.SEED_SD_FACTOR * sd:.4f}" if sd is not None
+             else f"|Δ| > {rs.SEED_SD_FACTOR:g} × SD seedów LightGBM — NIESPRAWDZALNE ({seed_info.get('reason')}) "
+                  f"→ „nierozstrzygnięte”")
+    return [
+        "Bramka (ustalona z góry, przed liczbami): Δ log loss (zestaw − LightGBM) ≤ "
+        f"−{mid:g} I górna granica 95% CI < 0 I {noise} I Δ niedotriażowania (progi T, T = "
+        f"{100 * float(cfg.target):g}%) ≤ +{100 * GATE_MAX_UNDERTRIAGE_WORSE:g} pp I Δ ECE ESI 1 ≤ "
+        f"+{GATE_MAX_ECE_ESI1_WORSE:g}",
+        f"Oszczędność: para TFM tylko, gdy bije najlepszy przechodzący zestaw z jednym TFM o ≥ {mid:g} log loss; "
+        f"najwyżej {MAX_TFMS} TFM",
+    ]
+
+
 def plan_lines(selection: Selection, variants: Sequence[Variant], units: Sequence[Mapping[str, Any]],
                todo: int, n: int, cfg: BlendConfig) -> list[str]:
     est = estimate_repeat_s(variants, n) * todo
@@ -1415,13 +1435,17 @@ def run_tfm_blend(cfg: BlendConfig, plan_only: bool = False) -> dict[str, Any]:
                 and load_preds(preds_path(u), variants, data.row_ids) is not None)
 
     todo = [u for u in units if cfg.force or not ready(u)]
+    # SD seedów i bramka — znane i wypisane przed jakąkolwiek liczbą eksperymentu (pre-rejestracja)
+    seed_info = lightgbm_seed_sd(cfg.feature_set, selection.tag, selection.lightgbm, cfg.runs_dir)
+    mid = float(rs.MINIMAL_IMPORTANT_DIFFERENCE["log_loss"])
+    preregistered = gate_console_lines(mid, seed_info, cfg)
     if plan_only:
-        return {"plan_lines": plan_lines(selection, variants, units, len(todo), data.n, cfg),
+        return {"plan_lines": plan_lines(selection, variants, units, len(todo), data.n, cfg) + preregistered,
                 "feature_set": cfg.feature_set, "tag": selection.tag, "variants": [v.as_dict() for v in variants]}
 
     store.write_plan({"analysis": ANALYSIS, "feature_set": cfg.feature_set, "tag": selection.tag,
                       "config_hash": digest, "variants": [v.as_dict() for v in variants], "units": units})
-    for line in plan_lines(selection, variants, units, len(todo), data.n, cfg):
+    for line in plan_lines(selection, variants, units, len(todo), data.n, cfg) + preregistered:
         log.info(line)
 
     def compute(u: Mapping[str, Any]) -> dict[str, Any]:
@@ -1463,8 +1487,6 @@ def run_tfm_blend(cfg: BlendConfig, plan_only: bool = False) -> dict[str, Any]:
     vc_summary = ({v.id: {k: _mean([p[v.id].get(k) for p in vc_points]) for k in vc_points[0][v.id]}
                    for v in variants} if vc_points else {})
 
-    seed_info = lightgbm_seed_sd(cfg.feature_set, selection.tag, selection.lightgbm, cfg.runs_dir)
-    mid = float(rs.MINIMAL_IMPORTANT_DIFFERENCE["log_loss"])
     best = best_variants(variants, metrics)
     gates = {sid: evaluate_gate(v, deltas[v.id], seed_info.get("sd"), mid) for sid, v in best.items()}
     choice = choose(gates, deltas, mean_samples, best, mid)

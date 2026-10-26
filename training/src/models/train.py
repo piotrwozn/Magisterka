@@ -440,18 +440,53 @@ def _pretrained_warnings(model_name: str, *, tune: bool, do_filter: bool, tune_m
     return False
 
 
+def _cap_bag_params(model, n_bags: int) -> dict[str, Any]:
+    """
+    Redukcja worków zapisana w PARAMETRACH (→ run_info.params → refit_from_run): przy n_bags="auto" limit
+    `max_bags` (auto nadal przeliczane dla nowego N, ale nigdy ponad budżet), przy liczbie — sama liczba.
+    Zwraca wartości sprzed zmiany (do opisu w final_budget).
+    """
+    before = {"n_bags": model.params.get("n_bags"), "max_bags": model.params.get("max_bags")}
+    spec = model.params.get("n_bags", 1)
+    if isinstance(spec, str) and spec.strip().lower() == "auto":
+        model.params["max_bags"] = int(n_bags)
+    else:
+        model.params["n_bags"] = int(n_bags)
+    predictor = getattr(model, "model", None)
+    if hasattr(predictor, "params"):
+        predictor.params.update({k: model.params[k] for k in ("n_bags", "max_bags") if k in model.params})
+    return before
+
+
 def _apply_final_budget(model, tuning_info: Mapping[str, Any], budget: Mapping[str, Any], n_rows: int) -> dict:
-    """Szacunek czasu finalnej predykcji (przepustowość z wyboru konfiguracji) > final_budget_s → mniej worków."""
+    """
+    Szacunek czasu finalnej predykcji (przepustowość z wyboru konfiguracji) > final_budget_s → mniej worków
+    (zapisane też w parametrach — refit nie wraca do pełnej liczby). Jeden worek nadal ponad budżetem →
+    WARNING + zdarzenie `final_budget_exceeded` (liczbą worków nie da się już zejść niżej).
+    """
     from src.models.tfm_tuning import final_bag_budget
 
     decision = final_bag_budget(tuning_info.get("throughput"), model.n_bags, n_rows, budget.get("final_budget_s"))
+    n_before = model.n_bags
     if decision["reduce"]:
-        reason = (f"szacunek {decision['estimate_s'] / 60:.1f} min ({model.n_bags} worków × "
+        reason = (f"szacunek {decision['estimate_s'] / 60:.1f} min ({n_before} worków × "
                   f"{decision['per_bag_s'] / 60:.1f} min na {n_rows:,} wierszy) > final_budget_s "
                   f"{float(budget['final_budget_s']) / 60:.0f} min → {decision['n_bags']} worków")
         log.warning(f"{model.name}: BUDŻET FINALNEJ PREDYKCJI — {reason}")
         model.limit_bags(decision["n_bags"], reason)
-    elif decision["estimate_s"] is not None:
+        decision["params_before"] = _cap_bag_params(model, decision["n_bags"])
+    if decision.get("over_budget"):
+        detail = (f"szacunek {decision['estimate_after_s'] / 60:.1f} min ({decision['n_bags']} worek, "
+                  f"{n_rows:,} wierszy) > final_budget_s {float(budget['final_budget_s']) / 60:.0f} min; "
+                  f"liczbą worków nie da się zejść niżej — zmniejsz n_ctx / n_estimators (mniejszy profil) "
+                  f"albo sprawdź, czy GPU nie jest zajęte przez inne programy")
+        log.warning(f"{model.name}: BUDŻET FINALNEJ PREDYKCJI PRZEKROCZONY — {detail}")
+        model.tfm_events.append({"kind": "final_budget_exceeded",
+                                 "time": datetime.now().isoformat(timespec="seconds"),
+                                 "estimate_s": decision["estimate_after_s"],
+                                 "final_budget_s": decision["final_budget_s"], "n_bags": decision["n_bags"],
+                                 "detail": detail})
+    elif decision["estimate_s"] is not None and not decision["reduce"]:
         log.info(f"{model.name}: szacunek finalnej predykcji {decision['estimate_s'] / 60:.1f} min "
                  f"({model.n_bags} worków, {n_rows:,} wierszy) — w budżecie")
     return decision
@@ -791,6 +826,15 @@ _FRAME_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 _RESERVED_FRAME_NAMES: tuple[str, ...] = ("fit", "early_stopping", "features", "features_before_filter", "train")
 
 
+def run_duration_s(info: Mapping[str, Any]) -> float:
+    """
+    Czas runa do szacunków ETA refitów: `training_duration_s` + (TFM) czas predykcji `tfm.predict_s` —
+    "trening" TFM to tylko zapis kontekstu (≈ 0 s), a godziny zajmuje predykcja. Klasyczne: bez zmian.
+    """
+    tfm = info.get("tfm") if isinstance(info.get("tfm"), Mapping) else {}
+    return float(info.get("training_duration_s") or 0.0) + float((tfm or {}).get("predict_s") or 0.0)
+
+
 def refit_params(model_name: str, params: Mapping[str, Any], seed: int) -> tuple[dict[str, Any], str]:
     """
     Parametry finalne runa źródłowego do refitu: nowy seed (CatBoost `random_seed`, reszta
@@ -1117,7 +1161,9 @@ def refit_from_run(
         key = f"{name}_argmax_quadratic_weighted_kappa"
         if key in metrics:
             summary.append(f"{name}: QWK {metrics[key]:.4f}, log loss {metrics.get(f'{name}_argmax_log_loss', float('nan')):.4f}")
-    log.info(f"Refit gotowy ({model.training_duration_s or 0:.1f} s): " + "; ".join(summary) + f" → {new_dir}")
+    # TFM: "trening" = zapis kontekstu (≈ 0 s) — czas refitu to dopasowanie + predykcja ramek ewaluacji
+    duration = float(model.training_duration_s or 0) + float(getattr(model, "tfm_predict_s", None) or 0)
+    log.info(f"Refit gotowy ({duration:.1f} s): " + "; ".join(summary) + f" → {new_dir}")
     return {
         "run_name": run_name,
         "run_dir": str(new_dir),
@@ -1226,11 +1272,14 @@ def _tfm_lines(info: dict) -> list[str]:
     if budget.get("estimate_s") is not None:
         lines.append(f"- szacunek finalnej predykcji: {float(budget['estimate_s']) / 60:.1f} min (budżet "
                      f"{float(budget.get('final_budget_s') or 0) / 60:.0f} min)"
-                     + (f" → **zredukowano do {budget['n_bags']} worków**" if budget.get("reduce") else ""))
+                     + (f" → **zredukowano do {budget['n_bags']} worków**" if budget.get("reduce") else "")
+                     + (" — **NADAL PONAD BUDŻETEM** (1 worek; zmniejsz n_ctx / n_estimators)"
+                        if budget.get("over_budget") else ""))
     if events:
         lines.append("- zdarzenia: " + ", ".join(f"{k} × {v}" for k, v in sorted(kinds.items())))
         for event in events:
-            if event.get("kind") in ("oom_downgrade", "bags_reduced", "device_fallback", "weights_mismatch"):
+            if event.get("kind") in ("oom_downgrade", "bags_reduced", "device_fallback", "weights_mismatch",
+                                     "final_budget_exceeded", "cache_on_host"):
                 lines.append(f"  - {event.get('kind')}: {event.get('step') or event.get('detail')}")
     lines.append("")
     return lines

@@ -33,9 +33,14 @@ Statystyka (każdy model vs lightgbm_tuned w danym scenariuszu i n; metryka pier
     - dwupoziomowy bootstrap (`n_boot`): losowanie powtórzeń ze zwracaniem, potem wierszy oceny
       warstwowo względem ESI (jedno losowanie wierszy na replikację, wspólne dla powtórzeń — ten sam zbiór
       oceny) → percentylowy 95% CI i p (te same ogony),
+    - p do werdyktu = max(p bootstrapu, p testu t) — co najmniej tak ostrożne jak sparowany test t po
+      powtórzeniach: przy R = 2–5 percentylowy poziom 1 bootstrapu jest zbyt wąski (zgodne znaki Δ we
+      wszystkich powtórzeniach → p bootstrapu = 1/B niezależnie od rozrzutu), a sam test t pomija wspólny
+      szum wierszy oceny; R < 2 → werdykt 'na' (brak testu),
     - korekta Holma między rozmiarami n dla metryki pierwszorzędowej; „wygrana” tylko gdy p_Holm < 0,05
-      (CI bez zera) I |Δ| > MID (report_sections.MINIMAL_IMPORTANT_DIFFERENCE),
-    - krzywe a + b·n^(−c) (learning_curve.fit_power_law) i punkt przecięcia n* z bootstrapem po powtórzeniach.
+      (przedział t I przedział bootstrapu bez zera) I |Δ| > MID (report_sections.MINIMAL_IMPORTANT_DIFFERENCE),
+    - krzywe a + b·n^(−c) (learning_curve.fit_power_law) i punkt przecięcia n* z bootstrapem po powtórzeniach
+      (przedział n* „orientacyjny”, gdy któryś rozmiar ma < MIN_REPEATS_NSTAR_CI powtórzeń).
 
 Wyniki: runs/analyses/small_data__<cechy>__<tag>/ — plan.json, units/*.json (UnitStore; klucz source_run),
 preds/*.npy (prawdopodobieństwa wierszy oceny), samples/*.npy, results.json, units.csv, figures/*.png,
@@ -112,6 +117,8 @@ RECALL_MIN_N = 5_000                   # czułość ESI 1 raportowana tylko od t
 SMALL_COUNT_ESI1 = 100                 # mniej wizyt ESI 1 w zbiorze oceny → ostrzeżenie (Clopper–Pearson)
 RULES: tuple[str, ...] = ("argmax", "cost")
 CROSSOVER_FACTOR = 10.0                # n* szukane do 10 × największego n (dalej — za daleko poza danymi)
+MIN_REPEATS_TEST = 2                   # werdykt (test) wymaga ≥ 2 powtórzeń; R = 1 → 'na'
+MIN_REPEATS_NSTAR_CI = 5               # CI n* „pełny” tylko, gdy każdy rozmiar ma ≥ 5 powtórzeń; inaczej orientacyjny
 
 # Strojenie LightGBM na małych n (wersja przestrzeni w konfiguracji jednostki)
 LGBM_SPACE_VERSION = 1
@@ -1029,15 +1036,36 @@ def crossover_bootstrap(per_size: Mapping[int, tuple[Sequence[float], Sequence[f
     out["n_boot"] = int(n_boot)
     out["share"] = {k: v / float(n_boot) for k, v in sorted(statuses.items())}
     out["agreement"] = out["share"].get(point["status"], 0.0)       # odsetek losowań z tym samym wynikiem
+    min_repeats = min(len(arrays[n][0]) for n in sizes)
+    out["min_repeats"] = int(min_repeats)
+    # Bootstrap po R = 3 powtórzeniach jest zbyt wąski (jak poziom 1 porównań) — przedział tylko orientacyjny
+    out["ci_indicative"] = bool(min_repeats < MIN_REPEATS_NSTAR_CI)
     if point["n_star"] is None:
         return out
     if stars and len(stars) >= 0.5 * n_boot:
         lo, hi = np.percentile(stars, [100 * ALPHA / 2, 100 * (1 - ALPHA / 2)])
         out["ci_low"], out["ci_high"] = float(lo), float(hi)
+        if out["ci_indicative"]:
+            out["ci_note"] = (f"orientacyjny: najmniej {min_repeats} powtórzeń przy jednym z rozmiarów "
+                              f"(< {MIN_REPEATS_NSTAR_CI}) — bootstrap po tak małej liczbie powtórzeń zaniża rozrzut")
     else:
         out["ci_note"] = (f"przedział nie wyznaczony: przecięcie tego samego typu w {len(stars)}/{n_boot} "
                           f"losowań (< 50%)")
     return out
+
+
+def decision_p(p_boot: float | None, p_t: float | None, n_repeats: int) -> float | None:
+    """
+    p do werdyktu: max(p dwupoziomowego bootstrapu, p sparowanego testu t, df = R − 1) — wygrana wymaga,
+    by OBA przedziały wykluczały 0. Przy R = 2–5 percentylowy poziom 1 bootstrapu (losowanie R powtórzeń) jest
+    zbyt wąski — gdy wszystkie Δ mają ten sam znak, p bootstrapu spada do 1/B niezależnie od rozrzutu między
+    podpróbami (antykonserwatywnie); test t z kolei pomija wspólny szum wierszy oceny. R < 2 → None
+    (bez testu → werdykt 'na'). Bez bootstrapu (`--bootstrap 0`) — p testu t.
+    """
+    if int(n_repeats) < MIN_REPEATS_TEST:
+        return None
+    values = [float(p) for p in (p_boot, p_t) if p is not None and math.isfinite(float(p))]
+    return max(values) if values else None
 
 
 def _mid(stat_metric: str) -> float | None:
@@ -1146,14 +1174,38 @@ def build_units(cfg: SmallDataConfig, counts: SourceCounts, statuses: Mapping[st
     return units, skipped
 
 
+def benchmark_unusable_reason(data: Mapping[str, Any] | None) -> str | None:
+    """
+    Czy benchmark 13_tfm_setup NIE nadaje się do szacunków GPU (powód) — pomiar na CPU, atrapa
+    (SOR_AI_TFM_FAKE) albo przekierowane (losowe) wagi; brak klucza = format tolerancyjny (używany).
+    """
+    if not isinstance(data, Mapping):
+        return "brak pliku"
+    if data.get("mechanics_only"):
+        return f"test mechaniki ({data['mechanics_only']})"
+    if data.get("fake"):
+        return "atrapa estymatora (SOR_AI_TFM_FAKE)"
+    if data.get("device") not in (None, "cuda"):
+        return f"pomiar na '{data.get('device')}', nie na GPU"
+    weights = data.get("weights") if isinstance(data.get("weights"), Mapping) else {}
+    if any(isinstance(w, Mapping) and w.get("override") for w in weights.values()):
+        return "przekierowane wagi (SOR_AI_*_MODEL_PATH)"
+    return None
+
+
 def _benchmark_rates(path: Path) -> dict[str, list[tuple[float, float, float]]]:
     """
     {model: [(n_ctx, rows_per_s, fit_s)]} z benchmark.json 13_tfm_setup (`results`: rekordy {model, n_ctx,
     n_estimators, status, fit_s, rows_per_s, …}; format tolerancyjny), przeliczone na liczbę estymatorów
-    eksperymentu A (koszt ~ liniowy w estymatorach); rekordy ze statusem ≠ ok pomijane.
+    eksperymentu A (koszt ~ liniowy w estymatorach); rekordy ze statusem ≠ ok pomijane. Pomiar na CPU,
+    z atrapą albo przekierowanymi wagami (`benchmark_unusable_reason`) — pomijany w całości.
     """
     data = read_json(path)
     if not data:
+        return {}
+    reason = benchmark_unusable_reason(data)
+    if reason is not None:
+        log.info(f"Benchmark {path} pominięty w szacunkach: {reason}")
         return {}
     records: list[dict[str, Any]] = []
     if isinstance(data.get("results"), list):
@@ -1213,6 +1265,24 @@ def estimate_unit_s(u: Mapping[str, Any], n_eval: int, lgbm_trials: int,
         table = sorted(_MEMPLAN_UNIT_S[base].items())
         return _interp_log([(float(a), float(b)) for a, b in table], context) * max(n_eval, 1) / 20_000.0
     return None
+
+
+def lightgbm_eta_s(cfg: SmallDataConfig | None = None, counts: SourceCounts | None = None) -> float:
+    """
+    Szacunek części LightGBM planu (strojony + domyślny + przeniesiony; ta sama formuła co `--plan`), bez
+    wczytywania danych: brak `counts` → źródła ≥ największego rozmiaru (prawdziwe dane: żaden rozmiar nie
+    odpada) i pełne `transport_rows` — górne oszacowanie. Używane przez orkiestrator (ETA kroku small_data)
+    i 13_tfm_setup (szacunek eksperymentu A); jednostki TFM liczone osobno (benchmark).
+    """
+    cfg = cfg or SmallDataConfig()
+    sizes, repeats = parse_sizes_repeats(cfg.sizes, cfg.repeats)
+    big = max(sizes) + int(cfg.transport_rows) + 1
+    counts = counts or SourceCounts(n_train=big, n_val=big, sites_train={}, sites_val={}, local_train=big,
+                                    local_val=big, foreign_train=big, local_esi1_val=0)
+    plan_cfg = SmallDataConfig(models=[], scenarios=list(cfg.scenarios), sizes=sizes, repeats=repeats,
+                               foreign_rows=0, transport_rows=int(cfg.transport_rows), lgbm_trials=int(cfg.lgbm_trials))
+    units, _ = build_units(plan_cfg, counts, {}, None)
+    return float(sum(estimate_unit_s(u, 0, int(cfg.lgbm_trials), {}, None) or 0.0 for u in units))
 
 
 # ─────────────────────────────────────────
@@ -1313,16 +1383,21 @@ def collect_statistics(store_root: Path, scenario: str, done: Sequence[Mapping[s
                             "p_boot": summary["p"], "n_boot_valid": summary["n_valid"]})
             comparisons.append(row)
 
-    # Holm między rozmiarami n (metryka pierwszorzędowa, każda para osobno); werdykty
+    # p werdyktu = max(p bootstrapu, p testu t) (R ≥ 2); Holm między rozmiarami n (metryka pierwszorzędowa,
+    # każda para osobno); werdykty
+    for c in comparisons:
+        c["p"] = decision_p(c["p_boot"], c["p_t"], c["R"])
     for arm, base in pairs:
         rows = [c for c in comparisons if c["arm"] == arm and c["base"] == base and c["metric"] == PRIMARY_METRIC]
-        adjusted = holm([c["p_boot"] if c["p_boot"] is not None else c["p_t"] for c in rows])
+        adjusted = holm([c["p"] for c in rows])
         for c, p_adj in zip(rows, adjusted, strict=True):
             c["p_holm"] = p_adj
     for c in comparisons:
-        p_used = c.get("p_holm") if c["metric"] == PRIMARY_METRIC else (c["p_boot"] if c["p_boot"] is not None
-                                                                          else c["p_t"])
-        c["verdict"], c["verdict_text"] = verdict(c["delta"], p_used, c["metric"])
+        p_used = c.get("p_holm") if c["metric"] == PRIMARY_METRIC else c["p"]
+        if c["R"] < MIN_REPEATS_TEST:
+            c["verdict"], c["verdict_text"] = "na", f"R = {c['R']} < {MIN_REPEATS_TEST} — bez testu"
+        else:
+            c["verdict"], c["verdict_text"] = verdict(c["delta"], p_used, c["metric"])
         c["mid"] = _mid(COMPARE_METRICS[c["metric"]][0])
 
     # Krzywe potęgowe i n* (metryka pierwszorzędowa)
@@ -1571,8 +1646,9 @@ def decision_lines(results: Mapping[str, Any]) -> list[str]:
             cross = (block.get("crossover") or {}).get(f"{arm}|{BASELINE}") or {}
             if cross.get("n_star") is not None:
                 where = "w zakresie danych" if cross.get("in_range") else "EKSTRAPOLACJA poza zakres n"
-                ci = (f"95% CI {_n(cross['ci_low'])}–{_n(cross['ci_high'])}" if cross.get("ci_low") is not None
-                      else cross.get("ci_note") or "bez przedziału")
+                ci = (f"95% CI {_n(cross['ci_low'])}–{_n(cross['ci_high'])}"
+                      + (" — ORIENTACYJNY (mało powtórzeń)" if cross.get("ci_indicative") else "")
+                      if cross.get("ci_low") is not None else cross.get("ci_note") or "bez przedziału")
                 cross_text = (f"przecięcie krzywych potęgowych n* ≈ {_n(cross['n_star'])} ({ci}; {where}; "
                               f"{_STATUS_TEXT.get(cross['status'], cross['status'])})")
             else:
@@ -1643,10 +1719,14 @@ def methods_paragraph(results: Mapping[str, Any]) -> str:
         "argmax i reguły kosztowej. Dla każdego n i modelu obliczono sparowane różnice Δ względem strojonego "
         "LightGBM w każdym powtórzeniu, ich średnią z 95% przedziałem t (df = R − 1) oraz dwupoziomowy bootstrap "
         f"({cfg.get('n_boot')} losowań: powtórzenia ze zwracaniem, a następnie wizyty oceniane warstwowo względem "
-        "ESI). Wartości p miary pierwszorzędowej skorygowano metodą Holma względem liczby rozmiarów n. Przewagę "
-        f"modelu ogłaszano wyłącznie, gdy skorygowane p < 0,05 i |Δ| > {mid_text} (minimalna istotna różnica). "
-        "Przebieg log loss w funkcji n opisano krzywą a + b·n^(−c), a punkt przecięcia krzywych n* wyznaczono "
-        "wraz z 95% przedziałem bootstrap po powtórzeniach. Czułość dla ESI 1 raportowano wyłącznie dla "
+        "ESI). Do wnioskowania przyjęto wartość p równą większej z wartości p bootstrapu i sparowanego testu t "
+        "(różnicę uznawano za istotną tylko wtedy, gdy oba przedziały wykluczały zero; przy jednym powtórzeniu "
+        "testu nie przeprowadzano), ponieważ przy kilku powtórzeniach percentylowy bootstrap po powtórzeniach "
+        "zaniża niepewność. Wartości p miary pierwszorzędowej skorygowano metodą Holma względem liczby rozmiarów "
+        f"n. Przewagę modelu ogłaszano wyłącznie, gdy skorygowane p < 0,05 i |Δ| > {mid_text} (minimalna istotna "
+        "różnica). Przebieg log loss w funkcji n opisano krzywą a + b·n^(−c), a punkt przecięcia krzywych n* "
+        "wyznaczono wraz z 95% przedziałem bootstrap po powtórzeniach (orientacyjnym, gdy dla któregoś rozmiaru "
+        f"wykonano mniej niż {MIN_REPEATS_NSTAR_CI} powtórzeń). Czułość dla ESI 1 raportowano wyłącznie dla "
         f"n ≥ {_n(RECALL_MIN_N)}, z dokładnym przedziałem Clopper–Pearsona."
     )
 
@@ -1681,12 +1761,16 @@ def report_lines(results: Mapping[str, Any]) -> list[str]:
               "- Δ = model − odniesienie w każdym powtórzeniu (układ sparowany); średnia z 95% CI t (df = R − 1)",
               f"- dwupoziomowy bootstrap: {cfg.get('n_boot')} losowań (powtórzenia ze zwracaniem → wiersze oceny "
               "warstwowo wg ESI); p z tych samych ogonów co przedział",
+              "- p werdyktu = **max(p bootstrapu, p testu t)** (R ≥ 2; R = 1 → bez werdyktu) — wygrana wymaga, by "
+              "przedział t (df = R − 1) **i** przedział bootstrapu wykluczały 0 (przy 2–5 powtórzeniach sam "
+              "bootstrap jest zbyt wąski)",
               f"- korekta Holma między rozmiarami n (każda para model–odniesienie osobno); **wygrana** tylko gdy "
               f"p_Holm < 0.05 **i** |Δ| > MID = {mid:g}; metryki drugorzędowe bez korekty (eksploracyjnie; MID: "
               "QWK 0.01, niedotriażowanie 0.01; Brier / ECE bez MID)",
               f"- czułość ESI 1 raportowana tylko dla n ≥ {_n(RECALL_MIN_N)} (przedział Clopper–Pearsona)",
               f"- krzywa a + b·n^(−c) (≥ 3 rozmiary; przy 3 c = 0.5) i przecięcie n* (szukane do "
-              f"{CROSSOVER_FACTOR:g}× największego n); 95% CI n* z bootstrapu po powtórzeniach", ""]
+              f"{CROSSOVER_FACTOR:g}× największego n); 95% CI n* z bootstrapu po powtórzeniach — orientacyjny, gdy "
+              f"któryś rozmiar ma < {MIN_REPEATS_NSTAR_CI} powtórzeń", ""]
     lines += ["## Ustawienia", "",
               f"- scenariusze: {', '.join(cfg.get('scenarios') or [])}; rozmiary n: {', '.join(_n(n) for n in cfg.get('sizes') or [])}; "
               f"powtórzenia: {', '.join(str(r) for r in cfg.get('repeats') or [])}; seed {cfg.get('seed')}",
@@ -1753,14 +1837,15 @@ def report_lines(results: Mapping[str, Any]) -> list[str]:
                       f"wierszach innych oddziałów (+ {_n(transported.get('n_es'))} na early stopping); korekta priorów: "
                       f"P·π_lokalny/π_trening (π_lokalny = rozkład ESI w TRAIN oddziału — „znany” z rejestru).", ""]
         lines += ["### Δ log loss vs LightGBM strojony (metryka pierwszorzędowa)", "",
-                  "| model | odniesienie | n | R | Δ | SD | 95% CI t | 95% CI bootstrap 2-poz. | p (bootstrap) | p Holm | werdykt |",
-                  "|---|---|---:|---:|---:|---:|---|---|---:|---:|---|"]
+                  "| model | odniesienie | n | R | Δ | SD | 95% CI t | 95% CI bootstrap 2-poz. | p (t) | p (bootstrap) "
+                  "| p = max | p Holm | werdykt |",
+                  "|---|---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---|"]
         prim = [c for c in block.get("comparisons") or [] if c["metric"] == PRIMARY_METRIC]
         for c in sorted(prim, key=lambda c: (c["base"] != BASELINE, c["arm"], c["n"])):
             lines.append(f"| {_arm_label(c['arm'])} | {_arm_label(c['base'])} | {_n(c['n'])} | {c['R']} | "
                          f"{_f(c['delta'])} | {_f(c['sd'])} | {_ci(c['t_ci_low'], c['t_ci_high'])} | "
-                         f"{_ci(c['boot_ci_low'], c['boot_ci_high'])} | {_p(c['p_boot'])} | {_p(c.get('p_holm'))} | "
-                         f"{c['verdict_text']} |")
+                         f"{_ci(c['boot_ci_low'], c['boot_ci_high'])} | {_p(c.get('p_t'))} | {_p(c['p_boot'])} | "
+                         f"{_p(c.get('p'))} | {_p(c.get('p_holm'))} | {c['verdict_text']} |")
         lines += ["", "### Metryki drugorzędowe — Δ vs LightGBM strojony (95% CI bootstrap 2-poz.; bez korekty)", "",
                   "| model | n | Δ QWK argmax | Δ QWK koszt | Δ undertriage argmax | Δ undertriage koszt | Δ Brier | Δ ECE |",
                   "|---|---:|---|---|---|---|---|---|"]
@@ -1784,8 +1869,9 @@ def report_lines(results: Mapping[str, Any]) -> list[str]:
                 lines.append(f"| {_arm_label(arm)} | — | — | — | — | — | — | — | za mało rozmiarów n (< 3) |")
                 continue
             reasons = "tak" if fit.get("reliable") else "nie (" + "; ".join(fit.get("reasons") or []) + ")"
-            ci = _ci(cross.get("ci_low"), cross.get("ci_high"), 0) if cross.get("ci_low") is not None else (
-                cross.get("ci_note") or "—")
+            ci = (_ci(cross.get("ci_low"), cross.get("ci_high"), 0)
+                  + (" orientacyjny" if cross.get("ci_indicative") else "")
+                  if cross.get("ci_low") is not None else (cross.get("ci_note") or "—"))
             outcome = _STATUS_TEXT.get(cross.get("status"), "—") if cross else "odniesienie"
             if cross.get("n_star") is not None and cross.get("in_range") is False:
                 outcome += " — ekstrapolacja"
@@ -1811,8 +1897,9 @@ def report_lines(results: Mapping[str, Any]) -> list[str]:
               "- Rzadkie klasy: ESI 1 ≈ 1% wizyt. Przy małym n podpróba ma kilka wizyt ESI 1 (gwarancja ≥ 2 lekko je "
               "nadreprezentuje przy najmniejszych n); metryki ESI 1 przy małym n i w VAL jednego oddziału "
               "(kilkadziesiąt wizyt ESI 1) są bardzo niepewne.",
-              "- Mało powtórzeń przy dużych n → niska moc; dwupoziomowy bootstrap łączy zmienność podprób i zbioru oceny, "
-              "ale przy R = 3 rozkład poziomu 1 jest grubo ziarnisty.",
+              "- Mało powtórzeń przy dużych n: sam percentylowy bootstrap po R = 2–5 powtórzeniach zaniżałby niepewność "
+              "(fałszywe „wygrane”), dlatego werdykt używa max(p bootstrapu, p testu t) — kosztem mocy; przedział n* "
+              "przy R < 5 jest tylko orientacyjny.",
               "- Zbiór oceny jest stały (VAL); TEST nie był używany. LightGBM strojony wewnętrzną CV na tej samej "
               "podpróbie (bez dostępu do VAL) — TFM bez strojenia: porównanie „z pudełka” vs „strojony” jest zamierzone.",
               "- Kontekst TFM większy od zakresu pretreningu (TabICL: ~48 tys. wierszy; n = 50 000 + obce wiersze) "
@@ -1895,10 +1982,13 @@ def plan_lines(cfg: SmallDataConfig, units: Sequence[Mapping[str, Any]], skipped
     rates = _benchmark_rates(benchmark)
     eval_n = {"pooled": counts.n_val if not cfg.eval_rows else min(cfg.eval_rows, counts.n_val),
               "site_local": counts.local_val if not cfg.local_eval_rows else min(cfg.local_eval_rows, counts.local_val)}
+    # liczba ESI 1 jest znana bez wczytywania cech tylko dla CAŁEGO VAL oddziału — przy próbie podajemy ją jako tło
+    local_esi1 = (f"{counts.local_esi1_val} ESI 1" if eval_n["site_local"] >= counts.local_val else
+                  f"próba warstwowa; cały VAL oddziału: {counts.local_val:,} wierszy, {counts.local_esi1_val} ESI 1")
     lines = [f"Plan eksperymentu A → {root}",
              f"  scenariusze: {', '.join(cfg.scenarios)}; n = {cfg.sizes}; powtórzenia = {cfg.repeats}; seed {cfg.seed}",
              f"  ocena: pooled {eval_n['pooled']:,} wierszy VAL; site_local (oddział {cfg.local_site}) "
-             f"{eval_n['site_local']:,} wierszy VAL ({counts.local_esi1_val} ESI 1)",
+             f"{eval_n['site_local']:,} wierszy VAL ({local_esi1})",
              f"  szacunek czasu: {'benchmark ' + str(benchmark) if rates else 'bez pomiaru (plan pamięci, GPU; orientacyjnie)'}"]
     for model in cfg.models:
         st = statuses.get(model) or {}

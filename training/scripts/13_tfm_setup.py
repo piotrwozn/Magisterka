@@ -36,6 +36,11 @@ Kroki:
        (krzywa małych danych). Szacunki skalują pomiar liniowo z liczbą estymatorów i interpolują log-log
        po rozmiarze kontekstu — to rząd wielkości, nie gwarancja.
 
+Benchmark na CPU (`--device cpu` albo brak CUDA), z atrapą (SOR_AI_TFM_FAKE) lub z przekierowanymi wagami
+= TEST MECHANIKI: wynik trafia do runs/analyses/tfm_setup/benchmark_mechanics.json (benchmark.json z GPU zostaje
+nietknięty — run_all.py i 14_small_data_curve.py używają tylko pomiaru GPU z prawdziwymi wagami), a bez CUDA
+kod wyjścia to 1 ("TFM nie są gotowe do treningu" — na CPU działa tylko profil smoke).
+
 benchmark.json (kontrakt dla run_all.py / 14_small_data_curve.py): {"kind": "tfm_setup_benchmark", "version": 1,
 "created", "device", "gpu", "torch", "libraries", "weights", "data", "results": [{model, n_ctx, n_estimators,
 test_rows, status (ok | skipped | oom | failed), fit_s, predict_s, rows_per_s, peak_vram_mb, detail}],
@@ -46,8 +51,8 @@ Haki testowe (nigdy w zwykłym użyciu): SOR_AI_TABPFN_MODEL_PATH / SOR_AI_TABIC
 wagami) — pobieranie tego modelu pominięte, kontrola dotyczy wskazanego pliku; SOR_AI_TFM_FAKE=1 — atrapa
 estymatora (benchmark bez torch).
 
-Kody wyjścia: 0 = gotowe do treningu TFM, 1 = coś wymaga poprawy (lista [BŁĄD ] powyżej wyniku),
-2 = złe argumenty, 130 = Ctrl+C.
+Kody wyjścia: 0 = gotowe do treningu TFM, 1 = coś wymaga poprawy (lista [BŁĄD ] powyżej wyniku) albo brak
+CUDA (test mechaniki na CPU się udał, ale TFM nie są gotowe do treningu), 2 = złe argumenty, 130 = Ctrl+C.
 """
 
 from __future__ import annotations
@@ -86,6 +91,13 @@ WARMUP_CONTEXT, WARMUP_TEST_ROWS = 200, 100        # rozgrzewka (CUDA, wczytanie
 SDPA_SEQ_LEN: int = 20_000                          # długość sekwencji próby SDPA na GPU (bez MATH: ~0,1 GB)
 SDPA_SEQ_LEN_CPU: int = 512
 BENCHMARK_SUBDIR, BENCHMARK_FILE = "tfm_setup", "benchmark.json"
+# Test mechaniki (CPU / atrapa / przekierowane wagi) — osobny plik: NIGDY nie nadpisuje pomiaru GPU,
+# z którego run_all.py i 14_small_data_curve.py liczą szacunki czasu
+MECHANICS_FILE = "benchmark_mechanics.json"
+# Szczyt pamięci ≥ tego ułamka VRAM → ostrzeżenie (Windows: Sysmem Fallback zamiast OOM)
+VRAM_NEAR_FULL_FRACTION = 0.9
+# Czas na wiersz testu rośnie > SLOWDOWN_FACTOR × proporcja kontekstów → podejrzany zjazd (pamięć współdzielona)
+SLOWDOWN_FACTOR = 10.0
 BENCHMARK_VERSION: int = 1
 TABICL_REPO_ID: str = "jingang/TabICL"
 DEFAULT_TABICL_CHECKPOINT: str = "tabicl-classifier-v2-20260212.ckpt"
@@ -732,15 +744,15 @@ def benchmark_unit(model_name: str, X_ctx: Any, y_ctx: Any, X_test: Any, *, n_es
     finally:
         with contextlib.suppress(Exception):
             model.release()
-    per_bag = (thr.get("per_bag") or {}).get("0") or {}
-    predict_s = float(per_bag.get("predict_s") or thr.get("predict_s") or 0.0)
-    fit_s = float(per_bag.get("fit_s") or thr.get("fit_s_per_bag") or 0.0)
+    # Jeden worek: sumy throughput() = ten worek; wierszy/s liczone w wrapperze z NIEZAOKRĄGLONEGO czasu
+    predict_s = float(thr.get("predict_s") or 0.0)
+    fit_s = float(thr.get("fit_s_per_bag") or 0.0)
     events = [e.get("kind") for e in getattr(model, "tfm_events", []) or []]
     return {
         "device": str(model.params.get("device")),
         "fit_s": round(fit_s, 3),
         "predict_s": round(predict_s, 3),
-        "rows_per_s": round(len(X_test) / predict_s, 2) if predict_s > 0 else None,
+        "rows_per_s": thr.get("rows_per_s"),
         "peak_vram_mb": thr.get("peak_vram_mb"),
         "wall_s": round(time.time() - t0, 3),
         "events": [e for e in events if e in ("oom_downgrade", "library_oom_warning", "device_fallback")],
@@ -908,13 +920,16 @@ def experiment_a_estimate(curves: Mapping[str, Curve], data: Mapping[str, Any]) 
     """
     Eksperyment A (krzywa małych danych): jednostki TFM w obu scenariuszach — pooled (ewaluacja na 20 000
     wierszy VAL), site_local (VAL oddziału) i site_local + 10 000 obcych wierszy kontekstu; domyślne
-    rozmiary / powtórzenia z TFM_BRIEF §5, 8 estymatorów (domyślne biblioteki). LightGBM poza szacunkiem.
+    rozmiary / powtórzenia z TFM_BRIEF §5, 8 estymatorów (domyślne biblioteki) — `tfm_s`; plus część
+    LightGBM (`lightgbm_s`: strojony Optuną na podpróbce, domyślny, przeniesiony — formuła planu
+    14_small_data_curve.py --plan). `total_s` = obie części.
     """
     site_val = int(data.get("site_val_rows") or EXP_A_SITE_VAL_ROWS)
     out: dict[str, Any] = {"assumptions": {"sizes": list(EXP_A_SIZES), "repeats": list(EXP_A_REPEATS),
                                            "eval_rows": EXP_A_EVAL_ROWS, "site_val_rows": site_val,
                                            "foreign_rows": EXP_A_FOREIGN_ROWS, "n_estimators": EXP_A_N_ESTIMATORS},
-                           "note": "tylko jednostki TFM; LightGBM (Optuna na podpróbce, CPU) dochodzi osobno"}
+                           "note": "jednostki TFM z benchmarku + LightGBM (Optuna na podpróbce, CPU) z formuły planu "
+                                   "14_small_data_curve.py --plan"}
     total = 0.0
     for model, curve in curves.items():
         if not curve:
@@ -927,7 +942,12 @@ def experiment_a_estimate(curves: Mapping[str, Curve], data: Mapping[str, Any]) 
             seconds += repeats * (pooled + local + foreign)
         out[model] = round(seconds, 1)
         total += seconds
-    out["total_s"] = round(total, 1)
+    from src.analysis.small_data import SmallDataConfig, lightgbm_eta_s
+
+    lightgbm = lightgbm_eta_s(SmallDataConfig(sizes=list(EXP_A_SIZES), repeats=list(EXP_A_REPEATS)))
+    out["tfm_s"] = round(total, 1)
+    out["lightgbm_s"] = round(lightgbm, 1)
+    out["total_s"] = round(total + lightgbm, 1)
     return out
 
 
@@ -947,14 +967,54 @@ def print_estimates(con: Console, estimates: Mapping[str, Any], device: str) -> 
     if exp_a.get("total_s") is not None:
         parts = ", ".join(f"{m} ~{_fmt_s(exp_a[m])}" for m in TFM_NAMES if m in exp_a)
         con.add("Eksperyment A (14_small_data_curve.py)", STATUS_INFO,
-                f"jednostki TFM ~{_fmt_s(exp_a['total_s'])} ({parts}); {exp_a.get('note')}")
+                f"razem ~{_fmt_s(exp_a['total_s'])}: jednostki TFM ~{_fmt_s(exp_a.get('tfm_s', exp_a['total_s']))} "
+                f"({parts}) + LightGBM ~{_fmt_s(exp_a.get('lightgbm_s') or 0)}; {exp_a.get('note')}")
 
 
-def write_benchmark(payload: Mapping[str, Any], runs_dir: Path | None = None) -> Path:
+def mechanics_only(device: str, fake: bool, weights: Mapping[str, Any]) -> str | None:
+    """Powód, dla którego pomiar NIE jest benchmarkiem GPU do szacunków (CPU / atrapa / przekierowanie) albo None."""
+    if fake:
+        return "atrapa estymatora (SOR_AI_TFM_FAKE)"
+    if device != "cuda":
+        return f"urządzenie '{device}' (nie GPU)"
+    overrides = [str((w or {}).get("override")) for w in (weights or {}).values() if (w or {}).get("override")]
+    if overrides:
+        return "przekierowane wagi (" + ", ".join(overrides) + ")"
+    return None
+
+
+def write_benchmark(payload: Mapping[str, Any], runs_dir: Path | None = None, *, mechanics: bool = False) -> Path:
+    """benchmark.json (GPU, prawdziwe wagi) albo benchmark_mechanics.json (test mechaniki — bez nadpisania GPU)."""
     from src.analysis.common import analyses_root, write_json
 
-    path = analyses_root(runs_dir) / BENCHMARK_SUBDIR / BENCHMARK_FILE
+    path = analyses_root(runs_dir) / BENCHMARK_SUBDIR / (MECHANICS_FILE if mechanics else BENCHMARK_FILE)
     return write_json(path, dict(payload))
+
+
+def suspicious_rows(results: Sequence[Mapping[str, Any]], total_vram_mb: float | None) -> list[str]:
+    """
+    Pomiary podejrzane o przepełnienie VRAM bez OOM (Windows: "CUDA – Sysmem Fallback Policy" kieruje
+    nadmiar do współdzielonej pamięci RAM — wielokrotnie wolniej, drabina OOM nie zadziała):
+    szczyt ≥ VRAM_NEAR_FULL_FRACTION × VRAM albo czas na wiersz testu rośnie > SLOWDOWN_FACTOR × proporcja
+    kontekstów między kolejnymi rozmiarami tego samego modelu.
+    """
+    notes: list[str] = []
+    ok = [r for r in results if r.get("status") == "ok"]
+    for r in ok:
+        peak = r.get("peak_vram_mb")
+        if total_vram_mb and peak is not None and float(peak) >= VRAM_NEAR_FULL_FRACTION * float(total_vram_mb):
+            notes.append(f"{r['model']} n_ctx={int(r['n_ctx']):,}: szczyt {float(peak):,.0f} MB ≥ "
+                         f"{VRAM_NEAR_FULL_FRACTION:.0%} VRAM ({float(total_vram_mb):,.0f} MB)")
+    for model in dict.fromkeys(r["model"] for r in ok):
+        rows = sorted((r for r in ok if r["model"] == model and r.get("predict_s")), key=lambda r: int(r["n_ctx"]))
+        for a, b in zip(rows, rows[1:], strict=False):
+            per_a = float(a["predict_s"]) / max(int(a["test_rows"]), 1)
+            per_b = float(b["predict_s"]) / max(int(b["test_rows"]), 1)
+            ctx_ratio = int(b["n_ctx"]) / max(int(a["n_ctx"]), 1)
+            if per_a > 0 and per_b / per_a > SLOWDOWN_FACTOR * max(ctx_ratio, 1.0):
+                notes.append(f"{model}: czas na wiersz {per_b / per_a:.0f}× większy przy n_ctx {int(b['n_ctx']):,} "
+                             f"niż {int(a['n_ctx']):,} (kontekst ×{ctx_ratio:.1f})")
+    return notes
 
 
 # ─────────────────────────────────────────
@@ -1117,8 +1177,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "fake": fake, "data": data_info, "n_estimators": dict(n_estimators),
                     "contexts": list(contexts), "results": results, "sdpa": sdpa, "estimates": estimates,
                 }
-                path = write_benchmark(payload)
-                con.add("benchmark.json", STATUS_OK, str(path))
+                mechanics = mechanics_only(device, fake, payload["weights"])
+                payload["mechanics_only"] = mechanics
+                path = write_benchmark(payload, mechanics=mechanics is not None)
+                if mechanics:
+                    con.add(MECHANICS_FILE, STATUS_INFO, f"{path} — TEST MECHANIKI ({mechanics}); {BENCHMARK_FILE} "
+                            f"(pomiar GPU do szacunków run_all / eksperymentu A) NIE został nadpisany")
+                else:
+                    con.add(BENCHMARK_FILE, STATUS_OK, str(path))
+                for note in suspicious_rows(results, info.get("total_vram_mb") if device == "cuda" else None):
+                    con.add("Pamięć GPU", STATUS_WARN, note,
+                            "możliwe przepełnienie VRAM bez błędu OOM: Windows → Panel sterowania NVIDIA → Zarządzaj "
+                            "ustawieniami 3D → Ustawienia programu → python.exe z venv → \"CUDA – Sysmem Fallback "
+                            "Policy\" = \"Prefer No Sysmem Fallback\"; zamknij inne programy na karcie")
                 print_estimates(con, estimates, device)
                 if not any(r["status"] == "ok" for r in results):
                     con.add("Benchmark", STATUS_FAIL, "żaden pomiar się nie udał (szczegóły powyżej)")
@@ -1130,6 +1201,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     failures, warnings = con.failures, con.warnings
     if failures:
         print(f"Wynik: {len(failures)} błędów, {len(warnings)} ostrzeżeń — popraw pozycje [BŁĄD ] i uruchom ponownie.")
+        return 1
+    from src.models.tfm_base import weights_override_active
+
+    fake_hook = bool((weights_override_active(models[0]) or "").startswith("SOR_AI_TFM_FAKE"))
+    if not torch_state["cuda"] and not fake_hook:
+        print(f"Wynik: tylko test mechaniki ({len(warnings)} ostrzeżeń) — TFM NIE są gotowe do treningu (brak "
+              f"CUDA; na CPU działa tylko profil smoke). Zainstaluj koło torch z CUDA (polecenie w kroku 1) i "
+              f"uruchom ponownie bez --device cpu.")
         return 1
     print(f"Wynik: OK ({len(warnings)} ostrzeżeń) — TFM gotowe. Dalej: python scripts/00_check_env.py --models tfm "
           f"--profile thorough, potem python scripts/run_all.py --profile thorough --models tfm")

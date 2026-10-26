@@ -201,7 +201,7 @@ Zbiory `val` i `test` nie biorą udziału w tuningu ani w treningu.
 |---|---|
 | `--profile smoke\|quick\|standard\|thorough` | budżet (domyślnie `standard`) |
 | `--feature-set triage\|full\|triage,full` | zestaw cech (domyślnie `triage`); `full` ≈ 3–4× dłużej na próbę i ≥ 32 GB RAM — osobna noc |
-| `--models all\|lista` | np. `--models lightgbm,xgboost` (aliasy: lr, lgbm, xgb, cb, rf) |
+| `--models all\|tfm\|lista` | `all` = 6 modeli klasycznych; `tfm` = modele fundamentalne TabPFN-3.5 + TabICLv2 (GPU, punkt 17); np. `--models lightgbm,xgboost` (aliasy: lr, lgbm, xgb, cb, rf, pfn, icl) |
 | `--split random\|site` | podział danych; `site` = oddział B w całości jako test (walidacja zewnętrzna) |
 | `--no-tune` | bez tuningu, parametry domyślne (tag `<profil>-notune`; takich runów nie biorą domyślnie `latest_runs` / `07_compare_runs.py`) |
 | `--lanes auto\|1\|2` | tory równoległe |
@@ -438,6 +438,9 @@ python scripts/09_seed_refits.py --tag standard                      # refity z 
 python scripts/10_leave_site_out.py --tag standard                   # walidacja z wyłączeniem oddziału
 python scripts/11_learning_curve.py --tag standard                   # krzywa uczenia
 python scripts/12_llm_bakeoff.py run --dry-run                       # porównanie LLM do wyjaśnień (punkt 16)
+python scripts/13_tfm_setup.py                                       # TFM: torch/CUDA, licencja, wagi, benchmark (punkt 17)
+python scripts/14_small_data_curve.py --tag thorough --plan          # TFM, eksperyment A: krzywa małych danych
+python scripts/15_tfm_blend.py --tag thorough                        # TFM, eksperyment B: blend z LightGBM na VAL
 streamlit run app/streamlit_app.py                                   # demo (requirements-app.txt)
 ```
 
@@ -450,7 +453,8 @@ i nigdy nie zastępuje kroku profilu w `run_all.py` — nawet z ręcznym `--tag 
 
 Modele: `logreg` (liniowy punkt odniesienia), `lightgbm`, `xgboost` (GPU), `catboost` (GPU),
 `random_forest` (bagging — dywersyfikacja), `ebm` (Explainable Boosting Machine, interpretowalny
-GAM bez interakcji).
+GAM bez interakcji). Opcjonalnie modele fundamentalne `tabpfn` (TabPFN-3.5) i `tabicl` (TabICLv2):
+tylko jawnie (`--model tfm`), punkt 17.
 
 ## 13. Testy
 
@@ -613,14 +617,18 @@ python scripts/05_explain.py --model-name ebm --global             # 4. wyjaśni
 ```
 
 **1. Analizy** (`--stage analyses`; `--stage all` = trening, a potem analizy). Uruchamia po kolei
-trzy skrypty z tymi samymi zabezpieczeniami co trening (osobne procesy, logi, blokada uśpienia,
-wznawianie):
+trzy skrypty (a po nich kroki TFM, gdy są spełnione ich warunki) z tymi samymi zabezpieczeniami co
+trening (osobne procesy, logi, blokada uśpienia, wznawianie):
 
 | skrypt | co liczy (ULEPSZENIA.md) | wynik |
 |---|---|---|
 | `09_seed_refits.py` | każdy model z najlepszymi parametrami jeszcze 3 razy z innym seedem (C1) — ile wynik zależy od losowości treningu | `runs/analyses/seeds__<zestaw>__<tag>/results.json` (średnia ± SD) |
 | `10_leave_site_out.py` | trening bez oddziału A (potem B), ocena na jego wierszach TRAIN + VAL; korekta rozkładu klas: znana i EM (C3) | `runs/analyses/site_out__…/results.json` |
 | `11_learning_curve.py` | lightgbm i xgboost na 5–100% danych dopasowania, dopasowanie potęgowe (C9) | `runs/analyses/learning_curve__…/results.json` + wykres |
+| `14_small_data_curve.py` | tylko gdy TFM są w `--models` albo jest gotowy run TFM z tym tagiem, i są biblioteki TFM: TFM vs strojony LightGBM przy małym n (eksperyment A, punkt 17) | `runs/analyses/small_data__…/report.md` |
+| `15_tfm_blend.py` | tylko gdy są runy lightgbm i TFM z tym tagiem: blend z TFM na VAL z bramką (eksperyment B, punkt 17) | `runs/analyses/tfm_blend__…/recommendation.json` |
+
+Bez spełnionych warunków kroki TFM są w planie i w `--status` „pominięte: <powód>”.
 
 Każdy skrypt pomija gotowe jednostki, więc po przerwaniu uruchom to samo polecenie. Wyniki
 (`results.json`, `summary.md`, `--status`) są kumulatywne: wywołanie tylko dla części modeli lub
@@ -694,3 +702,29 @@ python scripts/12_llm_bakeoff.py run --recipe runs/final_report__triage__<czas>/
 
 Wynik: `runs/llm_bakeoff/<czas>/report.md` (sekcja „Wybór modelu”). Przerwany przebieg wznawia
 to samo polecenie (pamięć podręczna odpowiedzi). Linux: `make llm-bakeoff`.
+
+## 17. Modele fundamentalne (TFM): TabPFN-3.5 i TabICLv2 obok LightGBM
+
+Opcjonalny etap **po** treningu klasycznym: czy wstępnie wytrenowane modele tabelaryczne pomagają
+LightGBM. Eksperyment A sprawdza małą liczbę lokalnych danych, eksperyment B blend na pełnych danych.
+Do systemu trafiają najwyżej 2 TFM i tylko po przejściu bramki ustalonej z góry. Potrzebna jest karta
+NVIDIA z torch z CUDA. Licencja wag TabPFN-3.5 jest niekomercyjna, co w pracy magisterskiej jest
+dozwolone. `--models all` nadal oznacza 6 modeli klasycznych. Pełny opis — instalacja, czasy, jak czytać
+wyniki, tabela decyzji, akapity metod, ograniczenia i problemy: **[`docs/TFM.md`](docs/TFM.md)**.
+
+```powershell
+# instalacja DOPIERO PO zakończeniu treningu klasycznego (ten sam venv)
+pip install torch --index-url https://download.pytorch.org/whl/cu130     # sterownik < 580: .../whl/cu128
+pip install -r requirements-tfm.txt -c requirements-lock.txt
+python scripts/13_tfm_setup.py                                           # licencja TabPFN, wagi, benchmark GPU
+
+python scripts/run_all.py --profile thorough --models tfm                # 1. trening TFM
+python scripts/09_seed_refits.py --feature-set triage --tag thorough --models lightgbm   # 2. SD seedów (jeśli brak)
+python scripts/14_small_data_curve.py --feature-set triage --tag thorough   # 3. eksperyment A
+python scripts/15_tfm_blend.py --feature-set triage --tag thorough          # 4. eksperyment B (tylko VAL)
+# 5. RAZ: 08_final_report.py poleceniem z runs/analyses/tfm_blend__triage__thorough/recommendation.json
+```
+
+Kroki 2–4 robi też `python scripts/run_all.py --profile thorough --stage analyses` (razem z analizami
+klasycznymi; kroki TFM tylko wtedy, gdy są ich warunki). Linux: `make tfm-setup`,
+`make tfm-train PROFILE=thorough`, `make small-data TAG=thorough`, `make tfm-blend TAG=thorough`.

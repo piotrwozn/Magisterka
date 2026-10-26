@@ -448,6 +448,22 @@ def _renormalize(p: np.ndarray) -> np.ndarray:
     return np.divide(p, sums, out=np.full_like(p, 1.0 / N_CLASSES), where=sums > 0)
 
 
+def _rate(rows: int, seconds: float | None) -> float | None:
+    """Wierszy/s z NIEZAOKRĄGLONEGO czasu (0 wierszy → None; czas ≤ 0 → dolna granica 1 µs)."""
+    if not rows or seconds is None:
+        return None
+    return round(int(rows) / max(float(seconds), 1e-6), 2)
+
+
+def _rounded_bag(stats: Mapping[str, Any]) -> dict[str, Any]:
+    """Pomiary worka do opisu (run_info): czasy zaokrąglone do ms."""
+    out = dict(stats)
+    for key in ("fit_s", "predict_s"):
+        if isinstance(out.get(key), (int, float)):
+            out[key] = round(float(out[key]), 3)
+    return out
+
+
 # ─────────────────────────────────────────
 # Adapter biblioteki (TabPFN / TabICL / atrapa)
 # ─────────────────────────────────────────
@@ -569,6 +585,18 @@ class TFMAdapter:
     def cache_bytes(self, params: Mapping[str, Any], runtime: Mapping[str, Any], n_ctx: int,
                     n_features: int) -> int | None:
         """Szacunek pamięci bufora jednego worka (bajty; backend: kontrola budżetu VRAM)."""
+        return None
+
+    def cache_on_device(self, runtime: Mapping[str, Any]) -> bool:
+        """Czy bufor worka zostaje w VRAM między wywołaniami (TabPFN keep_cache_on_device=False → nie)."""
+        return True
+
+    def reencodes_context(self, runtime: Mapping[str, Any]) -> bool:
+        """Czy każde wywołanie predykcji koduje od nowa cały kontekst (brak pełnego bufora)."""
+        return False
+
+    def host_cache_runtime(self, runtime: Mapping[str, Any]) -> tuple[dict[str, Any], str] | None:
+        """Opcje z buforem poza VRAM (albo mniejszym) — (nowe opcje, opis) albo None, gdy nic do zmiany."""
         return None
 
 
@@ -731,31 +759,77 @@ class TFMPredictor:
         return max(self.context_sizes()) if self.bags else 0
 
     def throughput(self) -> dict[str, Any]:
-        """Ostatnie pomiary per worek: fit_s, predict_s, rows, rows_per_s, peak_vram_mb + sumy."""
+        """
+        Ostatnie pomiary per worek: fit_s, predict_s, rows, rows_per_s, peak_vram_mb + sumy.
+
+        `stats["bags"]` trzyma czasy NIEZAOKRĄGLONE (perf_counter) — sumy i wierszy/s liczone z nich,
+        zaokrąglenie tylko w zwracanym opisie (szybka predykcja < 0,5 ms nie daje już rows_per_s=None).
+        """
         bags = self.stats.get("bags") or {}
         if not bags:
             return {}
         values = [bags[b] for b in sorted(bags)]
-        predict_s = float(sum(v["predict_s"] for v in values))
+        predict_s = float(sum(float(v.get("predict_s") or 0.0) for v in values))
         rows = int(sum(v["rows"] for v in values))
-        fits = [v["fit_s"] for v in values if v.get("fit_s")]
+        fits = [float(v["fit_s"]) for v in values if v.get("fit_s")]
         peaks = [v["peak_vram_mb"] for v in values if v.get("peak_vram_mb") is not None]
         return {
             "n_bags_measured": len(values),
             "fit_s_per_bag": round(float(np.mean(fits)), 3) if fits else None,
             "predict_s": round(predict_s, 3),
             "rows_predicted": rows,
-            "rows_per_s": round(rows / predict_s, 2) if predict_s > 0 else None,
+            "rows_per_s": _rate(rows, predict_s),
             "peak_vram_mb": max(peaks) if peaks else None,
-            "per_bag": {str(b): bags[b] for b in sorted(bags)},
+            "per_bag": {str(b): _rounded_bag(bags[b]) for b in sorted(bags)},
         }
 
-    def estimated_cache_bytes(self) -> int | None:
-        """Szacunek sumy buforów wszystkich worków (backend: kontrola budżetu VRAM przed `warm_up`)."""
+    def reencodes_context(self) -> bool:
+        """
+        Czy KAŻDE wywołanie predykcji koduje od nowa cały kontekst worka (TabICL kv_cache 'repr' / bez
+        bufora, TabPFN fit_mode 'fit_preprocessors'): koszt wywołania ~ kontekst, nie ~ wiersze — serwowanie
+        pojedynczych wierszy (backend, what_if) trwa wtedy sekundy–dziesiątki sekund na żądanie.
+        """
+        return bool(self._get_adapter().reencodes_context(self.runtime))
+
+    def cache_on_host(self, reason: str) -> str | None:
+        """
+        Bufory worków poza VRAM (gdy wszystkie worki mają zostać dopasowane, a ich bufory nie mieszczą
+        się na karcie): TabPFN keep_cache_on_device=False + max_batched_estimator_rows=0, TabICL kv → repr.
+        Tylko przed dopasowaniem worków (zmienia opcje runtime, nie `params`). Zwraca opis kroku albo None
+        (nic do zmiany). WARNING + zdarzenie `cache_on_host` w tfm_events.
+        """
+        step = self._get_adapter().host_cache_runtime(self.runtime)
+        if step is None:
+            return None
+        new_runtime, description = step
+        self.release()
+        self.runtime = dict(new_runtime)
+        detail = f"{description} — {reason}"
+        log.warning(f"{self._get_adapter().display_name}: {detail}")
+        self.events.append({"kind": "cache_on_host", "time": _now(), "detail": detail,
+                            "runtime": dict(new_runtime)})
+        return description
+
+    def probe_latency(self, n_rows: int = 1) -> float:
+        """Czas (s) predykcji `n_rows` wierszy kontekstu przy bieżących workach (backend: po `warm_up`)."""
+        n_rows = max(1, min(int(n_rows), len(self.y_ctx)))
+        t0 = time.perf_counter()
+        self.predict_proba_many([self.X_ctx[:n_rows]])
+        return time.perf_counter() - t0
+
+    def estimated_cache_bytes(self, *, on_device: bool = False) -> int | None:
+        """
+        Szacunek sumy buforów wszystkich worków (backend: kontrola budżetu VRAM przed `warm_up`).
+        `on_device=True` — tylko część trzymana w VRAM między wywołaniami (TabPFN keep_cache_on_device=False → 0).
+        """
         adapter = self._get_adapter()
         sizes = [adapter.cache_bytes(self.params, self.runtime, n, len(self.kept_features))
                  for n in self.context_sizes()]
-        return None if any(s is None for s in sizes) else int(sum(sizes))
+        if any(s is None for s in sizes):
+            return None
+        if on_device and not adapter.cache_on_device(self.runtime):
+            return 0
+        return int(sum(sizes))
 
     # ── wejście ──
     def _matrix(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
@@ -943,18 +1017,18 @@ class TFMPredictor:
                     _peak_reset()
                     if est is None:
                         self._make_room(adapter)
-                        t0 = time.time()
+                        t0 = time.perf_counter()
                         idx = self.bags[b]
                         est = adapter.build(self.params, self.runtime, weights, device, self._seed(b))
                         adapter.fit(est, self.X_ctx[idx], self.y_ctx[idx].astype(np.int64))
-                        fit_s = time.time() - t0
+                        fit_s = time.perf_counter() - t0
                         details = adapter.describe(est)
                         log.info(f"{adapter.display_name}: worek {b + 1}/{self.n_bags} — kontekst {len(idx):,} "
                                  f"wierszy, dopasowanie {fit_s:.1f} s" + (f", {details}" if details else ""))
                     phase = "predict"
-                    t0 = time.time()
+                    t0 = time.perf_counter()
                     outs = [self._predict_rows(adapter, est, mat, b) for mat in mats]
-                    predict_s = time.time() - t0
+                    predict_s = time.perf_counter() - t0
                     peak = _peak_mb()
             except Exception as exc:
                 if not is_tfm_oom(exc):
@@ -964,18 +1038,21 @@ class TFMPredictor:
             if failure is None:
                 rows = int(sum(len(m) for m in mats))
                 previous = self.stats["bags"].get(b, {})
-                self.stats["bags"][b] = {
+                self.stats["bags"][b] = {                  # czasy niezaokrąglone (zaokrąglenie w throughput())
                     "n_ctx": int(len(self.bags[b])),
-                    "fit_s": round(fit_s, 3) if fit_s else previous.get("fit_s"),
-                    "predict_s": round(predict_s, 3), "rows": rows,
-                    "rows_per_s": round(rows / predict_s, 2) if predict_s > 0 else None,
+                    "fit_s": fit_s if fit_s else previous.get("fit_s"),
+                    "predict_s": predict_s, "rows": rows,
+                    "rows_per_s": _rate(rows, predict_s),
                     "peak_vram_mb": peak,
                 }
                 self._keep_or_release(adapter, b, est)
                 return outs
             # OOM — sprzątanie POZA blokiem except (ślad wyjątku trzyma tensory na karcie)
             step = adapter.next_oom_step(self.runtime, phase)
-            if step is None or step[2]:
+            # OOM w fazie fit → estymator jest dopasowany tylko częściowo (np. TabICL: model_.to(cuda) przed
+            # zbudowaniem enkodera) — ZAWSZE budowany od nowa, także przy kroku bez przebudowy (predict_batch)
+            rebuild = step is not None and (bool(step[2]) or phase == "fit")
+            if step is None or rebuild:
                 self._release_est(adapter, est)
                 est = None
             free_device_memory()
@@ -985,7 +1062,7 @@ class TFMPredictor:
                     f"{adapter.display_name}: brak pamięci GPU (worek {b + 1}, faza {phase}) także po krokach "
                     f"awaryjnych: {', '.join(tried) or 'brak dostępnych'}. Zmniejsz: {adapter.oom_advice()} "
                     f"(np. --profile z mniejszym kontekstem). Ostatni błąd: {failure}")
-            new_runtime, description, rebuild = step
+            new_runtime, description, _ = step
             log.warning(f"{adapter.display_name}: BRAK PAMIĘCI GPU (worek {b + 1}, faza {phase}: {failure}) — "
                         f"krok awaryjny: {description}" + (" (ponowne dopasowanie worka)" if rebuild else ""))
             self.events.append({"kind": "oom_downgrade", "time": _now(), "bag": b, "phase": phase,
@@ -1165,9 +1242,9 @@ class TFMTriageModel(BaseTriageModel):
         """Wszystkie ramki w jednym przebiegu każdego worka (VAL + TEST bez ponownego budowania buforów)."""
         if not self.is_fitted:
             raise RuntimeError("Model nie wytrenowany.")
-        t0 = time.time()
+        t0 = time.perf_counter()
         out = self.model.predict_proba_many([self._align_features(f) for f in frames])
-        self.tfm_predict_s = round(time.time() - t0, 3)
+        self.tfm_predict_s = round(time.perf_counter() - t0, 3)
         return [full_class_proba(p, self.classes_) for p in out]
 
     def limit_bags(self, n_bags: int, reason: str) -> None:

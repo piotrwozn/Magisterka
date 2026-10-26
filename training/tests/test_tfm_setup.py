@@ -282,8 +282,33 @@ class TestEstimates:
         expected = 0.0
         for n, r in zip(setup.EXP_A_SIZES, setup.EXP_A_REPEATS, strict=True):
             expected += r * (curve.bag_s(n, 20_000, 8) + curve.bag_s(n, 1_000, 8) + curve.bag_s(n + 10_000, 1_000, 8))
-        assert est["tabicl"] == pytest.approx(expected, rel=1e-3) and est["total_s"] == pytest.approx(expected, rel=1e-3)
+        from src.analysis.small_data import SmallDataConfig, lightgbm_eta_s
+
+        lightgbm = lightgbm_eta_s(SmallDataConfig(sizes=list(setup.EXP_A_SIZES), repeats=list(setup.EXP_A_REPEATS)))
+        assert est["tabicl"] == pytest.approx(expected, rel=1e-3) and est["tfm_s"] == pytest.approx(expected, rel=1e-3)
+        assert est["lightgbm_s"] == pytest.approx(lightgbm, rel=1e-3) and lightgbm > 3_600     # strojenie dominuje
+        assert est["total_s"] == pytest.approx(expected + lightgbm, rel=1e-3)
         assert est["assumptions"]["site_val_rows"] == 1_000 and "LightGBM" in est["note"]
+
+    def test_mechanics_only(self, setup):
+        assert setup.mechanics_only("cuda", False, {"tabpfn": {"override": None}}) is None
+        assert "atrapa" in setup.mechanics_only("cuda", True, {})
+        assert "cpu" in setup.mechanics_only("cpu", False, {})
+        assert "SOR_AI_TABICL_MODEL_PATH" in setup.mechanics_only(
+            "cuda", False, {"tabicl": {"override": "SOR_AI_TABICL_MODEL_PATH=x.ckpt"}})
+
+    def test_suspicious_rows(self, setup):
+        rows = [{"model": "tabpfn", "n_ctx": 5_000, "test_rows": 2_000, "status": "ok", "predict_s": 2.0,
+                 "peak_vram_mb": 3_000},
+                {"model": "tabpfn", "n_ctx": 25_000, "test_rows": 2_000, "status": "ok", "predict_s": 9.0,
+                 "peak_vram_mb": 15_500},                                   # ≥ 90% z 16 376 MB
+                {"model": "tabicl", "n_ctx": 5_000, "test_rows": 2_000, "status": "ok", "predict_s": 1.0},
+                {"model": "tabicl", "n_ctx": 25_000, "test_rows": 2_000, "status": "ok", "predict_s": 80.0}]
+        notes = setup.suspicious_rows(rows, 16_376)
+        assert len(notes) == 2
+        assert "tabpfn n_ctx=25,000" in notes[0] and "16,376" in notes[0]
+        assert notes[1].startswith("tabicl: czas na wiersz 80×")             # 80× > 10 × (25k / 5k)
+        assert setup.suspicious_rows(rows[:1], None) == []
 
     def test_report_sdpa(self, setup):
         con = setup.Console()
@@ -355,9 +380,11 @@ def test_main_fake_benchmark_writes_json(setup, prepared_paths, clean_env, capsy
     clean_env.setattr(setup, "download_tabpfn", lambda *a, **k: pytest.fail("bez pobierania"))
     rc = setup.main(["--device", "cpu", "--contexts", "100,300", "--test-rows", "60", "--skip-download"])
     out = capsys.readouterr().out
-    assert rc == 0, out
-    path = Path(config.RUNS_DIR) / "analyses" / "tfm_setup" / "benchmark.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
+    assert rc == 0, out                                               # atrapa (hak testowy): kod 0
+    folder = Path(config.RUNS_DIR) / "analyses" / "tfm_setup"
+    assert not (folder / "benchmark.json").exists()                  # test mechaniki NIE trafia do benchmark.json
+    data = json.loads((folder / "benchmark_mechanics.json").read_text(encoding="utf-8"))
+    assert "atrapa" in data["mechanics_only"] and "TEST MECHANIKI" in out
     assert data["kind"] == "tfm_setup_benchmark" and data["version"] == 1 and data["fake"] is True
     assert data["device"] == "cpu" and data["contexts"] == [100, 300]
     assert [(r["model"], r["n_ctx"], r["status"]) for r in data["results"]] == [
@@ -379,7 +406,8 @@ def test_main_cpu_limit_skips_large_contexts(setup, prepared_paths, clean_env, c
     rc = setup.main(["--models", "tabpfn", "--device", "cpu", "--contexts", "100,300", "--test-rows", "40",
                      "--skip-download"])
     assert rc == 0, capsys.readouterr().out
-    data = json.loads((Path(config.RUNS_DIR) / "analyses" / "tfm_setup" / "benchmark.json").read_text(encoding="utf-8"))
+    path = Path(config.RUNS_DIR) / "analyses" / "tfm_setup" / "benchmark_mechanics.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
     assert [(r["n_ctx"], r["status"]) for r in data["results"]] == [(100, "ok"), (300, "skipped")]
     assert "TFM_CPU_MAX_CONTEXT" in data["results"][1]["detail"]
 
@@ -415,6 +443,45 @@ def test_main_downloads_when_weights_missing_and_skips_redirected(setup, prepare
     out = capsys.readouterr().out
     assert calls == ["tabpfn v3.5"] and "aktywne przekierowanie SOR_AI_TABICL_MODEL_PATH" in out
     assert rc == 0, out
+
+
+def test_main_gpu_benchmark_is_canonical_and_cpu_run_keeps_it(setup, prepared_paths, clean_env, capsys):
+    """
+    GPU + prawdziwe wagi → benchmark.json (kod 0); późniejszy test mechaniki `--device cpu` → osobny plik,
+    pomiar GPU NIE nadpisany; szczyt VRAM blisko pojemności karty → ostrzeżenie (Sysmem Fallback).
+    """
+    from src.utils import config
+
+    _fake_environment(setup, clean_env, info=TORCH_CUDA)
+    clean_env.setattr(setup, "offline_check", lambda con, models, **k: {
+        m: {"present": True, "path": f"/cache/{m}.bin", "sha256": "ab" * 32, "override": None, "label": m}
+        for m in models})
+    clean_env.setattr(setup, "sdpa_check", lambda device="cuda", seq_len=None: {"fused_ok": True, "seq_len": 1,
+                                                                                 "kernels": {}})
+    devices: list[str] = []
+
+    def bench(con, models, contexts, test_rows, n_estimators, **kwargs):
+        device = "cpu" if os.environ.get("SOR_AI_DEVICE_TABPFN") == "cpu" else "cuda"
+        devices.append(device)
+        rows = [{"model": m, "n_ctx": c, "n_estimators": n_estimators[m], "test_rows": test_rows, "status": "ok",
+                 "fit_s": 1.0, "predict_s": 2.0 * c / 5_000, "rows_per_s": test_rows / (2.0 * c / 5_000),
+                 "peak_vram_mb": 15_800.0 if c == 50_000 else 4_000.0, "device": device}
+                for m in models for c in contexts]
+        return rows, {"n_features": 271, "site_val_rows": 16_633}
+
+    clean_env.setattr(setup, "run_benchmark", bench)
+    assert setup.main(["--skip-download"]) == 0, capsys.readouterr().out
+    out = capsys.readouterr().out
+    folder = Path(config.RUNS_DIR) / "analyses" / "tfm_setup"
+    canonical = (folder / "benchmark.json").read_text(encoding="utf-8")
+    data = json.loads(canonical)
+    assert data["device"] == "cuda" and data["mechanics_only"] is None and "Wynik: OK" in out
+    assert "Prefer No Sysmem Fallback" in out and "szczyt 15,800 MB" in out
+    assert setup.main(["--skip-download", "--device", "cpu", "--contexts", "500,1000"]) == 0     # CUDA jest
+    out = capsys.readouterr().out
+    assert devices == ["cuda", "cpu"] and "NIE został nadpisany" in out
+    assert (folder / "benchmark.json").read_text(encoding="utf-8") == canonical
+    assert json.loads((folder / "benchmark_mechanics.json").read_text(encoding="utf-8"))["device"] == "cpu"
 
 
 def test_main_cpu_only_torch_fails_with_install_commands(setup, prepared_paths, clean_env, capsys):
@@ -461,9 +528,12 @@ def test_main_real_libraries_tiny_checkpoints_on_cpu(setup, prepared_paths, clea
     rc = setup.main(["--device", "cpu", "--contexts", "150", "--test-rows", "40", "--n-estimators", "1",
                      "--n-jobs", "2"])
     out = capsys.readouterr().out
-    assert rc == 0, out
+    assert rc == 1, out                                               # bez CUDA: tylko test mechaniki
+    assert "tylko test mechaniki" in out and "NIE są gotowe do treningu" in out
     assert "PRZEKIEROWANIE" in out and "aktywne przekierowanie" in out
-    data = json.loads((Path(config.RUNS_DIR) / "analyses" / "tfm_setup" / "benchmark.json").read_text(encoding="utf-8"))
+    folder = Path(config.RUNS_DIR) / "analyses" / "tfm_setup"
+    assert not (folder / "benchmark.json").exists()
+    data = json.loads((folder / "benchmark_mechanics.json").read_text(encoding="utf-8"))
     assert [(r["model"], r["status"], r["device"]) for r in data["results"]] == [("tabpfn", "ok", "cpu"),
                                                                                 ("tabicl", "ok", "cpu")]
     assert data["fake"] is False and data["weights"]["tabpfn"]["sha256"]
