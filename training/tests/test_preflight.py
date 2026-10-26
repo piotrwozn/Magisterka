@@ -31,7 +31,9 @@ from src.pipeline.preflight import (
     check_power,
     check_python,
     check_resources,
+    check_tfm,
     run_preflight,
+    tfm_weights_status,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -319,6 +321,205 @@ def test_encoding_check_records_facts():
 
 
 # ─────────────────────────────────────────
+# Modele fundamentalne (TFM)
+# ─────────────────────────────────────────
+TORCH_CUDA = {"installed": True, "version": "2.14.1+cu130", "cuda_build": "13.0", "cuda_available": True,
+              "device_name": "NVIDIA GeForce RTX 4080 SUPER", "total_vram_mb": 16376, "free_vram_mb": 15000,
+              "error": None}
+TORCH_CPU_WHEEL = {**TORCH_CUDA, "version": "2.14.1+cpu", "cuda_build": None, "cuda_available": False,
+                   "device_name": None, "total_vram_mb": None, "free_vram_mb": None}
+TORCH_MISSING = {**TORCH_CPU_WHEEL, "installed": False, "version": None, "error": "torch nie jest zainstalowany"}
+
+
+class TestTfm:
+    @staticmethod
+    def run(models=("tabpfn", "tabicl"), profile="standard", *, info=TORCH_CUDA, probe=lambda lib: (True, "torch ok"),
+            preference=_no_preference, versions=None, weights=None, fake=False, context=None, disk=None,
+            tune=True) -> tuple[PreflightReport, dict]:
+        report = PreflightReport()
+        report.facts["devices"] = {"xgboost": "auto", "catboost": "auto"}
+        versions = {"tabpfn": "9.2.0", "tabicl": "2.2.0"} if versions is None else versions
+        present = {"present": True, "path": "/cache/w.safetensors", "cache_dir": "/cache", "size_mb": 835.0,
+                   "label": "wagi", "override": None}
+        devices = check_tfm(
+            report, list(models), profile, tune=tune, torch_info=lambda: dict(info), probe=probe,
+            preference=preference, version_of=lambda name: versions.get(name),
+            weights=weights or (lambda model: dict(present)), disk_free=disk or (lambda path: 100.0),
+            fake=fake, planned_context=context or (lambda model, prof, tune: 1_000 if prof == "smoke" else 50_000))
+        return report, devices
+
+    def test_classical_models_skip_check(self):
+        report = PreflightReport()
+        assert check_tfm(report, ["lightgbm", "xgboost"], "standard", torch_info=lambda: pytest.fail("bez torch")) \
+            == {}
+        assert report.checks == [] and "tfm" not in report.facts
+
+    def test_all_good_on_gpu(self):
+        report, devices = self.run()
+        assert devices == {"tabpfn": "gpu", "tabicl": "gpu"}
+        assert report.facts["devices"] == {"xgboost": "auto", "catboost": "auto", "tabpfn": "gpu", "tabicl": "gpu"}
+        assert report.ok and not report.warnings
+        assert _statuses(report, "TFM: VRAM") == [STATUS_OK]
+        assert _statuses(report, "TFM: wagi tabpfn") == [STATUS_OK]
+        assert report.facts["tfm"]["planned_context"] == {"tabpfn": 50_000, "tabicl": 50_000}
+
+    def test_low_free_vram_warns(self):
+        report, _ = self.run(info={**TORCH_CUDA, "free_vram_mb": 6 * 1024})
+        check = next(c for c in report.checks if c.name == "TFM: VRAM")
+        assert check.status == STATUS_WARN and "6.0 GB" in check.message and "ollama" in check.advice.lower()
+        assert report.ok
+
+    @pytest.mark.parametrize("info", [TORCH_CPU_WHEEL, {**TORCH_CUDA, "cuda_available": False}])
+    def test_no_cuda_refused_unless_smoke(self, info):
+        report, devices = self.run(info=info, profile="standard")
+        assert devices == {"tabpfn": "cpu", "tabicl": "cpu"}
+        assert {c.name for c in report.hard_failures} == {"TFM: tabpfn", "TFM: tabicl"}
+        failure = report.hard_failures[0]
+        assert "50,000" in failure.message and "TFM_CPU_MAX_CONTEXT" in failure.message
+        assert "cu130" in failure.advice and "cu128" in failure.advice and "--profile smoke" in failure.advice
+        report, devices = self.run(info=info, profile="smoke")
+        assert devices == {"tabpfn": "cpu", "tabicl": "cpu"} and report.ok
+        assert _statuses(report, "TFM: tabpfn") == [STATUS_WARN]
+
+    def test_cpu_only_wheel_message(self):
+        report, _ = self.run(info=TORCH_CPU_WHEEL, profile="smoke")
+        torch_check = next(c for c in report.checks if c.name == "TFM: torch")
+        assert "BEZ CUDA" in torch_check.message and "download.pytorch.org/whl/cu130" in torch_check.advice
+
+    def test_smoke_context_above_cpu_limit_refused(self):
+        report, _ = self.run(info=TORCH_CPU_WHEEL, profile="smoke", context=lambda m, p, t: 6_000)
+        assert len(report.hard_failures) == 2
+
+    def test_failed_torch_probe_counts_as_no_cuda(self):
+        report, devices = self.run(probe=lambda lib: (False, "CUDA error: out of memory"))
+        assert devices == {"tabpfn": "cpu", "tabicl": "cpu"} and not report.ok
+        assert "out of memory" in report.hard_failures[0].message
+
+    def test_no_probe_uses_cuda_available(self):
+        report, devices = self.run(probe=None)
+        assert devices == {"tabpfn": "gpu", "tabicl": "gpu"} and report.ok
+
+    def test_torch_missing_is_one_fatal_entry(self):
+        report, devices = self.run(info=TORCH_MISSING, profile="smoke",
+                                   versions={"tabpfn": "9.2.0"}, weights=lambda m: pytest.fail("bez torch"))
+        assert [c.name for c in report.hard_failures] == ["TFM: torch"]
+        assert "requirements-tfm.txt" in report.hard_failures[0].advice
+        assert devices == {"tabpfn": "cpu", "tabicl": "cpu"}
+
+    def test_forced_cpu_and_forced_gpu(self):
+        forced_cpu = lambda lib: ("cpu", f"SOR_AI_DEVICE_{lib.upper()}")  # noqa: E731
+        report, devices = self.run(preference=forced_cpu, profile="standard")
+        assert devices == {"tabpfn": "cpu", "tabicl": "cpu"} and len(report.hard_failures) == 2
+        assert "CPU wymuszone" in report.hard_failures[0].message
+        report, _ = self.run(preference=forced_cpu, profile="smoke")
+        assert report.ok
+        forced_gpu = lambda lib: ("gpu", "SOR_AI_DEVICE")  # noqa: E731
+        report, _ = self.run(info=TORCH_CPU_WHEEL, preference=forced_gpu, profile="smoke")
+        assert len(report.hard_failures) == 2 and "SOR_AI_DEVICE=gpu" in report.hard_failures[0].message
+
+    def test_invalid_device_variable_is_fatal(self):
+        def preference(lib):
+            raise ValueError("SOR_AI_DEVICE_TABPFN='tak' — dozwolone wartości: auto | cpu | gpu")
+
+        report, devices = self.run(models=("tabpfn",), preference=preference)
+        assert devices == {"tabpfn": "cpu"} and [c.name for c in report.hard_failures] == ["TFM: tabpfn"]
+
+    @pytest.mark.parametrize("versions, fragment", [({"tabpfn": "9.1.0", "tabicl": "2.2.0"}, "9.1.0 < 9.2.0"),
+                                                    ({"tabicl": "2.2.0"}, "nie jest zainstalowany")])
+    def test_library_versions(self, versions, fragment):
+        report, _ = self.run(versions=versions, weights=lambda m: {"present": True, "label": m, "override": None})
+        assert [c.name for c in report.hard_failures] == ["TFM: pakiet tabpfn"]
+        assert fragment in report.hard_failures[0].message
+
+    def test_missing_weights_point_to_setup_script_and_disk(self):
+        missing = {"present": False, "path": "/c/tabpfn-v3.5.safetensors", "cache_dir": "/c", "label": "TabPFN v3.5",
+                   "override": None}
+        report, _ = self.run(models=("tabpfn",), weights=lambda m: dict(missing), disk=lambda path: 1.0)
+        failure = next(c for c in report.checks if c.name == "TFM: wagi tabpfn")
+        assert failure.status == STATUS_FAIL and "sprawdzone bez sieci" in failure.message
+        assert "13_tfm_setup.py" in failure.advice and "TABPFN_TOKEN" in failure.advice
+        assert _statuses(report, "TFM: dysk") == [STATUS_WARN]
+
+    def test_weights_override_warns_or_fails(self):
+        override = {"present": True, "path": "/t/x.ckpt", "label": "x", "override": "SOR_AI_TABICL_MODEL_PATH=/t/x.ckpt"}
+        report, _ = self.run(models=("tabicl",), weights=lambda m: dict(override))
+        assert _statuses(report, "TFM: wagi tabicl") == [STATUS_WARN] and report.ok
+        report, _ = self.run(models=("tabicl",), weights=lambda m: {**override, "present": False})
+        assert _statuses(report, "TFM: wagi tabicl") == [STATUS_FAIL]
+
+    def test_weights_import_error_is_fatal_with_install_advice(self):
+        def broken(model):
+            raise ImportError("No module named 'tabpfn'")
+
+        report, _ = self.run(models=("tabpfn",), weights=broken)
+        failure = next(c for c in report.checks if c.name == "TFM: wagi tabpfn")
+        assert failure.status == STATUS_FAIL and "requirements-tfm.txt" in failure.advice
+
+    def test_fake_mode_skips_libraries_and_weights(self):
+        report, devices = self.run(info=TORCH_MISSING, profile="smoke", fake=True, versions={},
+                                   weights=lambda m: pytest.fail("atrapa — bez wag"))
+        assert devices == {"tabpfn": "cpu", "tabicl": "cpu"} and report.ok
+        assert _statuses(report, "TFM: hak testowy") == [STATUS_WARN]
+
+    def test_tfm_weights_status_override_and_cache(self, monkeypatch, tmp_path):
+        from src.models import tabicl_model, tabpfn_model
+        from src.models.tfm_base import TFMWeightsError
+
+        for var in ("SOR_AI_TFM_FAKE", "SOR_AI_TABPFN_MODEL_PATH", "SOR_AI_TABICL_MODEL_PATH"):
+            monkeypatch.delenv(var, raising=False)
+        weights = tmp_path / "tabpfn-v3.5-test.safetensors"
+        weights.write_bytes(b"x" * 2048)
+        monkeypatch.setenv("SOR_AI_TABPFN_MODEL_PATH", str(weights))
+        status = tfm_weights_status("tabpfn")
+        assert status["present"] and status["override"].startswith("SOR_AI_TABPFN_MODEL_PATH=")
+        monkeypatch.setenv("SOR_AI_TABPFN_MODEL_PATH", str(tmp_path / "brak.safetensors"))
+        assert not tfm_weights_status("tabpfn")["present"]
+        monkeypatch.delenv("SOR_AI_TABPFN_MODEL_PATH")
+        seen: list[str] = []
+        monkeypatch.setattr(tabpfn_model, "default_weights_path",
+                            lambda version: seen.append(version) or tmp_path / "cache" / f"tabpfn-{version}.safetensors")
+        status = tfm_weights_status("tabpfn", {"model_version": "v3.5-fast"})
+        assert seen == ["v3.5-fast"] and not status["present"] and status["cache_dir"] == str(tmp_path / "cache")
+        (tmp_path / "cache").mkdir()
+        (tmp_path / "cache" / "tabpfn-v3.5.safetensors").write_bytes(b"x" * 4096)
+        assert tfm_weights_status("tabpfn")["present"]
+
+        def no_checkpoint(name):
+            raise TFMWeightsError(f"brak {name}")
+
+        monkeypatch.setattr(tabicl_model, "cached_checkpoint", no_checkpoint)
+        assert not tfm_weights_status("tabicl")["present"]
+        ckpt = tmp_path / "tabicl.ckpt"
+        ckpt.write_bytes(b"x" * 100)
+        monkeypatch.setattr(tabicl_model, "cached_checkpoint", lambda name: ckpt)
+        assert tfm_weights_status("tabicl")["path"] == str(ckpt)
+        monkeypatch.setenv("SOR_AI_TFM_FAKE", "1")
+        assert tfm_weights_status("tabicl")["present"]
+        with pytest.raises(ValueError):
+            tfm_weights_status("lightgbm")
+
+
+def test_run_preflight_with_tfm_models(prepared_paths, fake_hardware, monkeypatch, tmp_path):
+    from src.utils import hardware
+
+    monkeypatch.setattr(hardware, "torch_info", lambda: dict(TORCH_CUDA))
+    monkeypatch.setattr(preflight, "tfm_weights_status",
+                        lambda model, params=None: {"present": True, "path": f"/c/{model}", "label": model,
+                                                    "override": None})
+    monkeypatch.setattr(preflight, "_dist_version",
+                        lambda name: {"tabpfn": "9.2.0", "tabicl": "2.2.0"}.get(name) or "1.0")
+    monkeypatch.delenv("SOR_AI_TFM_FAKE", raising=False)
+    report = run_preflight(probe_gpus=True, out_dir=tmp_path / "pf", models=["lightgbm", "tabpfn", "tabicl"],
+                           profile="thorough")
+    data = json.loads((tmp_path / "pf" / "preflight.json").read_text(encoding="utf-8"))
+    assert data["facts"]["devices"] == {"xgboost": "gpu", "catboost": "gpu", "tabpfn": "gpu", "tabicl": "gpu"}
+    assert data["facts"]["tfm"]["profile"] == "thorough" and data["facts"]["models"][-1] == "tabicl"
+    assert {"TFM: torch", "TFM: tabpfn", "TFM: VRAM", "TFM: wagi tabicl"} <= {c["name"] for c in data["checks"]}
+    assert data["facts"]["tfm"]["planned_context"]["tabpfn"] == 100_000          # kandydaci profilu thorough
+    assert report.facts["devices"]["tabpfn"] == "gpu"
+
+
+# ─────────────────────────────────────────
 # Całość + skrypt
 # ─────────────────────────────────────────
 @pytest.fixture
@@ -351,6 +552,22 @@ def test_run_preflight_without_gpu_probe(prepared_paths, fake_hardware, monkeypa
     monkeypatch.setattr(hardware, "probe_gpu", lambda lib: pytest.fail("próba GPU wyłączona"))
     report = run_preflight(probe_gpus=False)
     assert report.facts["devices"] == {"xgboost": "auto", "catboost": "auto"}
+    assert "tfm" not in report.facts                     # bez TFM na liście — kontrola TFM nie rusza
+
+
+def test_check_env_tfm_fake_subprocess_without_traceback(tmp_path):
+    """Prawdziwy 00_check_env.py z --models tfm (atrapa TFM): wpisy TFM, bez tracebacku — w obu venv."""
+    env = {**os.environ, "SOR_AI_ESI_DATA_DIR": str(tmp_path / "esi"), "SOR_AI_RUNS_DIR": str(tmp_path / "runs"),
+           "SOR_AI_LOGS_DIR": str(tmp_path / "logs"), "PYTHONUTF8": "1", "SOR_AI_TFM_FAKE": "1"}
+    result = subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts" / "00_check_env.py"), "--no-gpu-probe",
+                             "--models", "tfm", "--profile", "smoke", "--out-dir", str(tmp_path / "pf")],
+                            cwd=PROJECT_ROOT, env=env, capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=300)
+    output = result.stdout + result.stderr
+    assert "Traceback" not in output
+    assert "TFM: hak testowy" in output and "TFM: tabpfn" in output
+    facts = json.loads((tmp_path / "pf" / "preflight.json").read_text(encoding="utf-8"))["facts"]
+    assert facts["devices"]["tabpfn"] in ("cpu", "gpu") and facts["tfm"]["fake"] is True
 
 
 def _load_check_env():
@@ -364,7 +581,7 @@ def _load_check_env():
 def test_check_env_exit_code(monkeypatch, tmp_path, capsys, fatal, code):
     module = _load_check_env()
 
-    def fake_run_preflight(probe_gpus=True, out_dir=None):
+    def fake_run_preflight(probe_gpus=True, out_dir=None, **kwargs):
         report = PreflightReport()
         report.add("RAM", STATUS_FAIL if fatal else STATUS_OK, "test")
         report.facts.update({"gpu_ok": True, "physical_cores": 24, "ram_gb": 31.8,
@@ -377,6 +594,45 @@ def test_check_env_exit_code(monkeypatch, tmp_path, capsys, fatal, code):
     out = capsys.readouterr().out
     assert "2 tor" in out and "[xgboost]" in out
     assert (tmp_path / "preflight.json").exists()
+
+
+def test_check_env_passes_models_profile_and_tune(monkeypatch, tmp_path, capsys):
+    """--models / --profile / --no-tune trafiają do run_preflight; prognoza torów z tej listy modeli."""
+    module = _load_check_env()
+    seen: dict = {}
+
+    def fake_run_preflight(probe_gpus=True, out_dir=None, **kwargs):
+        seen.update(kwargs, probe_gpus=probe_gpus)
+        report = PreflightReport()
+        report.add("RAM", STATUS_OK, "test")
+        report.facts.update({"gpu_ok": False, "physical_cores": 24, "ram_gb": 64.0,
+                             "devices": {"xgboost": "cpu", "catboost": "cpu", "tabpfn": "gpu", "tabicl": "gpu"},
+                             "tfm": {"models": ["tabpfn", "tabicl"]}})
+        return report
+
+    monkeypatch.setattr(module, "run_preflight", fake_run_preflight)
+    assert module.main(["--out-dir", str(tmp_path), "--models", "lgbm,tfm", "--profile", "smoke", "--no-tune"]) == 0
+    assert seen == {"models": ["lightgbm", "tabpfn", "tabicl"], "profile": "smoke", "tune": False, "probe_gpus": True}
+    out = capsys.readouterr().out
+    assert "2 tor" in out and "[tabpfn, tabicl]" in out
+    assert "--models lgbm,tfm" in out and "13_tfm_setup.py" in out
+    with pytest.raises(SystemExit):
+        module.main(["--out-dir", str(tmp_path), "--models", "svm"])
+
+
+def test_check_env_default_models_are_classical(monkeypatch, tmp_path):
+    module = _load_check_env()
+    seen: dict = {}
+
+    def fake_run_preflight(probe_gpus=True, out_dir=None, **kwargs):
+        seen.update(kwargs)
+        report = PreflightReport()
+        report.facts.update({"devices": {}, "physical_cores": 4, "ram_gb": 16.0})
+        return report
+
+    monkeypatch.setattr(module, "run_preflight", fake_run_preflight)
+    assert module.main(["--out-dir", str(tmp_path), "--no-gpu-probe"]) == 0
+    assert seen["models"] == ["logreg", "lightgbm", "xgboost", "catboost", "random_forest", "ebm"]
 
 
 def _check_env_subprocess(tmp_path, blocked: list[str]) -> subprocess.CompletedProcess:

@@ -7,6 +7,9 @@ Wszystkie modele dziedziczą po `BaseTriageModel`, co zapewnia spójny interfejs
     - fit(X_train, y_train, X_val, y_val, ...)        — trening z pełnym trackingiem;
       samo dopasowanie estymatora deleguje do fit_estimator()
     - predict(X) / predict_proba(X)                    — zawsze (n, 5), float64, kolumny ESI 1–5
+    - predict_proba_many([X1, X2, …])                  — kilka ramek naraz (domyślnie każda osobno;
+                                                         modele TFM liczą wszystkie ramki w jednym
+                                                         przebiegu każdego worka kontekstu)
     - save(path) / load(path), `src.models.load_model(path)`
 
 fit_estimator() wspólnie dla wszystkich modeli:
@@ -28,6 +31,7 @@ import abc
 import gc
 import os
 import time
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -157,6 +161,7 @@ class BaseTriageModel(abc.ABC):
     display_name: str = "model"            # w logach: "Trenowanie <display_name> …"
     supports_early_stopping: bool = False   # czy fit_estimator używa (X_es, y_es)
     iteration_param: str | None = None      # nazwa parametru limitu iteracji (do komunikatów)
+    pretrained: bool = False                # model fundamentalny (TFM: TabPFN, TabICL) — bez tuningu Optuną
 
     def __init__(self, params: dict[str, Any] | None = None):
         self.params = dict(params or {})
@@ -492,6 +497,15 @@ class BaseTriageModel(abc.ABC):
             raise RuntimeError("Model nie wytrenowany.")
         return full_class_proba(self._predict_proba_raw(self._align_features(X)), self.classes_)
 
+    def predict_proba_many(self, frames: Sequence[pd.DataFrame]) -> list[np.ndarray]:
+        """
+        `predict_proba` dla kilku ramek (np. VAL i TEST) — lista wyników w kolejności ramek.
+
+        Domyślnie każda ramka osobno (wyniki identyczne jak `predict_proba`); modele TFM nadpisują to,
+        by każdy worek kontekstu dopasować raz i przeliczyć wszystkie ramki w jednym przebiegu.
+        """
+        return [self.predict_proba(frame) for frame in frames]
+
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         """Klasa 0–4 o największym prawdopodobieństwie (spójna z predict_proba)."""
         return self.predict_proba(X).argmax(axis=1)
@@ -529,6 +543,14 @@ class BaseTriageModel(abc.ABC):
         return df.sort_values("importance", ascending=False).reset_index(drop=True)
 
     # ──────── Persystencja ────────
+    def _artifact_extra(self) -> dict[str, Any]:
+        """Dodatkowe klucze artefaktu podklasy (dopisywane do słownika `save`); baza: brak."""
+        return {}
+
+    def _restore_extra(self, artifact: dict[str, Any]) -> None:
+        """Odtwarza stan podklasy z artefaktu (koniec `_from_artifact`; `__init__` podklasy nie jest wołane)."""
+        return None
+
     def save(self, path: Path | str | None = None) -> Path:
         """
         Zapisuje model na dysk (joblib, kompresja zlib; zapis atomowy przez plik .tmp
@@ -573,6 +595,7 @@ class BaseTriageModel(abc.ABC):
             "hardware": self.hardware,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
+        artifact.update(self._artifact_extra())
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
             joblib.dump(artifact, tmp, compress=JOBLIB_COMPRESS)
@@ -638,6 +661,7 @@ class BaseTriageModel(abc.ABC):
         instance.iteration_cap = artifact.get("iteration_cap")
         instance.hardware = artifact.get("hardware")
         instance.is_fitted = True
+        instance._restore_extra(artifact)
         return instance
 
     # ──────── Repr ────────

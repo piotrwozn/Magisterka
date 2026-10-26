@@ -39,7 +39,9 @@ Kroki:
        Sekcja bez danych (brak `admitted`, atrybutów pacjentów, wyników analiz) jest pomijana z notą.
     4. Zapis: runs/final_report__<zestaw>__<czas>/ (albo --out): report.md (po polsku, tabele do
        pracy), metrics.json, recipe.json, tables/*.csv, figures/*.png oraz
-       backend_ensemble_weights.json (format backend/app/models/ensemble.py, z parametrami reguły).
+       backend_ensemble_weights.json (format backend/app/models/ensemble.py, z parametrami reguły);
+       receptura z modelem fundamentalnym (TFM) → także backend_ensemble_weights_no_tfm.json (ta sama
+       receptura dopasowana na VAL bez TFM — backend domyślnie nie serwuje TFM).
 
 UWAGA: zbiór TESTOWY oceniasz RAZ, dla ostatecznej receptury. Kolejne uruchomienia z innymi
 recepturami i wybór „najlepszej” na teście zawyżają wyniki (test przestaje być niezależny).
@@ -50,6 +52,8 @@ Użycie:
     python scripts/08_final_report.py --feature-set triage --tag standard      # domyślnie: optimize, target T=15%
     python scripts/08_final_report.py --runs RUN_A RUN_B RUN_C --weights optimize --method geometric
     python scripts/08_final_report.py --feature-set triage --tag smoke --include-samples --bootstrap 300
+    python scripts/08_final_report.py --feature-set triage --tag thorough --models lightgbm,tabpfn --include-pretrained
+                                   # z modelem fundamentalnym (polecenie: recommendation.json kroku 15)
 """
 
 from __future__ import annotations
@@ -195,6 +199,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--include-samples", action="store_true", help="Uwzględnij runy na próbkach (tylko test!)")
     parser.add_argument("--include-untuned", action="store_true", help="Uwzględnij runy bez tuningu")
     parser.add_argument("--include-weighted", action="store_true", help="Uwzględnij runy z wagami klas")
+    parser.add_argument("--include-pretrained", action="store_true",
+                        help="Uwzględnij runy modeli fundamentalnych (TFM: tabpfn, tabicl) przy wyborze najnowszych "
+                             "runów (domyślnie pomijane; --models z nazwą TFM też je uwzględnia)")
     parser.add_argument("--weights", default="optimize",
                         help="JSON {model: waga}, ścieżka do pliku JSON (także backend_ensemble_weights.json — "
                              "wtedy jego method / rule / temperature są przejmowane), 'optimize' (min log loss "
@@ -252,7 +259,8 @@ def resolve_runs(args: argparse.Namespace) -> list[Run]:
     feature_set = resolve_feature_set(args.feature_set or "triage")
     models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else None
     runs = latest_runs(feature_set, models=models, include_samples=args.include_samples, tag=args.tag,
-                       include_weighted=args.include_weighted, require_tuned=not args.include_untuned)
+                       include_weighted=args.include_weighted, require_tuned=not args.include_untuned,
+                       include_pretrained=args.include_pretrained)
     # Refit analizy z modelem (09_seed_refits.py --save-models) bywa „najnowszym” runem — raport
     # dotyczy runu głównego, z którego refit powstał (refit jawnie: --runs)
     for i, run in enumerate(runs):
@@ -512,6 +520,67 @@ def recipe_hash(run_names: list[str], weights: dict[str, float], opts: RecipeOpt
         payload["decision"] = {"target": round(dopts.target, 6), "guarantee": dopts.guarantee,
                                "safety_net": dopts.safety_net, "population": dopts.population}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def is_pretrained_run(run: Run) -> bool:
+    """Run modelu fundamentalnego (TFM): `pretrained: true` w run_info.json albo model z config.TFM_MODELS."""
+    return bool(run.info.get("pretrained")) or run.model in config.TFM_MODELS
+
+
+def no_tfm_recipe(
+    runs: list[Run], weights: dict[str, float], weights_spec: str, val: SplitData, method: str,
+    temperature_mode: str, dopts: DecisionOptions,
+) -> dict[str, Any] | None:
+    """
+    Receptura BEZ modeli fundamentalnych — dla backendu, gdy TFM nie jest serwowany (domyślnie). None, gdy
+    receptura nie ma TFM z wagą > 0. Ten sam tryb wag (optimize → ponownie na VAL bez TFM; equal → równe;
+    jawne → wagi TFM usunięte, renormalizacja), ta sama metoda, temperatura (gdy 'fit') i reguła główna
+    dopasowane na VAL od nowa (te same ustawienia reguł). Zwraca {"backend" | None, "models", "weights",
+    "temperature", "main_spec", "weights_mode", "dropped", "note"}.
+    """
+    import dataclasses
+
+    by_name = {r.model: r for r in runs}
+    tfm = [n for n in weights if n in by_name and is_pretrained_run(by_name[n])]
+    dropped = [n for n in tfm if weights.get(n, 0.0) > 0]
+    if not dropped:
+        return None
+    classical = [n for n in weights if n not in tfm]
+    out: dict[str, Any] = {"backend": None, "models": classical, "dropped": dropped, "weights": None,
+                           "temperature": None, "main_spec": None, "weights_mode": None, "note": None}
+    if not classical:
+        out["note"] = "receptura składa się wyłącznie z modeli fundamentalnych — brak wariantu bez TFM"
+        return out
+    spec = weights_spec.strip()
+    probas = {n: val.probas[n] for n in classical}
+    if spec == "optimize":
+        raw = optimize_weights(probas, val.y, method=method) if len(classical) > 1 else {classical[0]: 1.0}
+        mode = "optimize (minimalny log loss na VAL, bez TFM)"
+    elif spec == "equal":
+        raw = dict.fromkeys(classical, 1.0)
+        mode = "równe (bez TFM)"
+    else:
+        raw = {n: weights[n] for n in classical}
+        mode = "jak w recepturze, bez TFM (renormalizacja)"
+    total = float(sum(raw.values()))
+    if total <= 0:
+        out["note"] = "modele klasyczne mają w recepturze wagę 0 — brak wariantu bez TFM"
+        return out
+    w = {n: float(raw.get(n, 0.0)) / total for n in classical}
+    p = blend(probas, w, method)
+    temperature = fit_temperature(p, val.y) if temperature_mode == "fit" else None
+    if temperature is not None:
+        p = apply_temperature(p, temperature)
+    try:
+        fitted = rs.fit_rules(val.y, p, val.vc, dataclasses.replace(dopts, rules=[dopts.main_rule]))
+    except ValueError as exc:
+        out["note"] = f"reguły bez TFM nie dały się dopasować na VAL ({exc})"
+        return out
+    main_spec = fitted.specs[dopts.main_rule]
+    out.update({"weights": w, "temperature": temperature, "main_spec": main_spec, "weights_mode": mode,
+                "backend": {"weights": {n: round(x, 6) for n, x in w.items() if x > 0}, "method": method,
+                            "temperature": None if temperature is None else round(temperature, 6), **main_spec}})
+    return out
 
 
 def _registry_path() -> Path:
@@ -1085,8 +1154,26 @@ def build_report(ctx: dict[str, Any], fmt: Fmt) -> str:
         "- `tables/*.csv` — tabele do arkusza / LaTeX-a (m.in. `ci_all_models.csv`, `subgroups.csv`, "
         "`tradeoff_val.csv`, `dca_*.csv`, `calibration_*.csv`, `deferral.csv`, `conformal.csv`),",
     ]
+    no_tfm = ctx.get("no_tfm")
+    if no_tfm is not None and no_tfm.get("backend") is not None:
+        lines += ["- `backend_ensemble_weights_no_tfm.json` — ta sama receptura dopasowana na VAL BEZ modeli "
+                  "fundamentalnych (skopiuj obok jako `backend/models/ensemble_weights_no_tfm.json`; backend użyje "
+                  "jej, gdy TFM nie jest serwowany — domyślnie, bez `SOR_AI_BACKEND_TFM=1`),"]
     if ctx["figures"]:
         lines += ["- `figures/`: " + ", ".join(f"`{f}`" for f in ctx["figures"]) + "."]
+    if no_tfm is not None:
+        dropped = ", ".join(no_tfm["dropped"])
+        if no_tfm.get("backend") is not None:
+            weights_text = ", ".join(f"{n} {w:.3f}" for n, w in no_tfm["weights"].items())
+            t = no_tfm["temperature"]
+            lines += ["", f"Receptura zawiera model fundamentalny ({dropped}). Backend domyślnie NIE serwuje TFM, więc "
+                      f"zapisano też wariant bez TFM, dopasowany na VAL tak samo (wagi: {no_tfm['weights_mode']} — "
+                      f"{weights_text}; T = {'—' if t is None else f'{t:.4f}'}; reguła główna "
+                      f"{no_tfm['main_spec'].get('rule')} z tymi samymi ustawieniami). Liczby TEST w tym raporcie "
+                      f"dotyczą receptury z TFM."]
+        else:
+            lines += ["", f"Receptura zawiera model fundamentalny ({dropped}); wariantu bez TFM nie zapisano: "
+                      f"{no_tfm['note']}."]
     lines += ["", "Lista kontrolna TRIPOD+AI i porównanie z literaturą: `docs/TRIPOD_AI.md`, `docs/LITERATURA.md`.",
               "", f"Wygenerowano {recipe['created_at']} (bootstrap {n_boot}×, ziarno {res_all.seed}).", ""]
     return "\n".join(lines)
@@ -1163,7 +1250,7 @@ def write_tables(table_dir: Path, ctx: dict[str, Any]) -> list[str]:
     for name, df in tables.items():
         if df is None or df.empty:
             continue
-        write_text_atomic(table_dir / name, df.to_csv(index=False))
+        write_text_atomic(table_dir / name, df.to_csv(index=False, lineterminator="\n"))
         written.append(name)
     return written
 
@@ -1460,6 +1547,9 @@ def main(argv: list[str] | None = None) -> int:
         figures += list(analysis_figures.values())
         timings["wykresy_s"] = round(time.perf_counter() - t4, 2)
 
+    no_tfm = no_tfm_recipe(runs, weights, args.weights, val, method, opts.temperature_mode, dopts)
+    if no_tfm is not None and no_tfm.get("backend") is None:
+        log.warning(f"Receptura z modelem fundamentalnym bez wariantu bez TFM: {no_tfm['note']}")
     decision_record = {
         "main_rule": main_rule, "rules": rules, "target_undertriage": dopts.target, "guarantee": dopts.guarantee,
         "guarantee_alpha": config.DECISION_GUARANTEE_ALPHA, "safety_net": dopts.safety_net,
@@ -1504,6 +1594,8 @@ def main(argv: list[str] | None = None) -> int:
         "git_commit": _git_commit(),
         "argv": sys.argv[1:] if argv is None else list(argv),
     }
+    if no_tfm is not None:
+        recipe["no_tfm"] = {k: v for k, v in no_tfm.items() if k != "backend"}
     counts = {"all": np.bincount(test.y, minlength=N_CLASSES).tolist()}
     if test.vc is not None:
         counts["vc"] = np.bincount(test.y[test.vc], minlength=N_CLASSES).tolist()
@@ -1518,7 +1610,7 @@ def main(argv: list[str] | None = None) -> int:
            "subgroups": subgroups, "attributes_source": attrs_source, "admission_subgroups": admission_subgroups,
            "discordance": discordance, "errors": errors, "dca_label": dca_label, "dca_admission": dca_admission,
            "calibration_groups": calibration_groups, "deferral": deferral, "conformal": conformal,
-           "analyses": analyses, "analysis_figures": analysis_figures}
+           "analyses": analyses, "analysis_figures": analysis_figures, "no_tfm": no_tfm}
     tables = write_tables(out_dir / "tables", ctx)
     write_text_atomic(out_dir / "report.md", build_report(ctx, Fmt(args.decimal_comma, args.alpha)))
     write_json_atomic(out_dir / "recipe.json", _jsonable(recipe))
@@ -1529,6 +1621,8 @@ def main(argv: list[str] | None = None) -> int:
         **main_spec,
     }
     write_json_atomic(out_dir / "backend_ensemble_weights.json", _jsonable(backend))
+    if no_tfm is not None and no_tfm.get("backend") is not None:
+        write_json_atomic(out_dir / "backend_ensemble_weights_no_tfm.json", _jsonable(no_tfm["backend"]))
     timings["razem_s"] = round(time.perf_counter() - t0, 2)
     analyses_summary = {k: ({"skipped": v["skipped"]} if v.get("skipped") else {"path": v.get("path")})
                         for k, v in analyses.items()}
@@ -1597,6 +1691,9 @@ def main(argv: list[str] | None = None) -> int:
     log.info(f"Raport: {out_dir / 'report.md'} (zapisany w rejestrze {_registry_path()})")
     log.info(f"Wagi i reguła dla backendu: {out_dir / 'backend_ensemble_weights.json'} "
              f"(skopiuj jako backend/models/ensemble_weights.json)")
+    if no_tfm is not None and no_tfm.get("backend") is not None:
+        log.info(f"Wariant bez TFM (backend bez serwowania TFM): {out_dir / 'backend_ensemble_weights_no_tfm.json'} "
+                 f"(skopiuj jako backend/models/ensemble_weights_no_tfm.json)")
     return 0
 
 

@@ -39,26 +39,22 @@ def base_parser(description: str, default_models: str) -> argparse.ArgumentParse
                         help="Tag runów źródłowych (najnowszy ukończony, dostrojony run każdego modelu); "
                              "domyślnie profil domyślny (standard)")
     parser.add_argument("--models", default=default_models,
-                        help="Lista po przecinku (aliasy: lr, lgbm, xgb, cb, rf) albo 'all'")
+                        help="Lista po przecinku (aliasy: lr, lgbm, xgb, cb, rf, pfn, icl), 'all' (6 modeli "
+                             "klasycznych) albo 'tfm' (TabPFN + TabICL — refity TFM tylko na jawne żądanie)")
     parser.add_argument("--force", action="store_true", help="Policz od nowa także gotowe jednostki")
     parser.add_argument("--n-jobs", type=positive_int, default=None,
                         help="Wątki CPU (SOR_AI_N_JOBS; ustawiane przed importem config)")
     return parser
 
 
-def parse_model_list(spec: str) -> list[str] | None:
-    """'all' → None (wszystkie modele z runami); inaczej lista nazw (aliasy rozwiązuje src.models)."""
-    if spec.strip().lower() in ("", "all"):
-        return None
-    from src.models import resolve_model_name
+def parse_model_list(spec: str) -> list[str]:
+    """
+    Lista modeli: 'all' (albo pusty tekst) → 6 modeli KLASYCZNYCH (modele fundamentalne TFM tylko jawnie:
+    'tfm', 'tabpfn', 'tabicl'); nazwy i aliasy rozwiązuje `src.models.resolve_model_list`.
+    """
+    from src.models import resolve_model_list
 
-    out: list[str] = []
-    for raw in spec.split(","):
-        if raw.strip():
-            name = resolve_model_name(raw.strip())
-            if name not in out:
-                out.append(name)
-    return out
+    return resolve_model_list(spec)
 
 
 __all__ = ["apply_n_jobs", "base_parser", "parse_model_list", "positive_int"]

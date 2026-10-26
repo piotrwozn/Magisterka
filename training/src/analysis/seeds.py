@@ -200,7 +200,7 @@ def run_seed_refits(
     Zwraca wynik (także `failures`: lista nieudanych jednostek).
     """
     from src.data.dataset import data_fingerprint
-    from src.models.train import REFIT_VERSION, refit_from_run
+    from src.models.train import REFIT_VERSION, refit_from_run, run_duration_s
 
     if n_seeds < 1:
         raise ValueError(f"n_seeds musi być ≥ 1, podano {n_seeds}")
@@ -238,7 +238,8 @@ def run_seed_refits(
                 **unit_metrics(run_dir)}
 
     def estimate(u: Mapping[str, Any]) -> float:
-        return 2.0 if u["source"] else float(runs[u["model"]].info.get("training_duration_s") or 0.0) * 1.2 + 5.0
+        # TFM: + czas predykcji (run_duration_s); klasyczne: training_duration_s jak dotąd
+        return 2.0 if u["source"] else run_duration_s(runs[u["model"]].info) * 1.2 + 5.0
 
     failures = execute_units(store, units, expect, compute, "seeds", force=force, estimate_s=estimate)
     models_out = summarize(store, all_units, expect)

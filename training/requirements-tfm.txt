@@ -1,0 +1,37 @@
+# ============================================================
+# SOR-AI: tabularne modele fundamentalne (TFM) — TabPFN-3.5 i TabICLv2
+# Opcjonalne: potrzebne tylko do `--model tfm` / `tabpfn` / `tabicl`, 14_small_data_curve.py,
+# 15_tfm_blend.py i 13_tfm_setup.py. Rdzeń (6 modeli klasycznych) działa bez tych pakietów.
+#
+# KOLEJNOŚĆ INSTALACJI (Windows 11, PowerShell, w tym samym venv co requirements-lock.txt):
+#   0. Instaluj DOPIERO PO zakończeniu trwającego treningu klasycznego (run_all.py) — pip podmienia pliki
+#      w venv, którego używa działający proces (na Windows: błędy zablokowanych plików / DLL).
+#   1. torch Z CUDA — z indeksu PyTorch, NIE z PyPI (koło torch z PyPI na Windows jest tylko-CPU):
+#        pip install torch --index-url https://download.pytorch.org/whl/cu130
+#      (sterownik NVIDIA >= 580; starszy sterownik: --index-url https://download.pytorch.org/whl/cu128)
+#      Sprawdzenie: python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+#   2. Ten plik, z ograniczeniami locka (żaden pakiet rdzenia nie zmieni wersji):
+#        pip install -r requirements-tfm.txt -c requirements-lock.txt
+#   3. Wagi (raz, z siecią; TabPFN-3.5: akceptacja licencji niekomercyjnej Prior Labs / TABPFN_TOKEN):
+#        python scripts/13_tfm_setup.py
+#      Potem trening działa offline.
+#
+# Uwagi:
+#   - Licencje: TabPFN-3.5 — wagi NIEKOMERCYJNE (praca magisterska: dozwolone), kod Apache-2.0;
+#     TabICL — kod BSD-3 (licencja wag: karta modelu jingang/TabICL na Hugging Face).
+#   - Linux: pip przy instalacji torch podmienia nvidia-nccl-cu13 (2.32.3 → 2.30.7), z którego korzysta też
+#     xgboost na GPU — po instalacji sprawdź `python scripts/00_check_env.py` (próba GPU xgboost).
+#   - torch nie jest tu przypięty: wersja zależy od koła CUDA z indeksu PyTorch (testowane: torch 2.14.1+cu130).
+#   - Nowe zależności przechodnie przypięte do wersji przetestowanych z tabpfn 9.2.0 / tabicl 2.2.0.
+# ============================================================
+
+tabpfn==9.2.0
+tabicl==2.2.0
+
+# --- przechodnie (nowe względem requirements-lock.txt; wersje przetestowane) ---
+huggingface-hub==2.3.0
+pydantic==2.14.1
+pydantic-settings==2.16.1
+safetensors==0.8.0
+einops==0.8.2
+skrub==0.10.1

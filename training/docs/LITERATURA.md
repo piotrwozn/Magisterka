@@ -57,6 +57,8 @@ Kolumna „pewność” mówi, skąd pochodzi liczba z literatury:
 | Conformal prediction (LAC, wersja warunkowa po klasie) | `report_sections.conformal_section`, sekcja 12.2 | Vovk i in. 2005; Angelopoulos i Bates 2021 (przegląd) |
 | Modele „glass-box” (EBM) zamiast wyjaśniania czarnej skrzynki | `05_explain.py --global` (krzywe kształtu EBM) | Rudin, *Nat Mach Intell* 2019;1:206–215 |
 | Wytyczne raportowania | `docs/TRIPOD_AI.md` | Collins i in., *BMJ* 2024;385:e078378 (TRIPOD+AI); Moons i in., *BMJ* 2025 (PROBAST+AI — do weryfikacji) |
+| Korekta Holma dla wielu porównań (eksperyment A, TFM) | `src/analysis/small_data.py` | Holm, *Scand J Stat* 1979;6:65–70 |
+| Model fundamentalny uczący się w kontekście (TabPFN) | `docs/TFM.md` | Hollmann i in., *Nature* 2025, doi:10.1038/s41586-024-08328-6 (TabPFN v2; wersja 3.5 — raport producenta, sekcja TFM niżej) |
 
 ## Wnioski do dyskusji
 
@@ -73,3 +75,65 @@ Kolumna „pewność” mówi, skąd pochodzi liczba z literatury:
    decyzyjnej trzeba dobrać na nowo na lokalnym rozkładzie ESI (TOPSOR).
 4. **Odsetków niedotriażowania nie zestawiaj z Sax 2023 ani z Hinson 2018**, bo definicje są
    inne. Porównuj kierunki: kto jest niedotriażowany (sekcje 8 i 9).
+
+## Tabularne modele fundamentalne (TFM)
+
+Do rozdziału o eksperymentach A i B ([`TFM.md`](TFM.md)). Źródła zebrano 2026-10-25. Repozytoria GitHub
+(README, kod, metadane) czytano bezpośrednio. Strony arXiv, medRxiv, HF i tabarena.ai nie dały się pobrać,
+więc wyniki prac pochodzą z abstraktów, stron wyszukiwarki i streszczeń.
+
+Oznaczenia:
+
+- **[P]** — twierdzenie producenta modelu;
+- **[S]** — znane tylko ze streszczenia lub fragmentu w wyszukiwarce; przed cytowaniem sprawdź pełny tekst;
+- **[?]** — źródło niezweryfikowane albo źródła się różnią.
+
+### Benchmarki i raporty producentów
+
+| praca / źródło | dane | wynik | ozn. | znaczenie dla nas |
+|---|---|---|---|---|
+| TabArena (arXiv 2506.16791; metadane w repozytorium autogluon/tabarena) | 51 zbiorów; tylko 2 mają ≥ 100 tys. wierszy (największy 150 tys., mediana ok. 6,5 tys.); 8 wieloklasowych | TFM w czołówce, np. Mitra‑v2 1774,6 Elo, strojony i ensemblowany LightGBM 1404,0 [S]. Post-hoc ensemble różnych rodzin poprawia wynik, ale wagi dobierane na walidacji się przeuczają [S] | [S] | ranking dotyczy głównie małych danych, nie naszej skali (446 tys. wierszy); stąd cross-fitting w eksperymencie B |
+| BeyondArena (arXiv 2606.30410) | 142 zbiory, do 1,3 mln wierszy | TFM wygrywają na małych i średnich danych IID; GBDT i strojone MLP prowadzą na danych dużych, czasowych, grupowanych i wysokowymiarowych. Rozmiar zbioru to jeden z najsilniejszych predyktorów przewagi GBDT; braki danych działają w tę samą stronę, słabiej | [S] | hipoteza: w B mały efekt albo żaden, w A możliwa przewaga TFM |
+| Raport TabPFN‑3 (Prior Labs, PDF) | klasyfikacja, 100 tys.–1 mln wierszy | przewaga nad XGBoost i CatBoost strojonymi 8 h nieistotna statystycznie; istotna tylko nad strojonym LightGBM | [P] | deklaracja, którą B sprawdza na danych SOR |
+| Raport TabPFN‑3.5 (arXiv 2609.17895) | — | strojone MLP nadal najlepsze na danych dużych, czasowych i grupowanych; TabPFN‑3.5 tylko „zmniejsza dystans” | [S][P] | ograniczenie na pełnych danych |
+| TabICLv2 (arXiv 2602.11139; README soda-inria/tabicl) | TALENT; pretrening 300–48 tys. wierszy, 2–100 kolumn | autorzy deklarują SOTA na TALENT [S][P]; README: model „może się pogarszać” znacznie powyżej 100 cech | [S][P] | u nas 271 cech i kontekst 25–50 tys., poza zakresem pretreningu; stąd kandydat `max_features=100` |
+| AutoGluon, wydania 1.4–1.6 (GitHub) | portfele modeli | portfel TFM tylko dla zbiorów ≤ 30 tys. (1.4); zyski w 1.5 „głównie do 100 tys. wierszy” | — | brak kontrolowanego dowodu dla blendu TFM ze strojonym GBDT na ≥ 100 tys. wierszy |
+| Ensemble i kalibracja TFM (arXiv 2605.18696) | TabArena | stacker LR nad TFM ma najgorszą rangę log loss; TabICLv2 najniższe ECE | — | w B wagi minimalizują log loss (bez stackera LR) |
+| Niezbalansowanie w TabPFN (arXiv 2605.21742) | — | przy rosnącym niezbalansowaniu predykcje przesuwają się w stronę klasy większościowej; pomagają progi i podpróbkowanie kontekstu | — | ESI 1 = 0,94%: kontekst `balanced` z korektą priorów, reguły decyzyjne zamiast oversamplingu |
+| Destylacja TFM do GBDT (arXiv 2605.18654) | — | działa głównie dla tabel z < 21 cechami; przy wielu cechach gorzej | [S] | przy 271 cechach destylacja nie jest drogą do szybkiego wdrożenia |
+| Przedziały ufności rankingu TabArena (substack „The Tabular Guy”) | — | przedziały pierwszej piątki się nakładają | [S] | rankingu nie traktuj jako rozstrzygającego |
+
+### Dowody kliniczne i małe dane
+
+| praca | dane | wynik | ozn. | znaczenie dla nas |
+|---|---|---|---|---|
+| Brima i Atemkeng, *Sci Rep* 2026 | MIMIC-IV-ED i eICU, 7 niezbalansowanych zadań, Macro-F1 | MIMIC-IV-ED: TabPFN v2.6 i TabICL z najlepszą średnią rangą, XGBoost tuż za nimi; eICU: najlepszy XGBoost | — | najbliższy analog SOR; nikt nie stosował TFM do triażu ESI/KTAS/MTS ani do danych Yale (luka = wkład pracy) |
+| Benchmark kliniczny TabPFN, *BMC Med Inform Decis Mak* 2026 | 12 zadań binarnych, 788–139 528 pacjentów | TabPFN lepszy od najlepszego modelu ML tylko w 16,7% zadań; różnice AUROC zwykle ±0,02; obliczenia ok. 5,5× dłuższe | — | w klinice raczej parytet niż przewaga |
+| Anemia u dzieci, 16 krajów (arXiv 2605.26589) | — | poniżej ok. 200 próbek na kraj TabPFN v2.6 lepiej rozróżniał klasy niż LR, XGBoost i LightGBM; na pełnych danych różnice ≤ 0,05 AUC | [S] | scenariusz A |
+| MCI → AD (arXiv 2604.27195) | n = 530 | przy N = 50 TabPFN najlepszy (AUC 0,810); na pełnych danych zbliżony do strojonego XGBoost (0,879 vs 0,887) | — | scenariusz A |
+| Ryzyko chirurgii ratunkowej, NSQIP (*Surgery* 2026; PubMed 41666517) | n = 7281 | TFM z najwyższym AUROC (powikłania 0,82, zgon 0,89); autorzy proponują TFM jako „portable standard” dla modeli lokalnych | — | scenariusz A (lokalny model) |
+| Omdlenia na SOR (PMC12331830) | n = 257 | gradient boosting AUC 0,78; TabPFN istotnie gorszy (p < 0,01) | — | kontrprzykład: mało danych nie gwarantuje wygranej TFM |
+| TL-ANDI (arXiv 2607.04809) | — | dane innego ośrodka w kontekście TFM mogą dać transfer negatywny przy przesunięciu rozkładu | — | warianty `+foreign` w eksperymencie A |
+| TFM pod przesunięciem rozkładu (arXiv 2607.26000) | TableShift | wszystkie 9 badanych TFM traciło (luka 0,003–0,060) | — | scenariusz `site_local` |
+| Kalibracja w zadaniach okołooperacyjnych (SAGE, doi:10.1177/20552076261443585) | — | kalibracja TabPFN wyraźnie spadała przy częstości wyniku < 20% | — | ESI 1 (0,9%) i ESI 5 (5%): kryterium ECE ESI 1 w bramce B |
+
+### Licencje i narzędzia
+
+| źródło | treść | ozn. |
+|---|---|---|
+| README PriorLabs/TabPFN (odczytane z repozytorium) | wagi TabPFN‑2.5/2.6/3/3.5 na licencjach niekomercyjnych, kod Apache-2.0; po pobraniu wag działa offline, dane nie są wysyłane do Prior Labs; wdrożenie komercyjne wymaga licencji Prior Labs | — |
+| soda-inria/tabicl, plik LICENSE | kod BSD-3; licencji wag (checkpoint `jingang/TabICL` na HF) nie potwierdzono | [?] |
+| Status przejęcia Prior Labs przez SAP | tech.eu: transakcja zamknięta; IT Brief: dopiero planowana | [?] |
+
+### Wnioski do dyskusji (TFM)
+
+1. **Na pełnych danych spodziewamy się małego efektu.** Rankingi, w których TFM wygrywają, mierzą głównie
+   małe zbiory (TabArena), a na dużych prowadzą GBDT (BeyondArena [S]). Jedyny realny mechanizm zysku
+   w B to dywersyfikacja błędów w blendzie (nasz wniosek). Wynik negatywny eksperymentu B jest zgodny
+   z literaturą i warto go raportować.
+2. **Przy małych danych przewaga TFM jest prawdopodobna, ale niepewna.** Część prac ją pokazuje
+   (anemia [S], MCI → AD, NSQIP), część nie (omdlenia na SOR). Eksperyment A odpowiada na to pytanie dla
+   danych SOR i podaje próg n\*.
+3. **Dane obcego ośrodka w kontekście mogą szkodzić** (TL-ANDI, TableShift). Wynik `+foreign`
+   w eksperymencie A sprawdza to dla danych Yale.
+4. **Deklaracje producentów [P] cytuj jako deklaracje**, a wyniki [S] dopiero po sprawdzeniu pełnego tekstu.

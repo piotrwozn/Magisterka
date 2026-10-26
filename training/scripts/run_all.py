@@ -15,8 +15,15 @@ Użycie (z katalogu training/, w aktywnym venv):
                                                       # krzywa uczenia — scripts/09–11, wznawialne)
     python scripts/run_all.py --stage all             # trening, potem analizy (jedna noc + kilka godzin)
 
+Modele fundamentalne (TabPFN-3.5, TabICLv2; GPU z torch z CUDA; najpierw python scripts/13_tfm_setup.py):
+    python scripts/run_all.py --profile smoke --models lightgbm,tfm   # test mechaniki (CPU dopuszczalne)
+    python scripts/run_all.py --profile thorough --models tfm         # oba TFM (wybór konfiguracji + VAL/TEST)
+    python scripts/run_all.py --profile thorough --stage analyses --models tfm
+                                  # analizy: + krzywa małych danych (14) i łączenie z LightGBM (15)
+`--models all` = 6 modeli klasycznych (TFM nigdy domyślnie); `all,tfm` = wszystkie 8.
+
 Opcje: --profile {smoke,quick,standard,thorough}, --feature-set triage|full|triage,full,
---models all|lista, --split random|site, --no-tune, --lanes auto|1|2, --force, --fail-fast,
+--models all|tfm|lista, --split random|site, --no-tune, --lanes auto|1|2, --force, --fail-fast,
 --dry-run, --status, --skip-preflight, --no-keep-awake, --stage train|analyses|all (domyślnie train).
 Szczegóły: src/pipeline/orchestrator.py. Wyniki analiz: runs/analyses/<analiza>__<cechy>__<profil>/.
 

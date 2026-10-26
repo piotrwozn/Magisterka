@@ -5,6 +5,9 @@ Sprawdza: Python (>= 3.12, 64-bit), pakiety i wersje (requirements.txt / require
 RAM, wolne miejsce, rdzenie, kartę NVIDIA (nvidia-smi) i PRAWDZIWY próbny trening na GPU dla
 xgboost i catboost, obecność danych Yale, ścieżkę repo (OneDrive, polskie znaki, długość),
 kodowanie konsoli i (Windows) plan zasilania. Raport: konsola + logs/run_all/<czas>/preflight.json.
+Z modelami fundamentalnymi w `--models` (tfm, tabpfn, tabicl) także: torch z CUDA (bez CUDA odmowa,
+chyba że `--profile smoke`), wersje tabpfn / tabicl, wagi w lokalnej pamięci podręcznej (bez sieci),
+wolna VRAM — szczegółowa konfiguracja i pobranie wag: scripts/13_tfm_setup.py.
 
 Brak pakietów (np. świeży venv bez `pip install`) nie kończy się tracebackiem: skrypt wypisuje,
 czego brakuje, i polecenie instalacji.
@@ -13,6 +16,7 @@ Użycie:
     python scripts/00_check_env.py
     python scripts/00_check_env.py --no-gpu-probe        # bez próby GPU (szybciej)
     python scripts/00_check_env.py --out-dir logs/x      # własny katalog na preflight.json
+    python scripts/00_check_env.py --models all,tfm --profile thorough   # plan z modelami TFM
 
 Kod wyjścia: 0 = można trenować (ostrzeżenia nie blokują), 1 = błędy krytyczne.
 """
@@ -74,9 +78,9 @@ try:
     from src.pipeline.orchestrator import (  # noqa: E402
         LANES_MIN_PHYSICAL_CORES,
         LANES_MIN_RAM_GB,
-        MODEL_ORDER,
         decide_lanes,
         gpu_planned_models,
+        parse_models,
     )
     from src.pipeline.preflight import run_preflight  # noqa: E402
     from src.utils import config  # noqa: E402
@@ -91,24 +95,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out-dir", type=Path, default=None,
                         help="Katalog na preflight.json (domyślnie logs/run_all/<czas>/)")
     parser.add_argument("--no-gpu-probe", action="store_true", help="Pomiń próbny trening na GPU")
+    parser.add_argument("--models", default="all",
+                        help="Modele planowanego przebiegu: all (6 klasycznych), tfm (TabPFN + TabICL — kontrola "
+                             "torch/CUDA, wersji, wag offline, VRAM) albo lista, np. all,tfm")
+    parser.add_argument("--profile", choices=list(config.TUNING_PROFILES), default=config.DEFAULT_TUNING_PROFILE,
+                        help="Profil przebiegu (TFM: kontekst planowany przez profil; bez CUDA tylko smoke)")
+    parser.add_argument("--no-tune", action="store_true", help="Przebieg bez tuningu (TFM: parametry domyślne)")
     args = parser.parse_args(argv)
+    try:
+        models = parse_models(args.models)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     out_dir = args.out_dir or (Path(config.LOGS_DIR) / "run_all" / datetime.now().strftime("%Y%m%d_%H%M%S"))
     try:
-        report = run_preflight(probe_gpus=not args.no_gpu_probe, out_dir=out_dir)
+        report = run_preflight(probe_gpus=not args.no_gpu_probe, out_dir=out_dir, models=models,
+                               profile=args.profile, tune=not args.no_tune)
     except ImportError as exc:
         return report_import_failure(exc)
     print(report.format())
 
     facts = report.facts
-    gpu_models = gpu_planned_models(MODEL_ORDER, facts.get("devices") or {}, bool(facts.get("gpu_ok")))
-    lanes = decide_lanes("auto", gpu_models, facts.get("physical_cores"), facts.get("ram_gb"), MODEL_ORDER)
+    gpu_models = gpu_planned_models(models, facts.get("devices") or {}, bool(facts.get("gpu_ok")))
+    lanes = decide_lanes("auto", gpu_models, facts.get("physical_cores"), facts.get("ram_gb"), models)
     print(f"\nrun_all.py --lanes auto → {lanes} tor(y) "
           f"(2 = co najmniej jeden model na GPU [{', '.join(gpu_models) or 'brak'}], "
           f"≥ {LANES_MIN_PHYSICAL_CORES} rdzeni fizycznych, ≥ {LANES_MIN_RAM_GB:.0f} GB RAM)")
     print(f"Raport JSON: {out_dir / 'preflight.json'}")
     if report.ok:
-        print("Dalej: python scripts/run_all.py --profile smoke   (5–10 min), potem: python scripts/run_all.py")
+        tfm = (facts.get("tfm") or {}).get("models")
+        if tfm:
+            print(f"Dalej: python scripts/run_all.py --profile {args.profile} --models {args.models}"
+                  f"   (TFM: najpierw python scripts/13_tfm_setup.py — wagi, benchmark GPU, szacunki czasu)")
+        else:
+            print("Dalej: python scripts/run_all.py --profile smoke   (5–10 min), potem: python scripts/run_all.py")
     return 0 if report.ok else 1
 
 

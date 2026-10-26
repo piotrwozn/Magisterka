@@ -31,6 +31,7 @@ from src.models.tuning import (
     tune_model,
 )
 from src.utils.config import (
+    CLASSICAL_MODELS,
     EARLY_STOPPING_FRACTION,
     N_CLASSES,
     SEARCH_SPACE_VERSION,
@@ -76,11 +77,13 @@ def _load(result: dict) -> optuna.Study:
 # Przestrzenie
 # ─────────────────────────────────────────
 def test_search_space_for_every_model():
-    assert set(SUGGEST_FUNCTIONS) == set(MODEL_REGISTRY)
-    assert set(SEARCH_SPACE_VERSION) == set(MODEL_REGISTRY)
+    """Przestrzeń Optuny dla każdego modelu KLASYCZNEGO; modele fundamentalne (TFM) jej nie mają."""
+    assert set(SUGGEST_FUNCTIONS) == set(CLASSICAL_MODELS)
+    assert set(SEARCH_SPACE_VERSION) == set(CLASSICAL_MODELS)
+    assert set(CLASSICAL_MODELS) == {m for m, c in MODEL_REGISTRY.items() if not c.pretrained}
 
 
-@pytest.mark.parametrize("name", list(MODEL_REGISTRY))
+@pytest.mark.parametrize("name", list(CLASSICAL_MODELS))
 def test_search_space_samples(name):
     study = optuna.create_study()
     params = SUGGEST_FUNCTIONS[name](study.ask(), "triage")
@@ -112,7 +115,7 @@ def test_n_startup_trials_scale_with_dimensions():
 # ─────────────────────────────────────────
 # Fold CV
 # ─────────────────────────────────────────
-@pytest.mark.parametrize("name", list(MODEL_REGISTRY))
+@pytest.mark.parametrize("name", list(CLASSICAL_MODELS))
 def test_fit_predict_fold(folds, name):
     X_tr, y_tr, X_va, _ = folds
     proba, info = fit_predict_fold(name, FOLD_PARAMS[name], X_tr, y_tr, X_va)

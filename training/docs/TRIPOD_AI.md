@@ -104,3 +104,25 @@ Najważniejsze domeny i odpowiedzi z tego repozytorium:
 | predyktory | niskie | Tylko dane z chwili triażu; przecieki usunięte; definicje w `FEATURE_ENGINEERING.md` |
 | wynik | **wysokie** (dla „prawdziwej pilności”) / niskie (dla „ESI pielęgniarki”) | Etykieta to ocena człowieka, który zna predyktory. Dlatego dodano analizę względem przyjęć |
 | analiza | niskie | VAL i TEST rozdzielone; reguły dopasowane tylko na VAL; CI dla wszystkich metryk; zmienność seedów (sekcja 13.1); kalibracja oceniona |
+
+## Uzupełnienie: modele fundamentalne (TFM)
+
+Dotyczy eksperymentów z TabPFN-3.5 i TabICLv2 ([`TFM.md`](TFM.md)). Status ◐ oznacza: kod i raporty są
+gotowe, wyników jeszcze nie ma (wymagają GPU i prawdziwych wag).
+
+| pozycja | temat (parafraza) | status | gdzie / co zrobić |
+|---|---|---|---|
+| 9a, 12b | Predyktory i ich obróbka | ✓ | Te same 271 cech `triage` co modele klasyczne. TabICLv2 ma kandydata `max_features=100`, który usuwa najrzadsze flagi skarg bez użycia etykiet (`TFM.md` §11.2) |
+| 10 | Uzasadnienie liczebności | ◐ | Eksperyment A: krzywa małych danych (n = 500–50 000) i próg n\* (`runs/analyses/small_data__…/report.md`) |
+| 11 | Braki danych | ✓ | TabPFN obsługuje NaN natywnie; TabICL imputuje średnią, więc flagi `*_missing` zostają w cechach |
+| 12c | Typ modelu, budowa, dobór hiperparametrów | ✓ | Modele wstępnie wytrenowane bez dopasowania wag; kontekst z TRAIN (worki warstwowane ESI × oddział); konfiguracja wybrana na holdoucie z TRAIN, bez VAL i TEST (sekcja „Tuning — wybór konfiguracji” w `report.md` runu) |
+| 12e, 23a | Ocena połączenia z TFM | ◐ | Eksperyment B: powtarzany cross-fitting na VAL, sparowany bootstrap, bramka; TEST raz w 08 (`runs/analyses/tfm_blend__…/report.md`, sekcja 3 raportu 08) |
+| 12g, 22 | Pełna specyfikacja modelu | ✓ | `run_info.json` → `tfm`: wersje bibliotek i torch, plik wag + SHA-256, konfiguracja, worki, zdarzenia OOM. Kontekst jest zapisany w `model.joblib` |
+| 13 | Niezrównoważenie klas | ✓ | Każdy worek ma ≥ 2 wiersze każdej klasy; kontekst `balanced` z dokładną korektą priorów; ECE ESI 1 jest kryterium bramki B |
+| 18c–d | Protokół i rejestracja | ◐ | Kryteria A i B ustalono przed analizą: stałe w kodzie, wypisywane w raportach przed liczbami. Publicznej rejestracji nie było — napisz to |
+| 18e | Dostępność modelu | ✍ | Wagi TabPFN-3.5 mają licencję niekomercyjną; kod TabICL ma licencję BSD-3, a licencję jego wag trzeba potwierdzić na karcie modelu (`TFM.md` §2) |
+| 26 | Ograniczenia | ✍ | Deklaracje producentów, rzadkie ESI 1, oddział B z 68 wizytami ESI 1 w VAL, podpróbkowany kontekst, dane z USA (`TFM.md` §9) |
+| 27a–c | Wdrożenie | ✍ | Backend domyślnie nie używa TFM (receptura bez TFM). Serwowanie wymaga opt-in, GPU i licencji komercyjnej TabPFN |
+
+PROBAST+AI, domena „analiza”: ryzyko optymizmu przy wyborze połączenia z TFM ograniczają cross-fitting na
+VAL, bramka ustalona z góry (MID, przedział bez zera, 2 × SD seedów) i jednorazowa ocena na TEST.

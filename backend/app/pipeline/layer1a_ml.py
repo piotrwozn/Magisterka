@@ -5,6 +5,11 @@ geometric mean), optional temperature scaling of the blend, then the decision ru
 (`registry.ensemble`: equal weights, mean, no temperature and argmax by default;
 optional override from `backend/models/ensemble_weights.json` — format in
 app/models/ensemble.py). Class index 0–4 = ESI 1–5.
+
+Foundation models (TFM_MODELS) are served only on opt-in (app/models/registry.py).
+A served TFM that fails during a request is dropped from the registry and — when
+`ensemble_weights_no_tfm.json` was deployed — the request is recomputed with that
+recipe (re-fitted without TFMs) instead of renormalising a calibrated full blend.
 """
 from __future__ import annotations
 
@@ -13,7 +18,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from app.models.ensemble import MODEL_WEIGHTS, EnsembleConfig, decide
+from app.models.ensemble import MODEL_WEIGHTS, TFM_MODELS, EnsembleConfig, decide
 from app.models.registry import N_CLASSES, ModelRegistry
 from app.models.schemas import ModelPrediction
 from app.pipeline.feature_engineering import align_features
@@ -71,6 +76,7 @@ def run_ensemble(
     """
     if not registry.models:
         raise RuntimeError("No models loaded — cannot run ensemble")
+    use_registry_config = config is None
     config = config or registry.ensemble
     active = config.active(registry.loaded_ids)
     if not active:
@@ -86,6 +92,11 @@ def run_ensemble(
             pred = predict_with_model(model_id, df_row, registry, config.rule)
         except Exception as exc:  # noqa: BLE001
             log.warning("Model %s failed: %s", model_id, exc)
+            # A TFM failing at request time (OOM, CUDA) keeps failing — drop it once and, when the
+            # registry switched to the no-TFM recipe, recompute this request with that recipe
+            if (model_id in TFM_MODELS and use_registry_config and hasattr(registry, "drop_tfm")
+                    and registry.drop_tfm(model_id, f"{type(exc).__name__}: {exc}")):
+                return run_ensemble(df_row, registry)
             continue
 
         per_model.append(pred)

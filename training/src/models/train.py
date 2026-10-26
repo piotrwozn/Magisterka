@@ -1,7 +1,8 @@
 """
 Trening modeli ESI — jeden punkt wejścia (CLI: `scripts/03_train.py`).
 
-    python scripts/03_train.py --model all                          # wszystkie modele, zestaw 'triage'
+    python scripts/03_train.py --model all                          # 6 modeli klasycznych, zestaw 'triage'
+    python scripts/03_train.py --model tfm --tune --profile smoke   # modele fundamentalne TabPFN + TabICL
     python scripts/03_train.py --model lightgbm                     # jeden model
     python scripts/03_train.py --model all --tune                   # tuning, profil 'standard' (noc)
     python scripts/03_train.py --model all --tune --profile quick   # test całego pipeline'u (~30 min)
@@ -36,6 +37,17 @@ Tag runa (domyślny, gdy nie podano `tag`):
 `--filter` działa tylko z `--tune` (filtr cech jest częścią konfiguracji tuningu); bez `--tune`
 jest pomijany z ostrzeżeniem.
 
+Modele fundamentalne (TFM: tabpfn, tabicl; `pretrained = True`) — tylko na jawne żądanie (`--model tfm`):
+    - X_fit = cały TRAIN (bez early stopping); "tuning" = wybór konfiguracji na holdoucie z TRAIN
+      (src/models/tfm_tuning.py, wynik `kind="tfm_config_selection"`) zamiast Optuny; bez skalowania
+      parametrów liczności i wag klas (wagi i --filter ignorowane z ostrzeżeniem),
+    - kontekst stratyfikowany po ESI × oddział (`context_strata`), predykcja VAL + TEST w jednym przebiegu
+      worków (`predict_proba_many`); szacunek czasu finalnej predykcji z przepustowości z wyboru konfiguracji
+      > `final_budget_s` profilu → mniej worków (WARNING z liczbami),
+    - brak GPU i kontekst > TFM_CPU_MAX_CONTEXT → błąd przed wczytaniem danych (bez katalogu runa),
+    - run_info / DONE.json: `pretrained: true` + blok `tfm` (biblioteka, wersja, wagi, licencja, konfiguracja,
+      worki, rozmiary kontekstu, zdarzenia, przepustowość, szczyt VRAM).
+
 Protokół łączenia modeli (ręcznie, zob. src/ensemble):
     wagi / progi / kalibrację dobieraj na `predictions_val.parquet`,
     `predictions_test.parquet` — wyłącznie do raportu końcowego.
@@ -69,7 +81,7 @@ from src.data.dataset import (
 )
 from src.data.prepare import VITALS_COMPLETE_COL
 from src.evaluation.metrics import decide, full_evaluation
-from src.models import MODEL_REGISTRY, get_model, resolve_model_name
+from src.models import MODEL_REGISTRY, get_model, resolve_model_list, resolve_model_name
 from src.models.base import ITERATION_CAP_WARN_FRACTION, compute_class_weights_dict
 from src.utils.config import (
     CLASS_NAMES,
@@ -110,8 +122,8 @@ VC_LEADERBOARD_METRICS = [
     "quadratic_weighted_kappa", "auc_macro", "log_loss",
     "undertriage_rate", "critical_miss_rate", "expected_cost",
 ]
-# Modele z obsługą GPU (urządzenie wybiera hardware.device_for)
-GPU_MODELS = ("xgboost", "catboost")
+# Modele z obsługą GPU (urządzenie wybiera hardware.device_for; TFM: próba torch)
+GPU_MODELS = ("xgboost", "catboost", "tabpfn", "tabicl")
 
 
 # ─────────────────────────────────────────
@@ -411,6 +423,92 @@ def default_run_tag(profile: str, tune: bool, custom: bool) -> str:
 
 
 # ─────────────────────────────────────────
+# Modele fundamentalne (TFM) — pomocnicze
+# ─────────────────────────────────────────
+def _pretrained_warnings(model_name: str, *, tune: bool, do_filter: bool, tune_metric: str,
+                         sample_weight_strategy: str) -> bool:
+    """Opcje bez znaczenia dla TFM → WARNING; zwraca do_filter (zawsze False — filtr LightGBM wyłączony)."""
+    if do_filter:
+        log.warning(f"{model_name}: --filter pominięty — model fundamentalny ma własny, beznadzorowy dobór cech "
+                    f"(parametr max_features); filtr LightGBM (z etykietami) nie jest używany")
+    if sample_weight_strategy != "none":
+        log.warning(f"{model_name}: wagi klas '{sample_weight_strategy}' są ignorowane przez model fundamentalny "
+                    f"(run i tak oznaczony jako niestandardowy)")
+    if tune and tune_metric != "logloss":
+        log.warning(f"{model_name}: --tune-metric {tune_metric} ignorowany — wybór konfiguracji TFM po log loss "
+                    f"holdoutu")
+    return False
+
+
+def _cap_bag_params(model, n_bags: int) -> dict[str, Any]:
+    """
+    Redukcja worków zapisana w PARAMETRACH (→ run_info.params → refit_from_run): przy n_bags="auto" limit
+    `max_bags` (auto nadal przeliczane dla nowego N, ale nigdy ponad budżet), przy liczbie — sama liczba.
+    Zwraca wartości sprzed zmiany (do opisu w final_budget).
+    """
+    before = {"n_bags": model.params.get("n_bags"), "max_bags": model.params.get("max_bags")}
+    spec = model.params.get("n_bags", 1)
+    if isinstance(spec, str) and spec.strip().lower() == "auto":
+        model.params["max_bags"] = int(n_bags)
+    else:
+        model.params["n_bags"] = int(n_bags)
+    predictor = getattr(model, "model", None)
+    if hasattr(predictor, "params"):
+        predictor.params.update({k: model.params[k] for k in ("n_bags", "max_bags") if k in model.params})
+    return before
+
+
+def _apply_final_budget(model, tuning_info: Mapping[str, Any], budget: Mapping[str, Any], n_rows: int) -> dict:
+    """
+    Szacunek czasu finalnej predykcji (przepustowość z wyboru konfiguracji) > final_budget_s → mniej worków
+    (zapisane też w parametrach — refit nie wraca do pełnej liczby). Jeden worek nadal ponad budżetem →
+    WARNING + zdarzenie `final_budget_exceeded` (liczbą worków nie da się już zejść niżej).
+    """
+    from src.models.tfm_tuning import final_bag_budget
+
+    decision = final_bag_budget(tuning_info.get("throughput"), model.n_bags, n_rows, budget.get("final_budget_s"))
+    n_before = model.n_bags
+    if decision["reduce"]:
+        reason = (f"szacunek {decision['estimate_s'] / 60:.1f} min ({n_before} worków × "
+                  f"{decision['per_bag_s'] / 60:.1f} min na {n_rows:,} wierszy) > final_budget_s "
+                  f"{float(budget['final_budget_s']) / 60:.0f} min → {decision['n_bags']} worków")
+        log.warning(f"{model.name}: BUDŻET FINALNEJ PREDYKCJI — {reason}")
+        model.limit_bags(decision["n_bags"], reason)
+        decision["params_before"] = _cap_bag_params(model, decision["n_bags"])
+    if decision.get("over_budget"):
+        detail = (f"szacunek {decision['estimate_after_s'] / 60:.1f} min ({decision['n_bags']} worek, "
+                  f"{n_rows:,} wierszy) > final_budget_s {float(budget['final_budget_s']) / 60:.0f} min; "
+                  f"liczbą worków nie da się zejść niżej — zmniejsz n_ctx / n_estimators (mniejszy profil) "
+                  f"albo sprawdź, czy GPU nie jest zajęte przez inne programy")
+        log.warning(f"{model.name}: BUDŻET FINALNEJ PREDYKCJI PRZEKROCZONY — {detail}")
+        model.tfm_events.append({"kind": "final_budget_exceeded",
+                                 "time": datetime.now().isoformat(timespec="seconds"),
+                                 "estimate_s": decision["estimate_after_s"],
+                                 "final_budget_s": decision["final_budget_s"], "n_bags": decision["n_bags"],
+                                 "detail": detail})
+    elif decision["estimate_s"] is not None and not decision["reduce"]:
+        log.info(f"{model.name}: szacunek finalnej predykcji {decision['estimate_s'] / 60:.1f} min "
+                 f"({model.n_bags} worków, {n_rows:,} wierszy) — w budżecie")
+    return decision
+
+
+def _tfm_done_summary(tfm: Mapping[str, Any]) -> dict:
+    """Skrót bloku `tfm` do DONE.json (biblioteka, wagi, worki, czas predykcji)."""
+    weights = tfm.get("weights") or {}
+    return {
+        "library": tfm.get("library"),
+        "library_version": tfm.get("library_version"),
+        "weights_file": weights.get("file"),
+        "weights_sha256": weights.get("sha256"),
+        "weights_override": tfm.get("weights_override"),
+        "n_bags": tfm.get("n_bags"),
+        "context_sizes": tfm.get("context_sizes"),
+        "predict_s": tfm.get("predict_s"),
+        "peak_vram_mb": tfm.get("peak_vram_mb"),
+    }
+
+
+# ─────────────────────────────────────────
 # Trening jednego modelu
 # ─────────────────────────────────────────
 def run_training(
@@ -452,12 +550,16 @@ def run_training(
     """
     model_name = resolve_model_name(model_name)
     feature_set = resolve_feature_set(feature_set)
+    pretrained = bool(getattr(MODEL_REGISTRY[model_name], "pretrained", False))
     budget = resolve_budget(model_name, profile)
     explicit = {"n_trials": n_trials, "tune_rows": tune_rows, "n_folds": cv_folds, "timeout_s": tune_timeout,
                 "train_sample": train_sample, "eval_sample": eval_sample}
     if do_filter and not tune:
         log.warning("--filter działa tylko razem z --tune (filtr jest częścią konfiguracji tuningu) — pomijam")
         do_filter = False
+    if pretrained:
+        do_filter = _pretrained_warnings(model_name, tune=tune, do_filter=do_filter, tune_metric=tune_metric,
+                                         sample_weight_strategy=sample_weight_strategy)
     overrides = _custom_overrides(
         budget, explicit, tune=tune, tune_metric=tune_metric, sample_weight_strategy=sample_weight_strategy,
         do_filter=do_filter, custom_params=custom_params, save_model=save_model,
@@ -476,6 +578,11 @@ def run_training(
     log.info("═" * 64)
     if custom:
         log.info(f"Run niestandardowy (nadpisania: {', '.join(overrides)}) — nie zastąpi zwykłego runa profilu")
+    if pretrained:
+        # Brak GPU + duży kontekst → błąd od razu (przed danymi i katalogiem runa)
+        from src.models.tfm_base import check_cpu_context, planned_max_context
+
+        check_cpu_context(model_name, budget["device"], planned_max_context(model_name, budget, custom_params, tune))
 
     # 1. Dane (przed utworzeniem katalogu runa — brak danych nie zostawia pustych katalogów)
     ensure_prepared()
@@ -508,7 +615,23 @@ def run_training(
     scaling: dict = {}
     best_params = dict(custom_params or {})
     optuna_cw = None
-    if tune:
+    if tune and pretrained:
+        # Model fundamentalny: wybór konfiguracji na holdoucie z X_fit (bez Optuny, skalowania i wag klas)
+        from src.models.tfm_tuning import select_config
+
+        OPTUNA_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        tuning_info = select_config(
+            model_name, X_fit[feature_names], y_fit,
+            strata=_site_strata(df_train, X_fit.index, y_fit),
+            budget=budget,
+            profile=profile,
+            feature_set=feature_set,
+            storage_dir=OPTUNA_STORAGE_DIR,
+            data_fp=data_fingerprint(),
+            fixed_params=custom_params,
+        )
+        best_params.update(tuning_info["best_params"])
+    elif tune:
         from src.models.tuning import filter_features_by_importance_1fold, tune_model
 
         if do_filter:
@@ -558,6 +681,8 @@ def run_training(
     # 4. Trening finalny
     model = get_model(model_name, params=best_params or None)
     model.optuna_class_weights = optuna_cw
+    if pretrained:
+        model.context_strata = _site_strata(df_train, X_fit.index, y_fit)    # kontekst: ESI × oddział
     model.fit(
         X_fit[feature_names], y_fit,
         X_val=X_es[feature_names] if X_es is not None else None, y_val=y_es,
@@ -566,10 +691,14 @@ def run_training(
         use_mlflow=use_mlflow,
         feature_set=feature_set,
     )
+    final_budget = None
+    if pretrained and tuning_info:
+        final_budget = _apply_final_budget(model, tuning_info, budget, len(X_val) + len(X_test))
 
-    # 5. Predykcje + metryki (val; test tylko do raportu końcowego)
-    proba_val = model.predict_proba(X_val[feature_names])
-    proba_test = model.predict_proba(X_test[feature_names])
+    # 5. Predykcje + metryki (val; test tylko do raportu końcowego) — TFM: oba zbiory w jednym przebiegu worków
+    proba_val, proba_test = model.predict_proba_many([X_val[feature_names], X_test[feature_names]])
+    if pretrained:
+        model.release()                          # estymatory TFM (pamięć GPU) — artefakt ich nie zawiera
     log.info("Ewaluacja na VAL…")
     metrics = _evaluate(df_val, y_val, proba_val, "val", print_report=True)
     metrics.update(_evaluate(df_test, y_test, proba_test, "test"))
@@ -634,6 +763,7 @@ def run_training(
         "hardware": hardware,
         "class_names": CLASS_NAMES,
         "proba_columns": PROBA_COLS,
+        **({"pretrained": True, "tfm": {**model.tfm_info(), "final_budget": final_budget}} if pretrained else {}),
     }
     _write_json(run_dir / "run_info.json", info)
     _write_json(run_dir / "metrics.json", metrics)
@@ -657,6 +787,7 @@ def run_training(
         "best_trial": (tuning_info or {}).get("best_trial"),
         "device": info["device"],
         "actual_device": model.actual_device,
+        **({"pretrained": True, "tfm": _tfm_done_summary(info["tfm"])} if pretrained else {}),
         "finished_at": datetime.now().isoformat(timespec="seconds"),
     }, ensure_ascii=True, default=_json_default)
 
@@ -693,6 +824,15 @@ REFIT_VERSION: int = 1
 _FRAME_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 # Nazwy zajęte w run_info.json (`n_<ramka>`) i metrykach
 _RESERVED_FRAME_NAMES: tuple[str, ...] = ("fit", "early_stopping", "features", "features_before_filter", "train")
+
+
+def run_duration_s(info: Mapping[str, Any]) -> float:
+    """
+    Czas runa do szacunków ETA refitów: `training_duration_s` + (TFM) czas predykcji `tfm.predict_s` —
+    "trening" TFM to tylko zapis kontekstu (≈ 0 s), a godziny zajmuje predykcja. Klasyczne: bez zmian.
+    """
+    tfm = info.get("tfm") if isinstance(info.get("tfm"), Mapping) else {}
+    return float(info.get("training_duration_s") or 0.0) + float((tfm or {}).get("predict_s") or 0.0)
 
 
 def refit_params(model_name: str, params: Mapping[str, Any], seed: int) -> tuple[dict[str, Any], str]:
@@ -825,6 +965,7 @@ def refit_from_run(
 
     model_name = resolve_model_name(src["model"])
     feature_set = resolve_feature_set(src["feature_set"])
+    pretrained = bool(getattr(MODEL_REGISTRY[model_name], "pretrained", False))
     ensure_prepared()
     fingerprint = data_fingerprint()
     if src.get("data_version") != DATA_VERSION or src.get("data_fingerprint") != fingerprint:
@@ -892,9 +1033,11 @@ def refit_from_run(
     log.info(f"Run: {run_name} | fit {len(X_fit):,}" + (f" (+{n_es:,} early stopping)" if uses_es else "")
              + " | ramki: " + ", ".join(f"{k} {len(v):,}" for k, v in frames.items()))
 
-    # 3. Trening finalny — ta sama ścieżka co run_training
+    # 3. Trening finalny — ta sama ścieżka co run_training (TFM: nowy random_state → nowe worki kontekstu)
     model = get_model(model_name, params=params)
     model.optuna_class_weights = optuna_cw
+    if pretrained:
+        model.context_strata = _site_strata(df_train, X_fit.index, y_fit)
     model.fit(
         X_fit[features], y_fit,
         X_val=X_es[features] if X_es is not None else None, y_val=y_es,
@@ -903,12 +1046,14 @@ def refit_from_run(
         feature_set=feature_set,
     )
 
-    # 4. Predykcje + metryki na ramkach ewaluacji
+    # 4. Predykcje + metryki na ramkach ewaluacji (wszystkie ramki jednym wywołaniem — TFM: jeden przebieg worków)
     metrics: dict[str, Any] = {}
     predictions: dict[str, str] = {}
-    for name, frame in frames.items():
-        X_eval, y_eval = get_xy(frame, feature_set)
-        proba = model.predict_proba(X_eval[features])
+    eval_xy = {name: get_xy(frame, feature_set) for name, frame in frames.items()}
+    probas = model.predict_proba_many([X_eval[features] for X_eval, _ in eval_xy.values()])
+    if pretrained:
+        model.release()                          # refity analiz w jednym procesie — zwolnij GPU od razu
+    for (name, frame), (_, y_eval), proba in zip(frames.items(), eval_xy.values(), probas, strict=True):
         metrics.update(_evaluate(frame, y_eval, proba, name))
         path = new_dir / f"predictions_{name}.parquet"
         _predictions_frame(frame, proba).to_parquet(path, index=False)
@@ -981,6 +1126,7 @@ def refit_from_run(
         "hardware": hardware,
         "class_names": CLASS_NAMES,
         "proba_columns": PROBA_COLS,
+        **({"pretrained": True, "tfm": model.tfm_info()} if pretrained else {}),
     }
     _write_json(new_dir / "run_info.json", info)
     _write_json(new_dir / "metrics.json", metrics)
@@ -1006,6 +1152,7 @@ def refit_from_run(
         "best_trial": tuning.get("best_trial"),
         "device": info["device"],
         "actual_device": model.actual_device,
+        **({"pretrained": True, "tfm": _tfm_done_summary(info["tfm"])} if pretrained else {}),
         "finished_at": datetime.now().isoformat(timespec="seconds"),
     }, ensure_ascii=True, default=_json_default)
 
@@ -1014,7 +1161,9 @@ def refit_from_run(
         key = f"{name}_argmax_quadratic_weighted_kappa"
         if key in metrics:
             summary.append(f"{name}: QWK {metrics[key]:.4f}, log loss {metrics.get(f'{name}_argmax_log_loss', float('nan')):.4f}")
-    log.info(f"Refit gotowy ({model.training_duration_s or 0:.1f} s): " + "; ".join(summary) + f" → {new_dir}")
+    # TFM: "trening" = zapis kontekstu (≈ 0 s) — czas refitu to dopasowanie + predykcja ramek ewaluacji
+    duration = float(model.training_duration_s or 0) + float(getattr(model, "tfm_predict_s", None) or 0)
+    log.info(f"Refit gotowy ({duration:.1f} s): " + "; ".join(summary) + f" → {new_dir}")
     return {
         "run_name": run_name,
         "run_dir": str(new_dir),
@@ -1056,12 +1205,94 @@ def _confusion_lines(metrics: dict, key: str) -> list[str]:
     return lines
 
 
+def _tfm_selection_lines(info: dict, metrics: dict) -> list[str]:
+    """Sekcja raportu: wybór konfiguracji TFM na holdoucie z TRAIN (wynik `tfm_tuning.select_config`)."""
+    t = info["tuning"]
+    h = t.get("holdout") or {}
+    val = metrics.get("val_argmax_log_loss")
+    timeout = t.get("timeout_s")
+    lines = [
+        "## Tuning — wybór konfiguracji modelu fundamentalnego (holdout z TRAIN, bez Optuny)",
+        "",
+        f"- wybór: `{t['study_name']}`" + (f" (`{t['best_json']}`)" if t.get("best_json") else ""),
+        f"- holdout: {int(h.get('rows') or 0):,} wierszy X_fit (stratyfikacja `{h.get('stratified_by')}`), "
+        f"pula kontekstu {int(h.get('pool_rows') or 0):,}; VAL i TEST nieużywane",
+        f"- kandydaci: ukończeni {t['n_complete']}, błędy / brak pamięci {t['n_fail']}, pominięci (limit czasu) "
+        f"{t['n_pruned']} — zaplanowano {t.get('n_trials_target')}"
+        + (f"; z pamięci podręcznej {t['n_cached']}" if t.get("n_cached") else ""),
+        f"- czas łącznie: {float(t.get('elapsed_s') or 0) / 60:.1f} min"
+        + (f" z limitu {float(timeout) / 60:.0f} min" if timeout else "") + f"; koniec: `{t.get('stopped_reason')}`",
+        f"- **log loss holdoutu: {t['best_value']:.5f}** (kandydat #{t['best_trial']}) vs **val log loss: "
+        f"{_fmt(val)}**"
+        + (f" (najlepszy kandydat {t['best_overall_value']:.5f}; w tolerancji {t.get('tolerance')} wygrywa tańszy)"
+           if t.get("best_overall_value") is not None and t["best_value"] > t["best_overall_value"] else ""),
+        "- wybrana konfiguracja: " + ", ".join(f"`{k}`={v}" for k, v in t["best_params"].items()),
+    ]
+    if t.get("weights_override"):
+        lines.append(f"- **przekierowanie wag (tylko test): {t['weights_override']}**")
+    lines += ["", "| # | etap | konfiguracja | status | log loss | QWK | czas [s] | wierszy/s | VRAM [MB] |",
+              "|---:|---:|---|---|---:|---:|---:|---:|---:|"]
+    for c in t.get("candidates") or []:
+        config = ", ".join(f"{k}={v}" for k, v in (c.get("config") or {}).items())
+        status = c.get("status", "?") + (" (pamięć)" if c.get("cached") else "")
+        lines.append(f"| {c.get('index')} | {c.get('stage')} | {config} | {status} | {_fmt(c.get('holdout_logloss'))} "
+                     f"| {_fmt(c.get('qwk_argmax'))} | {_fmt(c.get('wall_s'))} | {_fmt(c.get('rows_per_s'))} "
+                     f"| {_fmt(c.get('peak_vram_mb'))} |")
+    lines.append("")
+    return lines
+
+
+def _tfm_lines(info: dict) -> list[str]:
+    """Sekcja raportu: model fundamentalny (biblioteka, wagi, worki, przepustowość, zdarzenia)."""
+    tfm = info.get("tfm") or {}
+    weights = tfm.get("weights") or {}
+    thr = tfm.get("throughput") or {}
+    events = tfm.get("events") or []
+    budget = tfm.get("final_budget") or {}
+    kinds: dict[str, int] = {}
+    for event in events:
+        kinds[str(event.get("kind"))] = kinds.get(str(event.get("kind")), 0) + 1
+    lines = [
+        "## Model fundamentalny (TFM)",
+        "",
+        f"- {tfm.get('display_name')} — `{tfm.get('library')}` {tfm.get('library_version')} "
+        f"(torch {tfm.get('torch_version')}), licencja: {tfm.get('licence')}",
+        f"- wagi: `{weights.get('file')}`" + (f" (sha256 `{str(weights.get('sha256'))[:16]}…`)"
+                                              if weights.get("sha256") else ""),
+        f"- worki: {tfm.get('n_bags')} (`{tfm.get('bag_mode')}`, `{tfm.get('context_strategy')}`"
+        + (", korekta priorów" if tfm.get("prior_correction") else "") + f"), kontekst {tfm.get('context_sizes')} "
+        f"wierszy z {int(tfm.get('n_fit_rows') or 0):,}; cechy {tfm.get('n_features_used')} z {tfm.get('n_features_in')}",
+        f"- predykcja VAL + TEST: {_fmt(tfm.get('predict_s'))} s"
+        + (f", {_fmt(thr.get('rows_per_s'))} wierszy/s na worek" if thr.get("rows_per_s") else "")
+        + (f", szczyt VRAM {_fmt(tfm.get('peak_vram_mb'))} MB" if tfm.get("peak_vram_mb") is not None else ""),
+    ]
+    if tfm.get("weights_override"):
+        lines.append(f"- **PRZEKIEROWANIE WAG (tylko test — predykcje bezwartościowe klinicznie): "
+                     f"{tfm['weights_override']}**")
+    if budget.get("estimate_s") is not None:
+        lines.append(f"- szacunek finalnej predykcji: {float(budget['estimate_s']) / 60:.1f} min (budżet "
+                     f"{float(budget.get('final_budget_s') or 0) / 60:.0f} min)"
+                     + (f" → **zredukowano do {budget['n_bags']} worków**" if budget.get("reduce") else "")
+                     + (" — **NADAL PONAD BUDŻETEM** (1 worek; zmniejsz n_ctx / n_estimators)"
+                        if budget.get("over_budget") else ""))
+    if events:
+        lines.append("- zdarzenia: " + ", ".join(f"{k} × {v}" for k, v in sorted(kinds.items())))
+        for event in events:
+            if event.get("kind") in ("oom_downgrade", "bags_reduced", "device_fallback", "weights_mismatch",
+                                     "final_budget_exceeded", "cache_on_host"):
+                lines.append(f"  - {event.get('kind')}: {event.get('step') or event.get('detail')}")
+    lines.append("")
+    return lines
+
+
 def _tuning_lines(info: dict, metrics: dict) -> list[str]:
     t = info.get("tuning")
     if not t:
         return ["## Tuning", "", "Bez tuningu — parametry domyślne z `config.py`"
                 + (" + podane ręcznie: " + ", ".join(f"`{k}`={v}" for k, v in info["custom_params"].items())
                    if info.get("custom_params") else "") + ".", ""]
+    if t.get("kind") == "tfm_config_selection":
+        return _tfm_selection_lines(info, metrics)
     metric = t["metric"]
     val_key = "val_argmax_log_loss" if metric == "logloss" else "val_argmax_quadratic_weighted_kappa"
     val_value = metrics.get(val_key)
@@ -1151,6 +1382,8 @@ def _write_report(path: Path, info: dict, metrics: dict, importances: pd.DataFra
         "",
     ]
     lines += _tuning_lines(info, metrics)
+    if info.get("tfm"):
+        lines += _tfm_lines(info)
 
     lines += ["## Metryki — VAL (wybór modeli, wag i progów)", ""]
     columns = [("argmax", "val_argmax"), ("koszt", "val_cost")]
@@ -1225,6 +1458,8 @@ def _write_refit_report(path: Path, info: dict, metrics: dict) -> None:
         changes = ", ".join(f"`{k}` {v['tuned']:.4g} → {v['final']:.4g}"
                             for k, v in refit["count_scaling"]["params"].items())
         lines.append(f"- skalowanie parametrów liczności ×{refit['count_scaling']['factor']}: {changes}")
+    if info.get("tfm"):
+        lines += [""] + _tfm_lines(info)
     lines += ["", "## Metryki", ""]
     columns = []
     for name in refit["eval_frames"]:
@@ -1252,14 +1487,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model", "-m", default="all",
-        help=f"'all', jeden model albo lista po przecinku. Dostępne: {', '.join(MODEL_REGISTRY)}",
+        help=f"'all' (6 modeli klasycznych), 'tfm' (TabPFN + TabICL), jeden model albo lista po przecinku. "
+             f"Dostępne: {', '.join(MODEL_REGISTRY)}",
     )
     parser.add_argument("--feature-set", "-f", default="triage", help="triage | full")
     parser.add_argument(
         "--profile", choices=list(TUNING_PROFILES), default=DEFAULT_TUNING_PROFILE,
         help="Budżet tuningu i próbki danych (config.TUNING_PROFILES); jawne flagi poniżej mają pierwszeństwo",
     )
-    parser.add_argument("--tune", "-t", action="store_true", help="Tuning Optuną przed treningiem (wznawialny)")
+    parser.add_argument("--tune", "-t", action="store_true",
+                        help="Tuning Optuną przed treningiem (wznawialny); TFM: wybór konfiguracji na holdoucie z TRAIN")
     parser.add_argument("--n-trials", "-n", type=_positive_int, default=None,
                         help="Łączna liczba ukończonych prób badania (domyślnie z profilu)")
     parser.add_argument("--tune-metric", choices=["logloss", "qwk"], default="logloss",
@@ -1308,10 +1545,7 @@ def main(argv: list[str] | None = None) -> int:
         if int(_config.N_JOBS) != args.n_jobs:
             log.warning(f"--n-jobs {args.n_jobs} podane za późno (config.N_JOBS={_config.N_JOBS} ustalone przy "
                         f"imporcie) — uruchamiaj przez scripts/03_train.py albo ustaw SOR_AI_N_JOBS")
-    if args.model.lower() == "all":
-        models = list(MODEL_REGISTRY)
-    else:
-        models = [resolve_model_name(m.strip()) for m in args.model.split(",") if m.strip()]
+    models = resolve_model_list(args.model)        # 'all' = 6 klasycznych, 'tfm' = TabPFN + TabICL
     if args.filter and not args.tune:
         log.warning("--filter bez --tune nic nie robi (filtr cech działa tylko przed tuningiem)")
 
